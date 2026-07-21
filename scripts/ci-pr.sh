@@ -17,5 +17,6 @@ cargo test --locked --workspace
 scripts/no-orphan-crates.sh
 scripts/check-unsafe-confinement.sh
 scripts/check-abi-surface.sh
+scripts/test-append-only.sh
 scripts/check-append-only.sh
 scripts/test-native.sh --model-free

@@ -182,7 +182,7 @@ float run_metallib_probe(id<MTLDevice> device) {
             "Hyperion canary command failed: " + ns_error(command.error));
     }
     const float value = *static_cast<float*>(buffer.contents);
-    if (std::fabs(value - 42.0F) > 0.0001F) {
+    if (!std::isfinite(value) || std::fabs(value - 42.0F) > 0.0001F) {
         throw NativeError(HYP_STATUS_INTERNAL, "Hyperion metallib canary returned the wrong value");
     }
     return value;
@@ -196,7 +196,7 @@ float run_mlx_probe() {
     mx::eval(result);
     mx::synchronize(stream);
     const float value = result.item<float>();
-    if (std::fabs(value - 4.0F) > 0.0001F) {
+    if (!std::isfinite(value) || std::fabs(value - 4.0F) > 0.0001F) {
         throw NativeError(HYP_STATUS_INTERNAL, "MLX tensor canary returned the wrong value");
     }
     mx::clear_cache();
