@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hyperion-core",
+    "crates/hyperion-model",
+    "crates/hyperion-tokenizer",
+    "crates/hyperion-ffi",
+    "crates/hyperion-server",
+    "crates/hyperion-bench",
+]
+default-members = [
+    "crates/hyperion-server",
+    "crates/hyperion-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jscott3201/hyperion"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

@@ -1,2 +1,28 @@
 .DS_Store
 codex-id.json
+
+# Rust and native build output
+/target/
+/build/
+/cmake-build-*/
+compile_commands.json
+
+# Project-local Python oracle environment and caches
+/oracle/.venv/
+/.venv/
+/.python-version
+__pycache__/
+*.py[cod]
+
+# Model and generated evidence artifacts. Keep the reviewed manifests tracked.
+/artifacts/models/*
+!/artifacts/models/MANIFEST.md
+/artifacts/traces/
+/benchmarks/raw/
+/eval-results/raw/
+
+# Local profiling and crash output
+*.profraw
+*.profdata
+*.trace
+*.crash
