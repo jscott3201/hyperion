@@ -1,6 +1,6 @@
 # 0001 — M0 runtime and evidence boundaries
 
-- Status: proposed; acceptance requires the final committed M0 gate
+- Status: accepted
 - Date: 2026-07-21
 - Owners: Hyperion team
 
@@ -68,5 +68,10 @@ mapping. Upstream added that compatibility in commit
 
 - `HYP-M0-GATE-002` records a complete `PASS` from the clean, post-review M5 gate on exact
   source commit `90e154efae439638ffde6402d640ac3266e88522`.
-- The decision remains proposed until the non-draft feature PR passes required CI. Existing
-  text in this record becomes immutable once the decision status is accepted.
+- Mandatory adversarial review found thirteen total issues across the initial and focused
+  passes; every actionable finding was addressed and the reviewer approved exact evidence
+  head `22cf74f8246d2c2e4e9940b217248e2ba670a448` for the non-draft PR.
+- GitHub PR `#1` tier-1 workflow run `29862998459` passed at that exact evidence head with no
+  review threads or requested changes.
+- Verdict: accepted for merge into `development`. This existing decision text is now
+  immutable; later evidence may only be appended.
