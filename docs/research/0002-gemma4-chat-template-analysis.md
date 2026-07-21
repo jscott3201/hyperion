@@ -54,10 +54,11 @@ implementation differences whose output is observable in malformed or fragmented
 Canonical rendering is not itself evidence that the resulting agent loop is stable. An open
 [upstream report][loop-report] attributes verbatim repetition or runaway generation in
 multi-step tool use to reinjecting earlier raw thought blocks from the same live turn. Its
-reported 24-run harness saw failures in 7 runs with the merged change and
+reported 24-run harness against a pre-merge PR #35 version saw failures in 7 runs with
 `preserve_thinking=true`, 9 with it false, and none when reinjection was disabled. That is
-material counterevidence, not a Hyperion result: the report's directly validated model was a
-third-party derivative, and the pinned 12B QAT checkpoint has not yet been measured here.
+material counterevidence, not a Hyperion result: later changes produced final canonical commit
+`711c1368e39f1712f48ff0eb7bcdbbb760d52db0`, and neither that exact revision nor the pinned
+12B QAT checkpoint has been behaviorally measured by Hyperion yet.
 
 Simply removing live-turn thoughts is not an assumed fix. Google's guidance explicitly says
 they must remain between function calls inside one model turn. M3 must therefore run the
