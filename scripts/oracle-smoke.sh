@@ -19,13 +19,14 @@ response=$(
     "$generator" \
         --model "$model_dir" \
         --prompt "$prompt" \
-        --max-tokens 32 \
+        --max-tokens 128 \
         --temp 0.0 \
         --seed 0 \
+        --chat-template-config '{"enable_thinking":false}' \
         --verbose False
 )
-if ! grep -q 'HYPERION_M0_OK' <<<"$response"; then
-    echo "oracle generated a response but missed the frozen M0 marker" >&2
+if [[ "$response" != "HYPERION_M0_OK" ]]; then
+    echo "oracle generated a response but did not exactly match the frozen M0 marker" >&2
     printf '%s\n' "$response" >&2
     exit 1
 fi
