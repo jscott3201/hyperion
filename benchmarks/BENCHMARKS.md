@@ -133,3 +133,29 @@ HYPERION_M0_OK
 - Verdict: `PASS (pre-review)` — every M0 fast and heavy gate passed sequentially on the real
   target machine. Final milestone acceptance remains withheld until the mandatory adversarial
   review is addressed and the resulting commit is rerun.
+
+### `HYP-M0-REVIEW-001` — adversarial rejection of the pre-review gate
+
+- Classification: `DECIDED`
+- Reviewed commit: `81f891178f390188e7e322056cb03695ddaad616`
+- Base: `development` at `0ee828a00bcd0b2990af581542a9258540765970`
+- Exact review scope: `git diff development...81f891178f390188e7e322056cb03695ddaad616`
+- Review mode: fresh read-only adversarial pass against the M0 goal package, source, tests,
+  CI, artifacts, oracle, ABI, and claimed evidence
+- Finding: Release-mode `NDEBUG` removed the C++ `assert` expressions, so platform-policy
+  rejection and ABI tests had passed without executing their checks.
+- Finding: The release workflow's clean checkout removed ignored model/oracle prerequisites;
+  automatic pull-request code on a persistent self-hosted runner was also unsafe.
+- Finding: The oracle generation command did not mechanically verify the locked environment,
+  source/converted checksum manifests, model geometry, or quantization identity before printing
+  its model label; the metallib override was not bound to the freshly built sidecar hash.
+- Finding: The MLX probe relied on ambient stream resolution; the development push guard
+  compared `HEAD` to itself; E4B QAT was assigned to M8 despite being an M1 baseline; a local
+  `SHA256SUMS` made acquisition non-rerunnable; and an uncontrolled allocation failure was
+  mislabeled as predictive governor rejection.
+- Disposition: all prior MEASURED values remain immutable observations, but
+  `HYP-M0-GATE-001` is insufficient for milestone acceptance. A corrected commit must make
+  tests release-active with a negative control, enforce explicit streams and hash-bound
+  prerequisites, harden CI/acquisition/ABI failure paths, pass focused re-review, and rerun the
+  complete gate before an acceptance row may be appended.
+- Verdict: `REJECTED FOR ACCEPTANCE` — do not merge the reviewed commit.

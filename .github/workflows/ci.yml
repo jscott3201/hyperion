@@ -21,16 +21,22 @@ jobs:
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"
       MLX_ROOT: /opt/homebrew/opt/mlx
-      HYPERION_BASE_REF: origin/development
+      HYPERION_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
       - name: Install exact Rust floor
         run: rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt
       - name: Install native dependencies
         run: |
-          brew install cmake mlx
+          brew install cmake jq mlx ripgrep
           test "$(brew list --versions mlx | awk '{print $2}')" = "0.32.0"
+      - name: Ensure the optional Metal compiler is available
+        run: |
+          if ! xcrun metal --version >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun metal --version
       - name: Run cumulative model-free tier 1
         run: scripts/ci-pr.sh

@@ -29,7 +29,8 @@ printf '%s\n' \
     processor_config.json \
     tokenizer.json \
     tokenizer_config.json | sort >"$scratch_dir/expected"
-find "$source_dir" -maxdepth 1 -type f -exec basename {} \; | sort >"$scratch_dir/actual"
+find "$source_dir" -maxdepth 1 -type f ! -name SHA256SUMS -exec basename {} \; | sort \
+    >"$scratch_dir/actual"
 if ! cmp -s "$scratch_dir/expected" "$scratch_dir/actual"; then
     echo "M0 source root differs from the reviewed nine-file snapshot:" >&2
     diff -u "$scratch_dir/expected" "$scratch_dir/actual" >&2 || true

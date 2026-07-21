@@ -27,3 +27,8 @@ scripts/oracle-smoke.sh
 
 The goal contract and milestone gates live in [`docs/goal-package`](docs/goal-package/INDEX.md).
 Benchmark claims are valid only when present as `MEASURED` rows in the append-only ledger.
+
+The self-hosted `release-gate` keeps checkout cleanup enabled and recreates the locked oracle.
+Its protected `hyperion-m5-release` environment must define `HYPERION_M0_SOURCE_MODEL` and
+`HYPERION_M0_ORACLE_MODEL` as paths outside the checkout. Each path must contain the reviewed
+`SHA256SUMS`; the release script verifies both manifests and every payload before execution.

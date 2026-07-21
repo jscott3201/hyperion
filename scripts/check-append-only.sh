@@ -6,8 +6,12 @@ cd "$repo_root"
 base_ref=${HYPERION_BASE_REF:-origin/development}
 
 if ! git rev-parse --verify --quiet "$base_ref^{commit}" >/dev/null; then
-    echo "append-only: base $base_ref is unavailable; nothing accepted can be compared"
-    exit 0
+    echo "append-only: required base $base_ref is unavailable" >&2
+    exit 1
+fi
+if [[ "$(git rev-parse "$base_ref^{commit}")" == "$(git rev-parse "HEAD^{commit}")" ]]; then
+    echo "append-only: base $base_ref resolves to HEAD; refusing a self-comparison" >&2
+    exit 1
 fi
 
 scratch_dir=$(mktemp -d "${TMPDIR:-/tmp}/hyperion-append-only.XXXXXX")

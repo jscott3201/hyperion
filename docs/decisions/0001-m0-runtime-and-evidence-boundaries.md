@@ -40,14 +40,18 @@ mapping. Upstream added that compatibility in commit
    upstream compatibility commit above. Mutable branches and checkpoint-config rewrites are
    forbidden. Python remains bench/oracle-only and cannot be selected by serving code.
 7. M0 downloads, verifies, converts, and runs the primary 12B QAT source at immutable revision
-   `b6ed86275a6a5735884e208bfed95b445a684ca2`. The BF16 reference and M7/M8 checkpoints are
-   staged by their owning milestones after their immutable revisions are recorded. This avoids
-   exhausting the 16 GB development machine's local disk without weakening the M0 real-oracle
-   gate.
+   `b6ed86275a6a5735884e208bfed95b445a684ca2`. The E4B QAT baseline is acquired in M1, the
+   BF16 reference in M2, and the assistant checkpoints in M7/M8, after their immutable
+   revisions are recorded. This avoids exhausting the 16 GB development machine's local disk
+   without weakening the M0 real-oracle gate or deferring an owning milestone's prerequisite.
 8. Development PR CI is model-free and may compile on GitHub's macOS 26 Apple-Silicon host;
    it never treats that M1 host as a supported runtime and never bypasses the production
-   canary. Full milestone/release CI targets a labeled self-hosted M5 and runs the oracle and
-   native canary sequentially.
+   canary. Full milestone/release CI targets a labeled self-hosted M5 and runs only after a
+   reviewed main push or an authorized manual dispatch through the `hyperion-m5-release`
+   environment—not automatically for pull-request code. Checkout remains clean; the locked
+   oracle is recreated, and `HYPERION_M0_ORACLE_MODEL` must point outside the checkout to the
+   content-addressed model store. The gate verifies that store before native and oracle phases
+   run sequentially.
 
 ## Consequences
 

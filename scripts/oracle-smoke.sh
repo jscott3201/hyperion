@@ -5,6 +5,9 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 model_dir=${HYPERION_M0_ORACLE_MODEL:-$repo_root/artifacts/models/gemma4-12b-qat-mlx-g64-b4}
 generator="$repo_root/oracle/.venv/bin/mlx_lm.generate"
 
+scripts/verify-oracle.sh
+scripts/verify-m0-models.sh
+
 if [[ ! -x "$generator" ]]; then
     echo "oracle environment is missing; run scripts/setup-oracle.sh" >&2
     exit 2
@@ -13,7 +16,6 @@ if [[ ! -f "$model_dir/config.json" ]]; then
     echo "M0 oracle model is missing at $model_dir" >&2
     exit 2
 fi
-
 prompt=$(tr -d '\r\n' <"$repo_root/oracle/m0-prompt.txt")
 response=$(
     "$generator" \

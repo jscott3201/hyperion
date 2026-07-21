@@ -71,6 +71,15 @@ HypStatus ok() noexcept {
     return HYP_STATUS_OK;
 }
 
+HypStatus fail_unexpected(const char* operation) noexcept {
+    std::snprintf(
+        g_last_error.data(),
+        g_last_error.size(),
+        "%s failed with a non-standard exception",
+        operation != nullptr ? operation : "native operation");
+    return HYP_STATUS_INTERNAL;
+}
+
 template <typename Function>
 HypStatus abi_call(const char* operation, Function&& function) noexcept {
     try {
@@ -78,15 +87,16 @@ HypStatus abi_call(const char* operation, Function&& function) noexcept {
         return ok();
     } catch (const NativeError& error) {
         return fail(error.status(), error.what());
-    } catch (const std::bad_alloc& error) {
-        return fail(HYP_STATUS_OOM_GOVERNOR, error.what());
+    } catch (const std::bad_alloc&) {
+        return fail(
+            HYP_STATUS_INTERNAL,
+            "native allocation failed outside predictive governor admission");
     } catch (const std::filesystem::filesystem_error& error) {
         return fail(HYP_STATUS_IO, error.what());
     } catch (const std::exception& error) {
         return fail(HYP_STATUS_INTERNAL, error.what());
     } catch (...) {
-        const std::string message = std::string(operation) + " failed unexpectedly";
-        return fail(HYP_STATUS_INTERNAL, message.c_str());
+        return fail_unexpected(operation);
     }
 }
 
@@ -180,10 +190,11 @@ float run_metallib_probe(id<MTLDevice> device) {
 
 float run_mlx_probe() {
     const mx::Device gpu = mx::Device::gpu;
-    mx::set_default_device(gpu);
-    mx::array values = mx::ones({4}, mx::float32, gpu);
-    mx::array result = mx::sum(values, gpu);
+    const mx::Stream stream = mx::new_stream(gpu);
+    mx::array values = mx::ones({4}, mx::float32, stream);
+    mx::array result = mx::sum(values, stream);
     mx::eval(result);
+    mx::synchronize(stream);
     const float value = result.item<float>();
     if (std::fabs(value - 4.0F) > 0.0001F) {
         throw NativeError(HYP_STATUS_INTERNAL, "MLX tensor canary returned the wrong value");
