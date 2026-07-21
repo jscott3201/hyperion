@@ -21,6 +21,10 @@ cleanup() {
 }
 trap cleanup EXIT
 UV_PROJECT_ENVIRONMENT="$staging" uv sync --project oracle --python "$python_path" --frozen --no-dev
+# The measurement interpreter redirects cache lookups and disables bytecode writes.
+# Rejecting site-package bytecode makes any later injected .pyc fail identity checks.
+find "$staging" -type f -name '*.pyc' -delete
+find "$staging" -depth -type d -name '__pycache__' -empty -delete
 if [[ -e oracle/.venv ]]; then
     mv oracle/.venv "$backup"
 fi

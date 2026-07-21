@@ -47,11 +47,12 @@ const MLX_LM_GENERATE_SHA256: &str =
 const PYTHON_EXECUTABLE_SHA256: &str =
     "01564940172b2811e1f39a4dc90e84c7a26a19cf071bbc5de67e456d82627bec";
 const PYTHON_RUNTIME_TREE_SHA256: &str =
-    "01a580d385a91f4b8bc195c8b2f56c4c2d156f6c1e1ad8768fc4501987c4e12f";
-const PYTHON_RUNTIME_FILE_COUNT: u64 = 1_897;
+    "63c25fabba8839ccb349e3554fedf9c46011d9e414c76912448a19869f666cac";
+const PYTHON_RUNTIME_FILE_COUNT: u64 = 2_122;
 const SITE_PACKAGES_TREE_SHA256: &str =
     "db258e22404a3937d46d72ff44083400aafcf34636b8444a91a29c858b297006";
 const SITE_PACKAGES_FILE_COUNT: u64 = 5_470;
+const HASH_SEED_PROBE: i64 = 1_244_036_990_071_903_237;
 const RUN_MANIFEST_SCHEMA: &str = "hyperion.m1-run-manifest.v1";
 const SCHEDULE_SCHEMA: &str = "hyperion.m1-schedule.v1";
 const COMMAND_SCHEMA: &str = "hyperion.m1-controller-command.v1";
@@ -160,6 +161,7 @@ struct RunManifest {
     schedule_sha256: String,
     worker_sha256: String,
     server_worker_sha256: String,
+    verified_server_source_sha256: String,
     oracle_identity_source_sha256: String,
     oracle_launcher_sha256: String,
     model_identity_source_sha256: String,
@@ -707,6 +709,7 @@ fn begin_run(arguments: BeginRunArgs) -> Result<(), Error> {
         "schedule_sha256": sha256_file(&schedule_path)?,
         "worker_sha256": sha256_file(&repo.join("oracle/m1_bench_worker.py"))?,
         "server_worker_sha256": sha256_file(&repo.join("oracle/m1_server_smoke.py"))?,
+        "verified_server_source_sha256": sha256_file(&repo.join("oracle/verified_mlx_server.py"))?,
         "oracle_identity_source_sha256": sha256_file(&repo.join("oracle/oracle_identity.py"))?,
         "oracle_launcher_sha256": sha256_file(&repo.join("oracle/isolated_oracle.py"))?,
         "model_identity_source_sha256": sha256_file(&repo.join("oracle/model_identity.py"))?,
@@ -827,6 +830,8 @@ fn run_cell(arguments: RunCellArgs) -> Result<(), Error> {
         || run_manifest.worker_sha256 != sha256_file(&repo.join("oracle/m1_bench_worker.py"))?
         || run_manifest.server_worker_sha256
             != sha256_file(&repo.join("oracle/m1_server_smoke.py"))?
+        || run_manifest.verified_server_source_sha256
+            != sha256_file(&repo.join("oracle/verified_mlx_server.py"))?
         || run_manifest.oracle_identity_source_sha256
             != sha256_file(&repo.join("oracle/oracle_identity.py"))?
         || run_manifest.oracle_launcher_sha256
@@ -977,7 +982,7 @@ fn run_cell(arguments: RunCellArgs) -> Result<(), Error> {
     let mut command = Command::new(&python);
     command
         .current_dir(&repo)
-        .args(["-I", "-S"])
+        .args(["-B", "-S", "-s", "-P", "-X", "pycache_prefix=/dev/null"])
         .arg(repo.join("oracle/isolated_oracle.py"))
         .arg("script")
         .arg(&worker)
@@ -1526,16 +1531,29 @@ fn worker_environment_matches(value: Option<&Value>) -> bool {
         })
 }
 
-fn isolated_flags_match(value: Option<&Value>) -> bool {
+fn startup_flags_match(value: Option<&Value>) -> bool {
     let Some(object) = value.and_then(Value::as_object) else {
         return false;
     };
-    object.len() == 5
-        && object.get("isolated").and_then(Value::as_u64) == Some(1)
+    object.len() == 18
+        && object.get("bytes_warning").and_then(Value::as_u64) == Some(0)
+        && object.get("debug").and_then(Value::as_u64) == Some(0)
+        && object.get("dev_mode").and_then(Value::as_bool) == Some(false)
+        && object.get("dont_write_bytecode").and_then(Value::as_u64) == Some(1)
+        && object.get("hash_randomization").and_then(Value::as_u64) == Some(0)
+        && object.get("ignore_environment").and_then(Value::as_u64) == Some(0)
+        && object.get("inspect").and_then(Value::as_u64) == Some(0)
+        && object.get("int_max_str_digits").and_then(Value::as_u64) == Some(4_300)
+        && object.get("interactive").and_then(Value::as_u64) == Some(0)
+        && object.get("isolated").and_then(Value::as_u64) == Some(0)
         && object.get("no_site").and_then(Value::as_u64) == Some(1)
-        && object.get("ignore_environment").and_then(Value::as_u64) == Some(1)
-        && object.get("safe_path").and_then(Value::as_bool) == Some(true)
         && object.get("no_user_site").and_then(Value::as_u64) == Some(1)
+        && object.get("optimize").and_then(Value::as_u64) == Some(0)
+        && object.get("quiet").and_then(Value::as_u64) == Some(0)
+        && object.get("safe_path").and_then(Value::as_bool) == Some(true)
+        && object.get("utf8_mode").and_then(Value::as_u64) == Some(1)
+        && object.get("verbose").and_then(Value::as_u64) == Some(0)
+        && object.get("warn_default_encoding").and_then(Value::as_u64) == Some(0)
 }
 
 fn send_worker_command(
@@ -2423,6 +2441,8 @@ fn verify_run(directory: &Path) -> Result<(), Error> {
         || manifest.schedule_sha256 != sha256_file(&repo.join("benchmarks/m1/schedule.json"))?
         || manifest.worker_sha256 != sha256_file(&repo.join("oracle/m1_bench_worker.py"))?
         || manifest.server_worker_sha256 != sha256_file(&repo.join("oracle/m1_server_smoke.py"))?
+        || manifest.verified_server_source_sha256
+            != sha256_file(&repo.join("oracle/verified_mlx_server.py"))?
         || manifest.oracle_identity_source_sha256
             != sha256_file(&repo.join("oracle/oracle_identity.py"))?
         || manifest.oracle_launcher_sha256 != sha256_file(&repo.join("oracle/isolated_oracle.py"))?
@@ -2760,6 +2780,10 @@ fn verify_server_smoke(
         || value.get("server_source_sha256").and_then(Value::as_str) != Some(MLX_LM_SERVER_SHA256)
         || value.get("worker_sha256").and_then(Value::as_str)
             != Some(&manifest.server_worker_sha256)
+        || value
+            .get("verified_server_source_sha256")
+            .and_then(Value::as_str)
+            != Some(&manifest.verified_server_source_sha256)
         || value.get("oracle_launcher_sha256").and_then(Value::as_str)
             != Some(&manifest.oracle_launcher_sha256)
         || value
@@ -2819,7 +2843,10 @@ fn verify_server_smoke(
             .get("site_packages_file_count")
             .and_then(Value::as_u64)
             != Some(SITE_PACKAGES_FILE_COUNT)
-        || !isolated_flags_match(identity.get("isolated_flags"))
+        || !startup_flags_match(identity.get("startup_flags"))
+        || identity.get("pycache_prefix").and_then(Value::as_str) != Some("/dev/null")
+        || identity.get("hash_seed_probe").and_then(Value::as_i64) != Some(HASH_SEED_PROBE)
+        || !worker_environment_matches(identity.get("environment"))
         || identity.get("mlx_version").and_then(Value::as_str) != Some(MLX_VERSION)
         || identity.get("mlx_metal_version").and_then(Value::as_str) != Some(MLX_METAL_VERSION)
         || identity.get("mlx_lm_version").and_then(Value::as_str) != Some(MLX_LM_VERSION)
@@ -2865,7 +2892,7 @@ fn verify_server_smoke(
         if repeat.get("repeat").and_then(Value::as_u64)
             != Some(u64::try_from(repeat_number).expect("repeat number fits u64"))
             || repeat.get("port").and_then(Value::as_u64) != Some(port)
-            || repeat.get("command") != Some(&expected_server_command(port))
+            || repeat.get("command") != Some(&expected_server_command(port, model))
         {
             return Err(Error::new("server repeat command identity is invalid"));
         }
@@ -2997,7 +3024,21 @@ fn valid_server_exit(value: &Value) -> bool {
 }
 
 fn valid_model_identity(value: &Value, model: ModelSpec) -> bool {
-    value.get("schema").and_then(Value::as_str) == Some("hyperion.model-tree-identity.v1")
+    object_has_exact_keys(
+        value,
+        &[
+            "schema",
+            "manifest_sha256",
+            "payload_tree_sha256",
+            "payload_file_count",
+            "exact_inventory",
+            "symlinks_rejected",
+            "transport_cache_excluded",
+            "transport_cache_separately_bound",
+            "transport_cache_tree_sha256",
+            "transport_cache_file_count",
+        ],
+    ) && value.get("schema").and_then(Value::as_str) == Some("hyperion.model-tree-identity.v1")
         && value.get("manifest_sha256").and_then(Value::as_str) == Some(model.manifest_sha256)
         && value.get("payload_tree_sha256").and_then(Value::as_str)
             == Some(model.payload_tree_sha256)
@@ -3008,18 +3049,39 @@ fn valid_model_identity(value: &Value, model: ModelSpec) -> bool {
             .get("transport_cache_excluded")
             .and_then(Value::as_bool)
             == Some(false)
+        && value
+            .get("transport_cache_separately_bound")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && value
+            .get("transport_cache_tree_sha256")
+            .is_some_and(Value::is_null)
+        && value
+            .get("transport_cache_file_count")
+            .and_then(Value::as_u64)
+            == Some(0)
 }
 
-fn expected_server_command(port: u64) -> Value {
+fn expected_server_command(port: u64, model: ModelSpec) -> Value {
     json!([
         "oracle/.venv/bin/python",
-        "-I",
+        "-B",
         "-S",
+        "-s",
+        "-P",
+        "-X",
+        "pycache_prefix=/dev/null",
         "oracle/isolated_oracle.py",
-        "module",
-        "mlx_lm.server",
+        "script",
+        "oracle/verified_mlx_server.py",
         "--model",
         "<MODEL>",
+        "--model-manifest-sha256",
+        model.manifest_sha256,
+        "--model-payload-tree-sha256",
+        model.payload_tree_sha256,
+        "--model-payload-file-count",
+        model.payload_file_count.to_string(),
         "--host",
         "127.0.0.1",
         "--port",
@@ -3052,6 +3114,9 @@ fn server_tool_call(assembled: &Value) -> Result<(&Value, Value), Error> {
         ));
     }
     let call = &calls[0];
+    if !valid_sse_tool_call(call) {
+        return Err(Error::new("server tool call has an invalid nested schema"));
+    }
     let function = call
         .get("function")
         .ok_or_else(|| Error::new("server tool call lacks function"))?;
@@ -3451,14 +3516,15 @@ fn validate_server_chunk_stream(chunks: &[Value]) -> Result<(), Error> {
                 )));
             }
         }
-        if delta.get("tool_calls").is_some_and(|calls| {
-            calls
+        if let Some(calls) = delta.get("tool_calls") {
+            let calls = calls
                 .as_array()
-                .is_none_or(|calls| calls.iter().any(|call| !call.is_object()))
-        }) {
-            return Err(Error::new(
-                "server SSE delta.tool_calls is not an array of objects",
-            ));
+                .ok_or_else(|| Error::new("server SSE delta.tool_calls is not an array"))?;
+            if calls.iter().any(|call| !valid_sse_tool_call(call)) {
+                return Err(Error::new(
+                    "server SSE tool call or function has an invalid nested schema",
+                ));
+            }
         }
     }
     if usage_indexes != [chunks.len() - 1] || finish_reasons != 1 {
@@ -3475,6 +3541,98 @@ fn object_has_only_keys(value: &Value, allowed: &[&str]) -> bool {
             .keys()
             .all(|key| allowed.iter().any(|allowed_key| key == allowed_key))
     })
+}
+
+fn object_has_exact_keys(value: &Value, expected: &[&str]) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
+    })
+}
+
+fn valid_sse_tool_call(value: &Value) -> bool {
+    if !object_has_exact_keys(value, &["index", "id", "type", "function"])
+        || value.get("index").and_then(Value::as_u64).is_none()
+        || value
+            .get("id")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || value.get("type").and_then(Value::as_str) != Some("function")
+    {
+        return false;
+    }
+    let Some(function) = value.get("function") else {
+        return false;
+    };
+    object_has_exact_keys(function, &["name", "arguments"])
+        && function
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| !name.is_empty())
+        && function.get("arguments").and_then(Value::as_str).is_some()
+}
+
+fn valid_failure_traceback(value: Option<&Value>, error_type: &str, message: &str) -> bool {
+    let Some(lines) = value.and_then(Value::as_array) else {
+        return false;
+    };
+    if lines.len() < 2
+        || lines
+            .iter()
+            .any(|line| line.as_str().is_none_or(str::is_empty))
+        || lines.first().and_then(Value::as_str) != Some("Traceback (most recent call last):")
+    {
+        return false;
+    }
+    let expected_final = if message.is_empty() {
+        error_type.to_owned()
+    } else {
+        format!("{error_type}: {message}")
+    };
+    lines.last().and_then(Value::as_str) == Some(expected_final.as_str())
+}
+
+fn capacity_failure_matches(error_type: &str, message: &str) -> bool {
+    if error_type == "MemoryError" {
+        return true;
+    }
+    if !matches!(error_type, "RuntimeError" | "OSError") {
+        return false;
+    }
+    let normalized = message.trim().to_ascii_lowercase();
+    let exact_phrase = [
+        "out of memory",
+        "resource exhausted",
+        "cannot allocate memory",
+        "failed to allocate memory",
+        "memory allocation failed",
+        "wired limit exceeded",
+        "wired memory limit",
+        "std::bad_alloc",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase));
+    exact_phrase || mlx_capacity_message(&normalized)
+}
+
+fn mlx_capacity_message(message: &str) -> bool {
+    if let Some(limit) = message
+        .strip_prefix("[metal::malloc] resource limit (")
+        .and_then(|rest| rest.strip_suffix(") exceeded."))
+    {
+        return limit.parse::<u64>().is_ok_and(|value| value > 0);
+    }
+    if let Some(rest) = message.strip_prefix("[metal::malloc] attempting to allocate ")
+        && let Some((requested, maximum)) =
+            rest.split_once(" bytes which is greater than the maximum allowed buffer size of ")
+    {
+        return requested.parse::<u64>().is_ok_and(|value| value > 0)
+            && maximum.parse::<u64>().is_ok_and(|value| value > 0);
+    }
+    if let Some(rest) = message.strip_prefix("[malloc] unable to allocate ") {
+        let bytes = rest.strip_suffix(" bytes").unwrap_or(rest);
+        return bytes.parse::<u64>().is_ok_and(|value| value > 0);
+    }
+    false
 }
 
 fn verify_server_journal(path: &Path, expected_turn: &Value) -> Result<(), Error> {
@@ -3897,7 +4055,9 @@ fn load_cell(path: &Path) -> Result<Cell, Error> {
                         .get("site_packages_file_count")
                         .and_then(Value::as_u64)
                         != Some(SITE_PACKAGES_FILE_COUNT)
-                    || !isolated_flags_match(value.get("isolated_flags"))
+                    || !startup_flags_match(value.get("startup_flags"))
+                    || value.get("pycache_prefix").and_then(Value::as_str) != Some("/dev/null")
+                    || value.get("hash_seed_probe").and_then(Value::as_i64) != Some(HASH_SEED_PROBE)
                     || value.get("mlx_version").and_then(Value::as_str) != Some(MLX_VERSION)
                     || value.get("mlx_metal_version").and_then(Value::as_str)
                         != Some(MLX_METAL_VERSION)
@@ -4121,28 +4281,29 @@ fn load_cell(path: &Path) -> Result<Cell, Error> {
                 worker_failure_count += 1;
                 let error_type = string_field(value, "error_type")?;
                 let failure_message = string_field(value, "message")?;
-                let normalized_failure = failure_message.to_ascii_lowercase();
-                if error_type == "MemoryError"
-                    || [
-                        "alloc",
-                        "out of memory",
-                        "resource exhausted",
-                        "resource limit",
-                        "wired limit",
-                    ]
-                    .iter()
-                    .any(|needle| normalized_failure.contains(needle))
-                {
+                let traceback = value.get("traceback");
+                let traceback_valid =
+                    valid_failure_traceback(traceback, error_type, failure_message);
+                if traceback_valid && capacity_failure_matches(error_type, failure_message) {
                     worker_capacity_failure_count += 1;
                 }
                 if worker_stage == TraceWorkerStage::AwaitingStart
                     || worker_stage == TraceWorkerStage::Terminated
+                    || !object_has_exact_keys(
+                        value,
+                        &[
+                            "schema",
+                            "kind",
+                            "unix_ns",
+                            "monotonic_ns",
+                            "error_type",
+                            "message",
+                            "traceback",
+                        ],
+                    )
                     || error_type.is_empty()
-                    || failure_message.is_empty()
-                    || value
-                        .get("traceback")
-                        .and_then(Value::as_array)
-                        .is_none_or(Vec::is_empty)
+                    || (failure_message.is_empty() && error_type != "MemoryError")
+                    || !traceback_valid
                     || u64_field(value, "unix_ns")? == 0
                     || u64_field(value, "monotonic_ns")? == 0
                 {
@@ -5356,6 +5517,81 @@ mod tests {
         assert!(verify_server_journal(&path, &expected).is_err());
         assert!(assemble_server_chunks(&[json!({"usage": {}})]).is_err());
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn server_sse_rejects_extra_and_mistyped_nested_tool_fields() {
+        let valid = vec![
+            json!({
+                "id": "chatcmpl-synthetic",
+                "system_fingerprint": "mlx-lm-0.31.3",
+                "object": "chat.completion.chunk",
+                "model": "default_model",
+                "created": 1,
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "tool_calls",
+                    "delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": "call-synthetic",
+                        "type": "function",
+                        "function": {
+                            "name": "get_points",
+                            "arguments": "{\"filter\":\"site:HQ AND equip:AHU-01\"}",
+                        },
+                    }]},
+                }],
+            }),
+            json!({
+                "id": "chatcmpl-synthetic",
+                "system_fingerprint": "mlx-lm-0.31.3",
+                "object": "chat.completion",
+                "model": "default_model",
+                "created": 1,
+                "choices": [],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+            }),
+        ];
+        assert!(validate_server_chunk_stream(&valid).is_ok());
+
+        let mut extra_call = valid.clone();
+        extra_call[0]["choices"][0]["delta"]["tool_calls"][0]["extra"] = json!(true);
+        assert!(validate_server_chunk_stream(&extra_call).is_err());
+
+        let mut extra_function = valid.clone();
+        extra_function[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["extra"] =
+            json!(true);
+        assert!(validate_server_chunk_stream(&extra_function).is_err());
+
+        let mut mistyped_index = valid.clone();
+        mistyped_index[0]["choices"][0]["delta"]["tool_calls"][0]["index"] = json!("0");
+        assert!(validate_server_chunk_stream(&mistyped_index).is_err());
+
+        let mut mistyped_arguments = valid;
+        mistyped_arguments[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] =
+            json!({});
+        assert!(validate_server_chunk_stream(&mistyped_arguments).is_err());
+    }
+
+    #[test]
+    fn controlled_capacity_classifier_accepts_only_bounded_signatures() {
+        assert!(capacity_failure_matches(
+            "RuntimeError",
+            "[metal::malloc] Resource limit (8589934592) exceeded."
+        ));
+        assert!(capacity_failure_matches(
+            "RuntimeError",
+            "[metal::malloc] Attempting to allocate 1024 bytes which is greater than the maximum allowed buffer size of 512"
+        ));
+        assert!(capacity_failure_matches("MemoryError", ""));
+        assert!(!capacity_failure_matches(
+            "RuntimeError",
+            "synthetic allocator protocol corruption"
+        ));
+        assert!(!capacity_failure_matches(
+            "ProtocolError",
+            "synthetic out of memory"
+        ));
     }
 
     #[test]

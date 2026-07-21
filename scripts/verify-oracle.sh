@@ -15,22 +15,43 @@ if [[ ! -x oracle/.venv/bin/python ]]; then
     exit 2
 fi
 
-identity=$(oracle/.venv/bin/python -I -S oracle/isolated_oracle.py \
-    script oracle/oracle_identity.py)
+identity=$(scripts/run-isolated-oracle.sh script oracle/oracle_identity.py)
 jq -e '
     .schema == "hyperion.m1-oracle-identity.v1" and
     .python == "3.12.13" and
     .python_executable_sha256 == "01564940172b2811e1f39a4dc90e84c7a26a19cf071bbc5de67e456d82627bec" and
-    .python_runtime_tree_sha256 == "01a580d385a91f4b8bc195c8b2f56c4c2d156f6c1e1ad8768fc4501987c4e12f" and
-    .python_runtime_file_count == 1897 and
+    .python_runtime_tree_sha256 == "63c25fabba8839ccb349e3554fedf9c46011d9e414c76912448a19869f666cac" and
+    .python_runtime_file_count == 2122 and
     .site_packages_tree_sha256 == "db258e22404a3937d46d72ff44083400aafcf34636b8444a91a29c858b297006" and
     .site_packages_file_count == 5470 and
-    .isolated_flags == {
-      "ignore_environment": 1,
-      "isolated": 1,
+    .startup_flags == {
+      "bytes_warning": 0,
+      "debug": 0,
+      "dev_mode": false,
+      "dont_write_bytecode": 1,
+      "hash_randomization": 0,
+      "ignore_environment": 0,
+      "inspect": 0,
+      "int_max_str_digits": 4300,
+      "interactive": 0,
+      "isolated": 0,
       "no_site": 1,
       "no_user_site": 1,
-      "safe_path": true
+      "optimize": 0,
+      "quiet": 0,
+      "safe_path": true,
+      "utf8_mode": 1,
+      "verbose": 0,
+      "warn_default_encoding": 0
+    } and
+    .pycache_prefix == "/dev/null" and
+    .hash_seed_probe == 1244036990071903237 and
+    .environment == {
+      "LANG": "C",
+      "LC_ALL": "C",
+      "PYTHONHASHSEED": "0",
+      "TOKENIZERS_PARALLELISM": "false",
+      "TZ": "UTC"
     } and
     .mlx_version == "0.32.0" and
     .mlx_metal_version == "0.32.0" and

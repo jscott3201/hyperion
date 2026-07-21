@@ -10,21 +10,36 @@ verify_tree() {
     local tree=$2
     local expected_manifest_sha256=$3
     local allow_cache=${4:-false}
+    local expected_cache_sha256=${5:-}
     local arguments=(
         script oracle/model_identity.py
         --model "$tree"
         --manifest-sha256 "$expected_manifest_sha256"
     )
     if [[ "$allow_cache" == true ]]; then
-        arguments+=(--allow-huggingface-cache)
+        arguments+=(
+            --allow-huggingface-cache
+            --expected-transport-cache-sha256 "$expected_cache_sha256"
+        )
     fi
     local identity
-    identity=$(oracle/.venv/bin/python -I -S oracle/isolated_oracle.py "${arguments[@]}")
-    jq -e --arg manifest "$expected_manifest_sha256" '
+    identity=$(scripts/run-isolated-oracle.sh "${arguments[@]}")
+    jq -e --arg manifest "$expected_manifest_sha256" --arg cache "$expected_cache_sha256" '
         .schema == "hyperion.model-tree-identity.v1" and
         .manifest_sha256 == $manifest and
         .exact_inventory == true and
         .symlinks_rejected == true and
+        (if $cache == "" then
+            .transport_cache_excluded == false and
+            .transport_cache_separately_bound == false and
+            .transport_cache_tree_sha256 == null and
+            .transport_cache_file_count == 0
+        else
+            .transport_cache_excluded == true and
+            .transport_cache_separately_bound == true and
+            .transport_cache_tree_sha256 == $cache and
+            .transport_cache_file_count > 0
+        end) and
         (.payload_file_count > 0)
     ' <<<"$identity" >/dev/null
     printf 'model-tree-verified: label=%s identity=%s\n' "$label" "$identity"
@@ -34,7 +49,8 @@ verify_tree \
     "M0 source" \
     "$source_dir" \
     6a07a92df9260b71117b113a8ad0b305432a48f895abd850a7616241a636ebed \
-    true
+    true \
+    09b457cc0d497d5603265bea079d1c534ec1d54779ea0280844d9ba7a958fbf0
 verify_tree \
     "M0 converted model" \
     "$converted_dir" \

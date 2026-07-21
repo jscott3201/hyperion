@@ -26,6 +26,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Install exact Rust floor
         run: rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt
       - name: Install native dependencies
@@ -38,5 +39,7 @@ jobs:
             xcodebuild -downloadComponent MetalToolchain
           fi
           xcrun metal --version
+      - name: Recreate the locked model-free oracle
+        run: scripts/setup-oracle.sh
       - name: Run cumulative model-free tier 1
         run: scripts/ci-pr.sh

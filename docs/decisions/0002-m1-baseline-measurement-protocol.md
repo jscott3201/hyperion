@@ -237,3 +237,40 @@ and compares the allowlist to the content manifest before upload. The release co
 permanent assets: the content-addressed evidence ZIP and its retrieval receipt. Repository
 write permission exists only in the protected, manually dispatched archive job; checkout
 never persists credentials, and `GH_TOKEN` is exposed only to the final publishing step.
+
+## Protocol clarification 7 — deterministic startup and guarded load boundaries
+
+This premeasurement clarification supersedes the startup and bytecode wording in clarification
+5. Every oracle process now starts from an empty environment containing only the five committed
+worker variables and uses Python `-B -S -s -P -X pycache_prefix=/dev/null`. This permits the
+committed `PYTHONHASHSEED=0` to take effect while retaining no-site, no-user-site, safe-path, and
+inert bytecode-cache behavior. The launcher rejects any other environment or flag state and
+requires the cross-process hash probe `hash("hyperion-m1-fixed-hash-probe")` to equal
+`1244036990071903237`. The uv runtime receipt now hashes every regular file, including all
+existing standard-library bytecode, as tree
+`63c25fabba8839ccb349e3554fedf9c46011d9e414c76912448a19869f666cac`
+over 2,122 entries. A clean oracle recreation removes site-package bytecode, and the launcher
+rejects any later `.pyc`, `__pycache__`, symlink, or special-file insertion before importing
+MLX; the non-bytecode site tree remains
+`db258e22404a3937d46d72ff44083400aafcf34636b8444a91a29c858b297006`
+over 5,470 entries.
+
+Source-model transport metadata is no longer blindly excluded. Its complete regular-file tree
+is recursively hashed while every link, special file, and model-payload suffix is rejected.
+The accepted transport-cache trees are 12B
+`09b457cc0d497d5603265bea079d1c534ec1d54779ea0280844d9ba7a958fbf0`
+and E4B `bffa1f7553e9bbc094174133554c6bc8df2cfad630a0dd7c1a00805baaf17027`,
+each over 21 files. Converted trees still permit no cache or extra file. The direct benchmark
+uses a verify-load-verify wrapper whose first verification is the operation immediately before
+the unchanged `mlx_lm.load`. Server smoke uses a project-owned `ModelProvider` subclass only to
+perform the same guard immediately inside the pinned provider's `_load` boundary; the upstream
+model, tokenizer, cache, generation, response, and HTTP implementations remain unchanged. Each
+server log must contain exactly one successful in-process load receipt.
+
+A controlled discovery failure is now limited to `MemoryError`, `RuntimeError`, or `OSError`
+with a bounded capacity phrase, an exact seven-field failure event, and a traceback made only of
+nonempty strings whose first and final lines reproduce the exception. Broad `alloc` substring
+matching is prohibited. SSE tool-call objects require exactly `index`, `id`, `type`, and
+`function`; the nested function requires exactly string `name` and string `arguments` fields.
+Both live validation and raw-journal replay enforce these shapes. Every workflow checkout,
+including model-free PR CI, disables persisted credentials.

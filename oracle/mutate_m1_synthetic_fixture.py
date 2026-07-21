@@ -85,6 +85,11 @@ def mutate(values: list[dict[str, Any]], mutation: str) -> list[dict[str, Any]]:
         "sigkill-relabel",
         "worker-exit-drift",
         "non-capacity-failure",
+        "capacity-protocol-error",
+        "alloc-substring-failure",
+        "traceback-non-string",
+        "failure-missing-field",
+        "failure-extra-field",
     ):
         controller_start = values[0]
         worker_start = next(value for value in values if value.get("kind") == "worker_start")
@@ -107,8 +112,8 @@ def mutate(values: list[dict[str, Any]], mutation: str) -> list[dict[str, Any]]:
             "unix_ns": 120,
             "monotonic_ns": 20,
             "error_type": "RuntimeError",
-            "message": "synthetic allocation refusal",
-            "traceback": ["Traceback (most recent call last):", "RuntimeError: synthetic allocation refusal"],
+            "message": "synthetic out of memory",
+            "traceback": ["Traceback (most recent call last):", "RuntimeError: synthetic out of memory"],
         }
         if mutation == "sigkill-relabel":
             controller_end["worker_exit"] = {"code": None, "signal": 9}
@@ -117,6 +122,21 @@ def mutate(values: list[dict[str, Any]], mutation: str) -> list[dict[str, Any]]:
             controller_end["worker_exit"] = {"code": 2, "signal": None}
         elif mutation == "non-capacity-failure":
             failure["message"] = "synthetic protocol bug"
+            failure["traceback"][-1] = "RuntimeError: synthetic protocol bug"
+        elif mutation == "capacity-protocol-error":
+            failure["error_type"] = "ProtocolError"
+            failure["traceback"][-1] = "ProtocolError: synthetic out of memory"
+        elif mutation == "alloc-substring-failure":
+            failure["message"] = "synthetic allocator protocol corruption"
+            failure["traceback"][-1] = (
+                "RuntimeError: synthetic allocator protocol corruption"
+            )
+        elif mutation == "traceback-non-string":
+            failure["traceback"][0] = {"forged": True}
+        elif mutation == "failure-missing-field":
+            del failure["message"]
+        elif mutation == "failure-extra-field":
+            failure["capacity"] = True
         return [controller_start, worker_start, model_loaded, failure, controller_end]
     if mutation == "stderr-hash-drift":
         values[-1]["stderr_sha256"] = "0" * 64

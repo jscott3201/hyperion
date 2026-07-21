@@ -18,7 +18,7 @@ run_manifest="$repo_root/benchmarks/raw/m1/$run_id/run-manifest.json"
 model_12b=${HYPERION_M1_12B_ORACLE_MODEL:-${HYPERION_M0_ORACLE_MODEL:-$repo_root/artifacts/models/gemma4-12b-qat-mlx-g64-b4}}
 model_e4b=${HYPERION_M1_E4B_ORACLE_MODEL:-$repo_root/artifacts/models/gemma4-e4b-qat-mlx-g64-b4}
 
-"$repo_root/oracle/.venv/bin/python" -I -S "$repo_root/oracle/isolated_oracle.py" \
+"$repo_root/scripts/run-isolated-oracle.sh" \
     script "$repo_root/oracle/m1_server_smoke.py" \
     --repo-root "$repo_root" \
     --model-path "$model_12b" \
@@ -28,7 +28,7 @@ model_e4b=${HYPERION_M1_E4B_ORACLE_MODEL:-$repo_root/artifacts/models/gemma4-e4b
     --run-manifest "$run_manifest" \
     --output-dir "$output_dir" \
     --base-port 18080
-"$repo_root/oracle/.venv/bin/python" -I -S "$repo_root/oracle/isolated_oracle.py" \
+"$repo_root/scripts/run-isolated-oracle.sh" \
     script "$repo_root/oracle/m1_server_smoke.py" \
     --repo-root "$repo_root" \
     --model-path "$model_e4b" \

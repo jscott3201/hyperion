@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import runpy
 import sys
 import types
@@ -18,13 +19,21 @@ EXPECTED_PYTHON_EXECUTABLE_SHA256 = (
     "01564940172b2811e1f39a4dc90e84c7a26a19cf071bbc5de67e456d82627bec"
 )
 EXPECTED_PYTHON_RUNTIME_TREE_SHA256 = (
-    "01a580d385a91f4b8bc195c8b2f56c4c2d156f6c1e1ad8768fc4501987c4e12f"
+    "63c25fabba8839ccb349e3554fedf9c46011d9e414c76912448a19869f666cac"
 )
-EXPECTED_PYTHON_RUNTIME_FILE_COUNT = 1897
+EXPECTED_PYTHON_RUNTIME_FILE_COUNT = 2122
 EXPECTED_SITE_PACKAGES_TREE_SHA256 = (
     "db258e22404a3937d46d72ff44083400aafcf34636b8444a91a29c858b297006"
 )
 EXPECTED_SITE_PACKAGES_FILE_COUNT = 5470
+EXPECTED_HASH_SEED_PROBE = 1244036990071903237
+EXPECTED_ENVIRONMENT = {
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PYTHONHASHSEED": "0",
+    "TOKENIZERS_PARALLELISM": "false",
+    "TZ": "UTC",
+}
 
 
 def sha256_file(path: Path) -> str:
@@ -36,9 +45,14 @@ def sha256_file(path: Path) -> str:
 
 
 def canonical_tree(
-    root: Path, *, allow_symlinks: bool, ignored_names: frozenset[str] = frozenset()
+    root: Path,
+    *,
+    allow_symlinks: bool,
+    ignored_names: frozenset[str] = frozenset(),
+    reject_bytecode: bool = False,
+    ignore_wheel_records: bool = False,
 ) -> tuple[str, int]:
-    """Hash a complete executable tree using location-independent relative names."""
+    """Hash a complete tree using location-independent relative names."""
 
     root = root.resolve()
     if not root.is_dir():
@@ -49,8 +63,6 @@ def canonical_tree(
         kept_directories: list[str] = []
         for name in directories:
             candidate = directory_path / name
-            if name == "__pycache__":
-                continue
             if candidate.is_symlink():
                 if not allow_symlinks:
                     raise RuntimeError(f"identity tree contains a directory symlink: {candidate}")
@@ -61,12 +73,14 @@ def canonical_tree(
                 relative = candidate.relative_to(root).as_posix()
                 entries.append(f"L {hashlib.sha256(target.encode()).hexdigest()} {len(target.encode())} {relative}\n")
                 continue
+            if not candidate.is_dir():
+                raise RuntimeError(f"identity tree contains a special directory: {candidate}")
+            if reject_bytecode and name == "__pycache__":
+                raise RuntimeError(f"identity tree contains a bytecode directory: {candidate}")
             kept_directories.append(name)
         directories[:] = kept_directories
         for name in files:
             candidate = directory_path / name
-            if name in ignored_names or name.endswith(".pyc"):
-                continue
             relative = candidate.relative_to(root).as_posix()
             if candidate.is_symlink():
                 if not allow_symlinks:
@@ -77,6 +91,15 @@ def canonical_tree(
                     raise RuntimeError(f"identity symlink escapes its tree: {candidate}")
                 entries.append(f"L {hashlib.sha256(target.encode()).hexdigest()} {len(target.encode())} {relative}\n")
             elif candidate.is_file():
+                if reject_bytecode and name.endswith(".pyc"):
+                    raise RuntimeError(f"identity tree contains a bytecode file: {candidate}")
+                wheel_record = (
+                    ignore_wheel_records
+                    and name == "RECORD"
+                    and candidate.parent.name.endswith(".dist-info")
+                )
+                if name in ignored_names or wheel_record:
+                    continue
                 entries.append(
                     f"F {sha256_file(candidate)} {candidate.stat().st_size} {relative}\n"
                 )
@@ -88,26 +111,82 @@ def canonical_tree(
     return hashlib.sha256("".join(entries).encode()).hexdigest(), len(entries)
 
 
+def scrubbed_environment() -> dict[str, str]:
+    """Require the caller to have removed every ambient environment variable."""
+
+    actual = dict(os.environ)
+    # macOS injects this process-local CoreFoundation value even through env -i.
+    core_foundation = actual.pop("__CF_USER_TEXT_ENCODING", None)
+    if core_foundation is not None and not re.fullmatch(
+        r"0x[0-9A-Fa-f]+:0x0:0x0", core_foundation
+    ):
+        raise RuntimeError("oracle CoreFoundation text environment is malformed")
+    if actual != EXPECTED_ENVIRONMENT:
+        raise RuntimeError(
+            f"oracle environment differs: expected {EXPECTED_ENVIRONMENT}, found {actual}"
+        )
+    os.environ.clear()
+    os.environ.update(EXPECTED_ENVIRONMENT)
+    return dict(EXPECTED_ENVIRONMENT)
+
+
 def startup_identity() -> dict[str, Any]:
     if sys.version.split()[0] != EXPECTED_PYTHON:
         raise RuntimeError(f"expected Python {EXPECTED_PYTHON}, found {sys.version.split()[0]}")
+    environment = scrubbed_environment()
     flags = {
+        "bytes_warning": sys.flags.bytes_warning,
+        "debug": sys.flags.debug,
+        "dev_mode": bool(sys.flags.dev_mode),
+        "dont_write_bytecode": sys.flags.dont_write_bytecode,
+        "hash_randomization": sys.flags.hash_randomization,
+        "ignore_environment": sys.flags.ignore_environment,
+        "inspect": sys.flags.inspect,
+        "int_max_str_digits": sys.flags.int_max_str_digits,
+        "interactive": sys.flags.interactive,
         "isolated": sys.flags.isolated,
         "no_site": sys.flags.no_site,
-        "ignore_environment": sys.flags.ignore_environment,
-        "safe_path": bool(sys.flags.safe_path),
         "no_user_site": sys.flags.no_user_site,
+        "optimize": sys.flags.optimize,
+        "quiet": sys.flags.quiet,
+        "safe_path": bool(sys.flags.safe_path),
+        "utf8_mode": sys.flags.utf8_mode,
+        "verbose": sys.flags.verbose,
+        "warn_default_encoding": sys.flags.warn_default_encoding,
     }
     if flags != {
-        "isolated": 1,
+        "bytes_warning": 0,
+        "debug": 0,
+        "dev_mode": False,
+        "dont_write_bytecode": 1,
+        "hash_randomization": 0,
+        "ignore_environment": 0,
+        "inspect": 0,
+        "int_max_str_digits": 4300,
+        "interactive": 0,
+        "isolated": 0,
         "no_site": 1,
-        "ignore_environment": 1,
-        "safe_path": True,
         "no_user_site": 1,
+        "optimize": 0,
+        "quiet": 0,
+        "safe_path": True,
+        "utf8_mode": 1,
+        "verbose": 0,
+        "warn_default_encoding": 0,
     }:
-        raise RuntimeError(f"oracle requires python -I -S, found flags {flags}")
+        raise RuntimeError(f"oracle requires scrubbed deterministic Python flags, found {flags}")
+    if sys.pycache_prefix != "/dev/null":
+        raise RuntimeError(
+            f"oracle requires an inert pycache prefix, found {sys.pycache_prefix!r}"
+        )
     if "site" in sys.modules or "sitecustomize" in sys.modules or "usercustomize" in sys.modules:
         raise RuntimeError("ambient Python startup hooks executed before oracle isolation")
+    hash_seed_probe = hash("hyperion-m1-fixed-hash-probe")
+    if hash_seed_probe != EXPECTED_HASH_SEED_PROBE:
+        raise RuntimeError(
+            f"oracle hash seed probe differs: expected {EXPECTED_HASH_SEED_PROBE}, "
+            f"found {hash_seed_probe}"
+        )
 
     oracle_dir = Path(__file__).resolve().parent
     expected_executable = oracle_dir / ".venv/bin/python"
@@ -127,7 +206,9 @@ def startup_identity() -> dict[str, Any]:
         # payload byte, plus every extra file, is still covered by this full tree.
         site_packages,
         allow_symlinks=False,
-        ignored_names=frozenset({".DS_Store", "RECORD"}),
+        ignored_names=frozenset({".DS_Store"}),
+        reject_bytecode=True,
+        ignore_wheel_records=True,
     )
     return {
         "python_executable_sha256": executable_sha256,
@@ -135,7 +216,10 @@ def startup_identity() -> dict[str, Any]:
         "python_runtime_file_count": runtime_count,
         "site_packages_tree_sha256": site_sha256,
         "site_packages_file_count": site_count,
-        "isolated_flags": flags,
+        "startup_flags": flags,
+        "pycache_prefix": sys.pycache_prefix,
+        "hash_seed_probe": hash_seed_probe,
+        "environment": environment,
         "site_packages": site_packages,
     }
 
@@ -163,7 +247,7 @@ def install_identity_module(identity: dict[str, Any]) -> None:
 
 def main() -> None:
     if len(sys.argv) < 2:
-        raise SystemExit("usage: isolated_oracle.py identity [--derive] | script PATH [ARGS...] | module NAME [ARGS...]")
+        raise SystemExit("usage: isolated_oracle.py identity [--derive] | script PATH [ARGS...]")
     action = sys.argv[1]
     identity = startup_identity()
     if action == "identity":
@@ -192,11 +276,6 @@ def main() -> None:
             raise RuntimeError("isolated oracle script target must be a direct oracle/*.py file")
         sys.argv = [str(target), *sys.argv[3:]]
         runpy.run_path(str(target), run_name="__main__")
-    elif action == "module":
-        if len(sys.argv) < 3 or sys.argv[2] != "mlx_lm.server":
-            raise RuntimeError("isolated oracle permits only the mlx_lm.server module")
-        sys.argv = [sys.argv[2], *sys.argv[3:]]
-        runpy.run_module("mlx_lm.server", run_name="__main__", alter_sys=True)
     else:
         raise SystemExit(f"unsupported isolated oracle action: {action}")
 

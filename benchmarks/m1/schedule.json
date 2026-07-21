@@ -4,11 +4,13 @@
   "oracle": {
     "python": "3.12.13",
     "python_executable_sha256": "01564940172b2811e1f39a4dc90e84c7a26a19cf071bbc5de67e456d82627bec",
-    "python_runtime_tree_sha256": "01a580d385a91f4b8bc195c8b2f56c4c2d156f6c1e1ad8768fc4501987c4e12f",
-    "python_runtime_file_count": 1897,
+    "python_runtime_tree_sha256": "63c25fabba8839ccb349e3554fedf9c46011d9e414c76912448a19869f666cac",
+    "python_runtime_file_count": 2122,
     "site_packages_tree_sha256": "db258e22404a3937d46d72ff44083400aafcf34636b8444a91a29c858b297006",
     "site_packages_file_count": 5470,
-    "startup_mode": "python -I -S through oracle/isolated_oracle.py",
+    "hash_seed_probe": 1244036990071903237,
+    "site_bytecode_policy": "reject",
+    "startup_mode": "five-variable scrubbed environment plus python -B -S -s -P -X pycache_prefix=/dev/null through oracle/isolated_oracle.py",
     "mlx": "0.32.0",
     "mlx_metal": "0.32.0",
     "mlx_lm": "0.31.3",
@@ -41,6 +43,16 @@
       "manifest_sha256": "9ba65423d3b2bab1e7c52ea88a1a2b0a33c1f51909b1df66330bf872b7a6c2b0",
       "payload_tree_sha256": "99e6875ffb1bf4eae37242c7c0736a43b45b38dd0088ed671551283c0e268f16",
       "payload_file_count": 8
+    }
+  },
+  "source_model_transport_caches": {
+    "12b": {
+      "tree_sha256": "09b457cc0d497d5603265bea079d1c534ec1d54779ea0280844d9ba7a958fbf0",
+      "file_count": 21
+    },
+    "e4b": {
+      "tree_sha256": "bffa1f7553e9bbc094174133554c6bc8df2cfad630a0dd7c1a00805baaf17027",
+      "file_count": 21
     }
   },
   "core": {

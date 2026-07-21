@@ -12,21 +12,36 @@ verify_tree() {
     local tree=$2
     local expected_manifest_sha256=$3
     local allow_cache=${4:-false}
+    local expected_cache_sha256=${5:-}
     local arguments=(
         script oracle/model_identity.py
         --model "$tree"
         --manifest-sha256 "$expected_manifest_sha256"
     )
     if [[ "$allow_cache" == true ]]; then
-        arguments+=(--allow-huggingface-cache)
+        arguments+=(
+            --allow-huggingface-cache
+            --expected-transport-cache-sha256 "$expected_cache_sha256"
+        )
     fi
     local identity
-    identity=$(oracle/.venv/bin/python -I -S oracle/isolated_oracle.py "${arguments[@]}")
-    jq -e --arg manifest "$expected_manifest_sha256" '
+    identity=$(scripts/run-isolated-oracle.sh "${arguments[@]}")
+    jq -e --arg manifest "$expected_manifest_sha256" --arg cache "$expected_cache_sha256" '
         .schema == "hyperion.model-tree-identity.v1" and
         .manifest_sha256 == $manifest and
         .exact_inventory == true and
         .symlinks_rejected == true and
+        (if $cache == "" then
+            .transport_cache_excluded == false and
+            .transport_cache_separately_bound == false and
+            .transport_cache_tree_sha256 == null and
+            .transport_cache_file_count == 0
+        else
+            .transport_cache_excluded == true and
+            .transport_cache_separately_bound == true and
+            .transport_cache_tree_sha256 == $cache and
+            .transport_cache_file_count > 0
+        end) and
         (.payload_file_count > 0)
     ' <<<"$identity" >/dev/null
     printf 'model-tree-verified: label=%s identity=%s\n' "$label" "$identity"
@@ -54,7 +69,12 @@ verify_e4b_geometry() {
     ' "$config" >/dev/null
 }
 
-verify_tree "M1 E4B source" "$source_dir" "$source_manifest_sha256" true
+verify_tree \
+    "M1 E4B source" \
+    "$source_dir" \
+    "$source_manifest_sha256" \
+    true \
+    bffa1f7553e9bbc094174133554c6bc8df2cfad630a0dd7c1a00805baaf17027
 verify_tree "M1 E4B converted model" "$converted_dir" "$converted_manifest_sha256"
 verify_e4b_geometry "$source_dir/config.json"
 verify_e4b_geometry "$converted_dir/config.json"

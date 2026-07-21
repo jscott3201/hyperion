@@ -34,6 +34,11 @@ for mutation in \
     stderr-hash-drift \
     worker-exit-drift \
     non-capacity-failure \
+    capacity-protocol-error \
+    alloc-substring-failure \
+    traceback-non-string \
+    failure-missing-field \
+    failure-extra-field \
     sigkill-relabel \
     uncontrolled-oom; do
     candidate="$scratch_dir/$mutation.jsonl"

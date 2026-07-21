@@ -22,6 +22,7 @@ from oracle_identity import verify_identity
 SCHEMA = "hyperion.m1-server-smoke.v1"
 RUN_MANIFEST_SCHEMA = "hyperion.m1-run-manifest.v1"
 SERVER_SOURCE_SHA256 = "cdfcb4ac848636f9927851a0ec7a951584526530cb7832ba58049e4a9144db8b"
+LOAD_RECEIPT_PREFIX = "HYPERION_M1_MODEL_LOAD_IDENTITY "
 SERVER_ENVIRONMENT = {
     "LANG": "C",
     "LC_ALL": "C",
@@ -93,6 +94,17 @@ def sanitize_server_log(path: Path, repo_root: Path, model_path: Path) -> None:
         path.read_text(encoding="utf-8", errors="replace"), repo_root, model_path
     )
     path.write_text(text, encoding="utf-8")
+
+
+def load_boundary_identity(path: Path) -> dict[str, Any]:
+    receipts = [
+        json.loads(line.removeprefix(LOAD_RECEIPT_PREFIX))
+        for line in path.read_text(encoding="utf-8", errors="strict").splitlines()
+        if line.startswith(LOAD_RECEIPT_PREFIX)
+    ]
+    if len(receipts) != 1 or not isinstance(receipts[0], dict):
+        raise RuntimeError("server log lacks exactly one in-process model-load receipt")
+    return receipts[0]
 
 
 def parse_args() -> argparse.Namespace:
@@ -228,6 +240,28 @@ def stream_request(port: int, body: dict[str, Any], journal_path: Path) -> dict[
     }
 
 
+def validate_stream_tool_call(call: Any) -> None:
+    if not isinstance(call, dict) or set(call) != {"index", "id", "type", "function"}:
+        raise RuntimeError("stream tool call has invalid keys")
+    if (
+        type(call["index"]) is not int
+        or call["index"] < 0
+        or not isinstance(call["id"], str)
+        or not call["id"]
+        or call["type"] != "function"
+    ):
+        raise RuntimeError("stream tool call identity fields are invalid")
+    function = call["function"]
+    if not isinstance(function, dict) or set(function) != {"name", "arguments"}:
+        raise RuntimeError("stream tool function has invalid keys")
+    if (
+        not isinstance(function["name"], str)
+        or not function["name"]
+        or not isinstance(function["arguments"], str)
+    ):
+        raise RuntimeError("stream tool function fields have invalid types")
+
+
 def validate_stream(result: dict[str, Any], *, expect_tool_call: bool) -> None:
     chunks = result["chunks"]
     if not chunks:
@@ -310,11 +344,11 @@ def validate_stream(result: dict[str, Any], *, expect_tool_call: bool) -> None:
         for field in ("content", "reasoning", "reasoning_content"):
             if field in delta and not isinstance(delta[field], str):
                 raise RuntimeError(f"stream delta {field} is not a string")
-        if "tool_calls" in delta and (
-            not isinstance(delta["tool_calls"], list)
-            or not all(isinstance(call, dict) for call in delta["tool_calls"])
-        ):
-            raise RuntimeError("stream delta tool_calls is not an array of objects")
+        if "tool_calls" in delta:
+            if not isinstance(delta["tool_calls"], list):
+                raise RuntimeError("stream delta tool_calls is not an array")
+            for call in delta["tool_calls"]:
+                validate_stream_tool_call(call)
     if usage_indexes != [len(chunks) - 1]:
         raise RuntimeError("stream requires one terminal usage chunk")
 
@@ -365,7 +399,8 @@ def validate_tool_call(tool_calls: list[dict[str, Any]]) -> dict[str, Any]:
     if len(tool_calls) != 1:
         raise RuntimeError(f"expected exactly one tool call, received {len(tool_calls)}")
     call = tool_calls[0]
-    function = call.get("function") or {}
+    validate_stream_tool_call(call)
+    function = call["function"]
     if function.get("name") != "get_points":
         raise RuntimeError(f"unexpected tool function: {function.get('name')!r}")
     arguments = function.get("arguments")
@@ -404,15 +439,26 @@ def canonical_result(first: dict[str, Any], second: dict[str, Any]) -> dict[str,
 def run_repeat(args: argparse.Namespace, repeat: int, port: int) -> dict[str, Any]:
     log_path = args.output_dir / f"{args.model_key}-repeat-{repeat + 1}.server.log"
     with log_path.open("xb") as log:
+        model_identity = verify_model_tree(args.model_path, args.model_manifest_sha256)
         command = [
             str(args.repo_root / "oracle/.venv/bin/python"),
-            "-I",
+            "-B",
             "-S",
+            "-s",
+            "-P",
+            "-X",
+            "pycache_prefix=/dev/null",
             str(args.repo_root / "oracle/isolated_oracle.py"),
-            "module",
-            "mlx_lm.server",
+            "script",
+            str(args.repo_root / "oracle/verified_mlx_server.py"),
             "--model",
             str(args.model_path),
+            "--model-manifest-sha256",
+            args.model_manifest_sha256,
+            "--model-payload-tree-sha256",
+            model_identity["payload_tree_sha256"],
+            "--model-payload-file-count",
+            str(model_identity["payload_file_count"]),
             "--host",
             "127.0.0.1",
             "--port",
@@ -443,9 +489,14 @@ def run_repeat(args: argparse.Namespace, repeat: int, port: int) -> dict[str, An
             for item in evidence_command
         ]
         evidence_command = [
+            "oracle/verified_mlx_server.py"
+            if item == str(args.repo_root / "oracle/verified_mlx_server.py")
+            else item
+            for item in evidence_command
+        ]
+        evidence_command = [
             "<MODEL>" if item == str(args.model_path) else item for item in evidence_command
         ]
-        model_identity = verify_model_tree(args.model_path, args.model_manifest_sha256)
         process = subprocess.Popen(
             command,
             cwd=args.repo_root,
@@ -524,6 +575,9 @@ def run_repeat(args: argparse.Namespace, repeat: int, port: int) -> dict[str, An
             raise RuntimeError("server ignored SIGTERM and required forced SIGKILL")
         if process.returncode not in (0, -signal.SIGTERM):
             raise RuntimeError(f"server exited unexpectedly with {process.returncode}")
+        boundary_identity = load_boundary_identity(log_path)
+        if boundary_identity != model_identity:
+            raise RuntimeError("server load-boundary identity differs from its pre-spawn check")
         prefix = f"{args.model_key}-repeat-{repeat + 1}"
         journals = {
             turn: {
@@ -541,7 +595,7 @@ def run_repeat(args: argparse.Namespace, repeat: int, port: int) -> dict[str, An
             "expected_termination": process.returncode == -signal.SIGTERM,
             "forced_kill": False,
         }
-        result["model_identity"] = model_identity
+        result["model_identity"] = boundary_identity
         result["server_log_sha256"] = sha256_file(log_path)
         result["journals"] = journals
         write_json_exclusive(
@@ -571,6 +625,11 @@ def main() -> None:
             raise RuntimeError("server-smoke output is not bound to the run-manifest root")
         if sha256_file(Path(__file__).resolve()) != run_manifest.get("server_worker_sha256"):
             raise RuntimeError("server-smoke worker differs from the run manifest")
+        verified_server_path = Path(__file__).resolve().with_name("verified_mlx_server.py")
+        if sha256_file(verified_server_path) != run_manifest.get(
+            "verified_server_source_sha256"
+        ):
+            raise RuntimeError("verified server entry differs from the run manifest")
         model_receipt = args.run_manifest.parent / "preflight/model-verification.log"
         if sha256_file(model_receipt) != run_manifest.get("model_verification_pre_sha256"):
             raise RuntimeError("server-smoke model receipt differs from the run manifest")
@@ -617,6 +676,7 @@ def main() -> None:
             "model_manifest_sha256": actual_manifest,
             "initial_model_identity": initial_model_identity,
             "server_source_sha256": server_source_sha256,
+            "verified_server_source_sha256": sha256_file(verified_server_path),
             "worker_sha256": sha256_file(Path(__file__).resolve()),
             "oracle_launcher_sha256": sha256_file(
                 Path(__file__).resolve().with_name("isolated_oracle.py")

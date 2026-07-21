@@ -16,7 +16,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from model_identity import verify_model_tree
+from model_identity import verified_model_load, verify_model_tree
 from oracle_identity import verify_identity
 
 
@@ -160,11 +160,11 @@ def main() -> int:
             "M1 cells require one warmup and five trials, except explicit 128K low-N stretch rows"
         )
 
-    for key, expected in EXPECTED_ENVIRONMENT.items():
-        if os.environ.get(key) != expected:
-            raise RuntimeError(
-                f"worker environment {key} must be {expected!r}, found {os.environ.get(key)!r}"
-            )
+    if dict(os.environ) != EXPECTED_ENVIRONMENT:
+        raise RuntimeError(
+            f"worker environment must be exactly {EXPECTED_ENVIRONMENT}, "
+            f"found {dict(os.environ)}"
+        )
     forbidden = sorted(
         key
         for key in os.environ
@@ -251,7 +251,9 @@ def main() -> int:
             "python_runtime_file_count": oracle_identity["python_runtime_file_count"],
             "site_packages_tree_sha256": oracle_identity["site_packages_tree_sha256"],
             "site_packages_file_count": oracle_identity["site_packages_file_count"],
-            "isolated_flags": oracle_identity["isolated_flags"],
+            "startup_flags": oracle_identity["startup_flags"],
+            "pycache_prefix": oracle_identity["pycache_prefix"],
+            "hash_seed_probe": oracle_identity["hash_seed_probe"],
             "platform": {"macos": platform.mac_ver()[0], "machine": platform.machine()},
             "mlx_version": oracle_identity["mlx_version"],
             "mlx_metal_version": oracle_identity["mlx_metal_version"],
@@ -285,7 +287,13 @@ def main() -> int:
     )
 
     load_started_ns = time.perf_counter_ns()
-    model, _tokenizer = load(str(args.model_path), lazy=False)
+    model, _tokenizer = verified_model_load(
+        args.model_path,
+        args.model_manifest_sha256,
+        model_identity,
+        load,
+        lazy=False,
+    )
     mx.synchronize()
     load_finished_ns = time.perf_counter_ns()
     prompt = mx.array(token_ids, dtype=mx.int32)
