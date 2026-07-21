@@ -159,3 +159,58 @@ HYPERION_M0_OK
   prerequisites, harden CI/acquisition/ABI failure paths, pass focused re-review, and rerun the
   complete gate before an acceptance row may be appended.
 - Verdict: `REJECTED FOR ACCEPTANCE` — do not merge the reviewed commit.
+
+### `HYP-M0-GATE-002` — post-review full release gate
+
+- Classification: `MEASURED`
+- Source commit: `90e154efae439638ffde6402d640ac3266e88522`
+- Review state: the mandatory adversarial review rejected the earlier candidate, verified all
+  remediations, and returned `READY` for this exact source commit before this gate ran
+- Worktree: clean for tracked files; model and build artifacts ignored by policy
+- Machine state: `m5-16g-local-2026-07-21`
+- Exact command: `scripts/ci-release.sh`
+- Build isolation: fresh temporary Cargo target and CMake build directories; no prior build
+  output reused
+- Cargo lock SHA-256: `63bf01240e9139a52d71d7bf6d8e8ee76a4ad28246dd2e6f27c5794242df98e8`
+- Oracle lock SHA-256: `5e6e51756f1420e078f09badc0748e010eaaa7a5f1b81adfebbe9ca24a0e8883`
+- Oracle package identity: Python 3.12.13, MLX 0.32.0, and `mlx-lm` package version 0.31.3
+  from exact source commit `8239c72de5a0e42c539e30489021db73c7fe258c`
+- Source repository/revision: `google/gemma-4-12B-it-qat-q4_0-unquantized` at
+  `b6ed86275a6a5735884e208bfed95b445a684ca2`
+- Source SHA-256 manifest digest:
+  `6a07a92df9260b71117b113a8ad0b305432a48f895abd850a7616241a636ebed`
+- Converted identity: affine Q4, group size 64, 4 bits; converted SHA-256 manifest digest
+  `9fa3c7f6c49305f621ed1f96edbb34c6402b6229701041db4e607df70e9b4144`
+- Fresh CMake metallib SHA-256:
+  `99553a7d5388eff0ea81e4346276a945733c1e9ee90f18b5b568fb4706f8c7d2`
+- Fresh Cargo sidecar SHA-256:
+  `cc978c2159c7b7eabdda39b256932d3108841a6d0521f7d5855684bf162a7f30`;
+  the hash was unchanged after canary execution
+- Fast checks: locked workspace build, Clippy with warnings denied, Rust tests, six-crate
+  no-orphan graph, unsafe confinement, two-symbol C ABI surface, append-only policy regression
+  and real-base guard, and model-free native build/tests all passed
+- Full native checks: Release-active platform, deliberate negative-control, ABI, and runtime
+  tests passed; the ignored Rust real-M5 test passed; both native probe values were finite and
+  exact
+- Phase order: the native executable and Rust canary exited before the isolated Python oracle
+  process started; source and converted manifests were independently verified before both
+  native and oracle phases
+- Trials: one complete functional post-review release-gate run; this is not a performance row
+- Exit status: `0`
+- Native output:
+
+```text
+MEASURED {"schema":"hyperion.canary.v1","model_scope":"gemma-4","abi_version":1,"macos":"26.6.0","gpu_family":1010,"gpu_name":"Apple M5","mlx_compile":"0.32.0","mlx_runtime":"0.32.0","recommended_working_set_bytes":12713115648,"budget_formula":"min(12GiB,floor(recommended*0.949))","effective_budget_bytes":12064746749,"soft_watermark_bytes":10858272074,"mlx_probe_value":4.0,"metallib_probe_value":42.0}
+MEASURED {"schema":"hyperion.metallib.v1","source":"fresh-cargo-sidecar","sha256":"cc978c2159c7b7eabdda39b256932d3108841a6d0521f7d5855684bf162a7f30","stable_during_canary":true}
+```
+
+- Oracle output:
+
+```text
+MEASURED {"schema":"hyperion.oracle-smoke.v1","model":"gemma-4-12B-QAT-Q4-g64-affine","prompt":"HYPERION_M0_OK","generated":true}
+HYPERION_M0_OK
+```
+
+- Verdict: `PASS (post-review release gate)` — every M0 fast and heavy gate passed
+  sequentially on the reviewed target commit. Milestone acceptance remains pending the
+  non-draft feature PR's required CI and merge into `development`.

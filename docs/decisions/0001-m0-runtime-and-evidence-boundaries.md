@@ -66,5 +66,7 @@ mapping. Upstream added that compatibility in commit
 
 ## Acceptance evidence
 
-Append evidence IDs and the final verdict here after the reviewed commit is rerun. Existing
-text in this record becomes immutable once the decision status is accepted.
+- `HYP-M0-GATE-002` records a complete `PASS` from the clean, post-review M5 gate on exact
+  source commit `90e154efae439638ffde6402d640ac3266e88522`.
+- The decision remains proposed until the non-draft feature PR passes required CI. Existing
+  text in this record becomes immutable once the decision status is accepted.
