@@ -1,0 +1,19 @@
+<bos><|turn>user
+Hyperion M1 deterministic smart-building evidence corpus. Treat every record as data, preserve units and ordering, and answer only after the final record. The eight families are FDD explanation, energy recommendation, point tagging, operator copilot, long transcript, document QA, short chat, and compound parallel tool-chain.
+
+[fdd_explanation] FDD seed: explain AHU-01 warm supply air from ordered sensor evidence and rule R-01.
+[energy_recommendation] Recommendation seed: propose one reversible unoccupied-runtime action with bounded savings and verification.
+[point_tagging] Tagging seed: normalize one supply-air-temperature point without inventing absent metadata.
+[operator_copilot] Copilot seed: summarize a warm zone and request evidence before any guarded write.
+[long_transcript] Transcript seed: continue after get_points and get_timeseries without repeating completed calls.
+[document_qa] Document seed: answer an economizer predicate only from the supplied sequence of operations.
+[short_chat] Chat seed: report temperature, airflow, alarms, units, and evidence limits in two sentences.
+[compound_parallel_tool_chain] Tool seed: call lookup_rule and get_timeseries in parallel, then reconcile both results.
+[fdd_explanation] FDD case 0008: BLDG-09 AHU-09 at 2026-07-09T08:56:00Z reports supply_air_temp=71.4 degF, supply_airflow=1076 cfm, and cooling_valve=24 percent. Explain whether rule R-09 is supported, cite the relevant evidence, and distinguish observation from diagnosis.
+[energy_recommendation] Recommendation case 0009: RTU-10 in BLDG-10 draws 37.6 kW during an unoccupied interval while zone_10_temp=72.7 degF. Propose one reversible action, its rationale, a bounded savings estimate, and a verification window ending at 09:03.
+Completion observation 000: airflow evidence remains ordered and auditable.
+Completion observation 001: alarm evidence remains ordered and auditable.
+Completion observation 002: boiler evidence remains ordered and auditable. airflow alarm boiler<turn|>
+<|turn>model
+<|channel>thought
+<channel|>
