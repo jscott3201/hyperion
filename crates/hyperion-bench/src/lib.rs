@@ -2,6 +2,8 @@
 
 use hyperion_core::CanaryInfo;
 
+pub mod m1;
+
 /// Format one append-ready M0 canary evidence line.
 #[must_use]
 pub fn measured_canary_line(info: &CanaryInfo) -> String {

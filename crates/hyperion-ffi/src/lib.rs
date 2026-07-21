@@ -5,12 +5,13 @@
 use std::{
     error::Error as StdError,
     ffi::CStr,
-    fmt,
+    fmt, io,
     os::raw::{c_char, c_int},
 };
 
 mod raw {
     use super::{c_char, c_int};
+    use std::ffi::c_void;
 
     pub const HYP_STATUS_OK: c_int = 0;
 
@@ -33,6 +34,50 @@ mod raw {
         pub mlx_runtime_version: [c_char; 32],
         pub gpu_name: [c_char; 128],
     }
+
+    /// Darwin `rusage_info_v4` from `<sys/resource.h>`.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct RusageInfoV4 {
+        pub uuid: [u8; 16],
+        pub user_time: u64,
+        pub system_time: u64,
+        pub pkg_idle_wkups: u64,
+        pub interrupt_wkups: u64,
+        pub pageins: u64,
+        pub wired_size: u64,
+        pub resident_size: u64,
+        pub phys_footprint: u64,
+        pub proc_start_abstime: u64,
+        pub proc_exit_abstime: u64,
+        pub child_user_time: u64,
+        pub child_system_time: u64,
+        pub child_pkg_idle_wkups: u64,
+        pub child_interrupt_wkups: u64,
+        pub child_pageins: u64,
+        pub child_elapsed_abstime: u64,
+        pub diskio_bytesread: u64,
+        pub diskio_byteswritten: u64,
+        pub cpu_time_qos_default: u64,
+        pub cpu_time_qos_maintenance: u64,
+        pub cpu_time_qos_background: u64,
+        pub cpu_time_qos_utility: u64,
+        pub cpu_time_qos_legacy: u64,
+        pub cpu_time_qos_user_initiated: u64,
+        pub cpu_time_qos_user_interactive: u64,
+        pub billed_system_time: u64,
+        pub serviced_system_time: u64,
+        pub logical_writes: u64,
+        pub lifetime_max_phys_footprint: u64,
+        pub instructions: u64,
+        pub cycles: u64,
+        pub billed_energy: u64,
+        pub serviced_energy: u64,
+        pub interval_max_phys_footprint: u64,
+        pub runnable_time: u64,
+    }
+
+    pub const RUSAGE_INFO_V4: c_int = 4;
 
     impl Default for HypCanaryInfo {
         fn default() -> Self {
@@ -59,6 +104,11 @@ mod raw {
     unsafe extern "C" {
         pub fn hyp_runtime_canary(out_info: *mut HypCanaryInfo) -> c_int;
         pub fn hyp_last_error(buffer: *mut c_char, buffer_len: usize) -> c_int;
+    }
+
+    #[link(name = "proc")]
+    unsafe extern "C" {
+        pub fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *mut c_void) -> c_int;
     }
 }
 
@@ -145,6 +195,50 @@ pub struct CanaryInfo {
     pub gpu_name: String,
 }
 
+/// Process memory counters returned by Darwin's `proc_pid_rusage` API.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessMemorySample {
+    /// Cumulative page-in count, used as a pressure diagnostic.
+    pub pageins: u64,
+    /// Bytes currently wired for the process.
+    pub wired_size_bytes: u64,
+    /// Resident-set bytes currently attributed to the process.
+    pub resident_size_bytes: u64,
+    /// Current physical footprint, including compressed-memory accounting.
+    pub phys_footprint_bytes: u64,
+    /// Largest physical footprint over the process lifetime.
+    pub lifetime_max_phys_footprint_bytes: u64,
+    /// Largest physical footprint over the kernel's current accounting interval.
+    pub interval_max_phys_footprint_bytes: u64,
+}
+
+/// Sample one live macOS process without exposing Darwin FFI outside this crate.
+pub fn sample_process_memory(pid: u32) -> io::Result<ProcessMemorySample> {
+    let pid = c_int::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "PID exceeds c_int"))?;
+    let mut usage = raw::RusageInfoV4::default();
+    // SAFETY: `usage` is writable and has the exact `rusage_info_v4` C layout selected by the
+    // flavor. `pid` is a checked positive-width Darwin process identifier.
+    let result = unsafe {
+        raw::proc_pid_rusage(
+            pid,
+            raw::RUSAGE_INFO_V4,
+            (&raw mut usage).cast::<std::ffi::c_void>(),
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ProcessMemorySample {
+        pageins: usage.pageins,
+        wired_size_bytes: usage.wired_size,
+        resident_size_bytes: usage.resident_size,
+        phys_footprint_bytes: usage.phys_footprint,
+        lifetime_max_phys_footprint_bytes: usage.lifetime_max_phys_footprint,
+        interval_max_phys_footprint_bytes: usage.interval_max_phys_footprint,
+    })
+}
+
 /// Run the real stateless M0 platform/native canary.
 pub fn runtime_canary() -> Result<CanaryInfo, Error> {
     let mut value = raw::HypCanaryInfo::default();
@@ -213,6 +307,22 @@ mod tests {
             64
         );
         assert_eq!(std::mem::offset_of!(raw::HypCanaryInfo, gpu_name), 96);
+        assert_eq!(std::mem::size_of::<raw::RusageInfoV4>(), 296);
+        assert_eq!(std::mem::offset_of!(raw::RusageInfoV4, wired_size), 56);
+        assert_eq!(std::mem::offset_of!(raw::RusageInfoV4, resident_size), 64);
+        assert_eq!(std::mem::offset_of!(raw::RusageInfoV4, phys_footprint), 72);
+        assert_eq!(
+            std::mem::offset_of!(raw::RusageInfoV4, lifetime_max_phys_footprint),
+            240
+        );
+    }
+
+    #[test]
+    fn samples_current_process_memory() {
+        let sample = sample_process_memory(std::process::id())
+            .expect("proc_pid_rusage should sample the current process");
+        assert!(sample.resident_size_bytes > 0);
+        assert!(sample.phys_footprint_bytes > 0);
     }
 
     #[test]

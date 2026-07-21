@@ -15,6 +15,20 @@ if [[ ! -x oracle/.venv/bin/python ]]; then
     exit 2
 fi
 
+site_packages=oracle/.venv/lib/python3.12/site-packages/mlx_lm
+declare -A expected_source_sha256=(
+    [generate.py]=270778ad53eaca55a8533d82e6752660fe5d2605c4aa0879b48a50a91f69345f
+    [benchmark.py]=31ee1bfff33bc7b87adc94f746eab8f3a6c537a286a7eacf66748875eabd1553
+    [server.py]=cdfcb4ac848636f9927851a0ec7a951584526530cb7832ba58049e4a9144db8b
+)
+for source in generate.py benchmark.py server.py; do
+    actual_source_sha256=$(shasum -a 256 "$site_packages/$source" | awk '{print $1}')
+    if [[ "$actual_source_sha256" != "${expected_source_sha256[$source]}" ]]; then
+        echo "installed mlx-lm $source differs from the reviewed oracle source" >&2
+        exit 1
+    fi
+done
+
 oracle/.venv/bin/python - <<'PY'
 from importlib.metadata import distribution
 import json

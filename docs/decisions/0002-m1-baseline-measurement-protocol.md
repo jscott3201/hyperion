@@ -145,3 +145,11 @@ generation implementation.
 
 Pending. Append-only evidence and the final M1 verdict will be added after the preregistered
 measurement, mandatory adversarial review, and reviewed-commit rerun.
+
+## Protocol clarification 1 — stock allocator-cache behavior
+
+The prohibition in decision 5 applies to project-owned orchestration: Hyperion adds no peak
+reset or allocator-cache clear inside the iterator. The pinned, unchanged `generate_step`
+implementation itself calls `mx.clear_cache()` at its stock prefill-chunk and 256-token
+boundaries. Those upstream calls remain part of the immutable A-arm and must not be removed,
+patched, or relabeled as Hyperion behavior.

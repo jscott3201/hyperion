@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      milestone:
+        description: Cumulative milestone gate to run
+        required: true
+        default: m0
+        type: choice
+        options: [m0, m1]
 
 permissions:
   contents: read
@@ -23,6 +30,8 @@ jobs:
       HYPERION_BASE_REF: ${{ github.event_name == 'push' && github.event.before || 'HEAD^' }}
       HYPERION_M0_SOURCE_MODEL: ${{ vars.HYPERION_M0_SOURCE_MODEL }}
       HYPERION_M0_ORACLE_MODEL: ${{ vars.HYPERION_M0_ORACLE_MODEL }}
+      HYPERION_M1_E4B_SOURCE_MODEL: ${{ vars.HYPERION_M1_E4B_SOURCE_MODEL }}
+      HYPERION_M1_E4B_ORACLE_MODEL: ${{ vars.HYPERION_M1_E4B_ORACLE_MODEL }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -33,7 +42,25 @@ jobs:
           test -n "${HYPERION_M0_ORACLE_MODEL:-}"
           test -f "$HYPERION_M0_SOURCE_MODEL/SHA256SUMS"
           test -f "$HYPERION_M0_ORACLE_MODEL/SHA256SUMS"
+      - name: Validate the external E4B model store
+        if: github.event_name == 'workflow_dispatch' && inputs.milestone == 'm1'
+        run: |
+          test -n "${HYPERION_M1_E4B_SOURCE_MODEL:-}"
+          test -n "${HYPERION_M1_E4B_ORACLE_MODEL:-}"
+          test -f "$HYPERION_M1_E4B_SOURCE_MODEL/SHA256SUMS"
+          test -f "$HYPERION_M1_E4B_ORACLE_MODEL/SHA256SUMS"
       - name: Recreate the locked bench-only oracle
         run: scripts/setup-oracle.sh
       - name: Run cumulative release gate
         run: scripts/ci-release.sh
+      - name: Run protected M1 stock baselines
+        if: github.event_name == 'workflow_dispatch' && inputs.milestone == 'm1'
+        run: scripts/run-m1-baselines.sh "m1-${GITHUB_SHA}"
+      - name: Preserve M1 raw evidence
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.milestone == 'm1'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hyperion-m1-${{ github.sha }}
+          path: benchmarks/raw/m1/m1-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 30
