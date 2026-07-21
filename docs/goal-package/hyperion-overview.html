@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>hyperion — MLX inference engine for Gemma 4 on M5</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Hanken+Grotesk:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --evergreen:#0c3b2a; --evergreen-2:#0f2b21; --ink:#0a1410; --panel:#12211b; --panel-2:#16261e;
+    --green:#16a36a; --teal:#14b3b3; --paper:#f4f7f2; --stone:#c7d2ca; --stone-dim:#8ba093;
+    --hair:rgba(199,210,202,.16); --hair-2:rgba(199,210,202,.10);
+    --amber:#de9410; --violet:#8769f0; --red:#e0504f; --blue:#3b8cf0;
+    --mono:'JetBrains Mono',monospace; --disp:'Space Grotesk',sans-serif; --body:'Hanken Grotesk',sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--ink);color:var(--stone);font-family:var(--body);line-height:1.55;
+    -webkit-font-smoothing:antialiased;padding:0 0 80px}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 28px}
+  .eyebrow{font-family:var(--mono);text-transform:uppercase;letter-spacing:.12em;font-size:11px;color:var(--green);font-weight:500}
+  .eyebrow.teal{color:var(--teal)} .eyebrow.dim{color:var(--stone-dim)}
+  h1{font-family:var(--disp);font-weight:700;color:var(--paper);font-size:40px;line-height:1.08;letter-spacing:-.01em;margin:10px 0 8px}
+  h2{font-family:var(--disp);font-weight:600;color:var(--paper);font-size:22px;letter-spacing:-.01em;margin:0 0 4px}
+  h3{font-family:var(--disp);font-weight:600;color:var(--paper);font-size:15px;margin:0 0 6px}
+  p{font-size:14.5px;color:var(--stone)} .lede{font-size:16px;color:var(--stone);max-width:760px}
+  .num{font-family:var(--mono);font-weight:500}
+  header{background:var(--evergreen-2);border-bottom:1px solid var(--hair);padding:40px 0 34px;margin-bottom:36px}
+  header .wrap{position:relative}
+  .mark{display:flex;align-items:center;gap:10px;margin-bottom:22px}
+  .mark svg{width:22px;height:22px} .mark span{font-family:var(--mono);font-size:12px;letter-spacing:.10em;text-transform:uppercase;color:var(--stone-dim)}
+  .tagline{font-family:var(--mono);font-size:12px;color:var(--green);margin-top:14px;letter-spacing:.02em}
+  section{margin:34px 0}
+  .sec-head{display:flex;align-items:baseline;gap:12px;margin-bottom:16px;border-bottom:1px solid var(--hair-2);padding-bottom:10px}
+  .sec-head .n{font-family:var(--mono);font-size:12px;color:var(--green)}
+  .grid{display:grid;gap:14px}
+  .cards-4{grid-template-columns:repeat(4,1fr)} .cards-3{grid-template-columns:repeat(3,1fr)} .cards-2{grid-template-columns:repeat(2,1fr)}
+  .card{background:var(--panel);border:1px solid var(--hair);border-radius:8px;padding:16px 16px 15px}
+  .card .k{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--stone-dim);margin-bottom:10px}
+  .stat{font-family:var(--mono);font-size:26px;font-weight:600;color:var(--paper);line-height:1} .stat.g{color:var(--green)} .stat.t{color:var(--teal)}
+  .stat .u{font-size:13px;color:var(--stone-dim);font-weight:400}
+  .card small{display:block;margin-top:8px;font-size:12.5px;color:var(--stone-dim);line-height:1.4}
+  .decisions{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
+  .dec{background:var(--panel);border:1px solid var(--hair);border-left:2px solid var(--green);border-radius:8px;padding:14px 16px}
+  .dec .q{font-size:12px;color:var(--stone-dim);margin-bottom:5px} .dec .a{font-family:var(--disp);font-weight:600;color:var(--paper);font-size:15px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--hair-2);vertical-align:top}
+  th{font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--stone-dim);font-weight:500}
+  td .num{color:var(--paper)} .tbl-wrap{background:var(--panel);border:1px solid var(--hair);border-radius:8px;overflow:hidden}
+  .pill{display:inline-block;font-family:var(--mono);font-size:10px;letter-spacing:.04em;padding:2px 7px;border-radius:4px;text-transform:uppercase}
+  .pill.no{background:rgba(224,80,79,.14);color:#f0938f} .pill.yes{background:rgba(22,163,106,.16);color:#54c795}
+  .pill.carry{background:rgba(22,163,106,.14);color:#54c795} .pill.adapt{background:rgba(59,140,240,.14);color:#7bb0f4}
+  .pill.drop{background:rgba(199,210,202,.10);color:var(--stone-dim)} .pill.new{background:rgba(20,179,179,.14);color:#5fd0d0}
+  .ladder{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+  .step{background:var(--panel);border:1px solid var(--hair);border-radius:8px;padding:13px 15px}
+  .step .m{font-family:var(--mono);font-size:12px;color:var(--green);font-weight:600}
+  .step .t{font-family:var(--disp);font-weight:600;color:var(--paper);font-size:14px;margin:3px 0 5px} .step p{font-size:12.5px;color:var(--stone-dim);line-height:1.42}
+  .flow{display:flex;flex-wrap:wrap;gap:8px;align-items:stretch}
+  .box{background:var(--panel);border:1px solid var(--hair);border-radius:8px;padding:11px 13px;flex:1;min-width:150px}
+  .box .l{font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--green);margin-bottom:5px}
+  .box.native .l{color:var(--teal)} .box p{font-size:12px;color:var(--stone-dim);line-height:1.4}
+  .callout{background:var(--panel-2);border:1px solid var(--hair);border-radius:8px;padding:16px 18px;margin-top:6px}
+  .callout .k{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--amber);margin-bottom:8px}
+  ul.tight{list-style:none;padding:0} ul.tight li{position:relative;padding-left:16px;margin:6px 0;font-size:13.5px}
+  ul.tight li:before{content:"";position:absolute;left:0;top:9px;width:5px;height:5px;border-radius:50%;background:var(--green)}
+  ul.tight li.r:before{background:var(--red)} ul.tight li.a:before{background:var(--amber)}
+  .foot{margin-top:44px;padding-top:18px;border-top:1px solid var(--hair);font-size:12px;color:var(--stone-dim);font-family:var(--mono);letter-spacing:.02em}
+  code{font-family:var(--mono);font-size:.92em;color:#9fe3c3;background:rgba(22,163,106,.08);padding:1px 5px;border-radius:4px}
+  @media(max-width:820px){.cards-4,.cards-3,.decisions,.ladder{grid-template-columns:1fr 1fr}.cards-2{grid-template-columns:1fr}h1{font-size:30px}}
+  @media(max-width:520px){.cards-4,.cards-3,.decisions,.ladder{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <div class="mark">
+      <svg viewBox="0 0 24 24" fill="none" stroke="#16a36a" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 17c3 0 4-9 6-9s2 5 4 5 3-8 5-8"/><circle cx="22" cy="5" r="1.6" fill="#16a36a" stroke="none"/></svg>
+      <span>Hyperion · target</span>
+    </div>
+    <div class="eyebrow">Inference engine · goal package v0.2 · 2026-07-21</div>
+    <h1>hyperion</h1>
+    <p class="lede">A clean-sheet Rust&nbsp;+&nbsp;MLX&nbsp;0.32 inference engine built exclusively around the Gemma&nbsp;4 architecture, tuned for the Apple&nbsp;M5 and a 16&nbsp;GB MacBook&nbsp;Pro — for non-coding agentic workloads in smart buildings and energy systems.</p>
+    <div class="tagline">// successor to Helios (Gemma math, FFI, evidence) + mlx-bonsai (serving, governor, eval) — Bonsai models retired on measured quality</div>
+    <div class="tagline" style="color:var(--teal);margin-top:6px">// v0.2 — folds in the NunSpark exploration: target-verified exactness (not byte-identical), append-only rollback, a throughput-optimum governor, an n-gram drafter lane, and a deferred 26B-on-16GB streaming tier</div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <section>
+    <div class="sec-head"><span class="n">01</span><h2>The frame</h2><span class="eyebrow dim">locked with owner, 2026-07-21</span></div>
+    <div class="decisions">
+      <div class="dec"><div class="q">Engine base</div><div class="a">Clean-sheet greenfield</div></div>
+      <div class="dec"><div class="q">Deliverable</div><div class="a">Agent-executable goal package</div></div>
+      <div class="dec"><div class="q">Family scope</div><div class="a">16&nbsp;GB-first — E4B + 12B run; 26B streamable (M9, deferred); 31B architected</div></div>
+      <div class="dec"><div class="q">Bonsai lane</div><div class="a">Dropped — mine infra, not the model</div></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="n">02</span><h2>The engine at a glance</h2></div>
+    <div class="grid cards-4">
+      <div class="card"><div class="k">12B QAT-Q4 weights</div><div class="stat g">~6.7<span class="u">&nbsp;GB</span></div><small>from <code>qat-q4_0-unquantized</code>, MLX affine 4-bit (grid decided by E1)</small></div>
+      <div class="card"><div class="k">Device budget</div><div class="stat">12.06<span class="u">&nbsp;GB</span></div><small>device-read ceiling on m5-16g; governor fail-closed at 529</small></div>
+      <div class="card"><div class="k">Decode ceiling</div><div class="stat">~22<span class="u">&nbsp;tok/s</span></div><small>153&nbsp;GB/s ÷ ~7&nbsp;GB working set — bandwidth-bound; MTP is the only lever through it</small></div>
+      <div class="card"><div class="k">16K peak target</div><div class="stat t">≤10<span class="u">&nbsp;GB</span></div><small>vs Helios <span class="num">21.9&nbsp;GB</span> — the headline M2 gate</small></div>
+    </div>
+    <p style="margin-top:14px;font-size:13.5px;color:var(--stone-dim)">The architecture <em>is</em> the compression: <span class="num" style="color:var(--stone)">40 of 48</span> layers are sliding-window (KV capped at a 1024-token ring, flat forever); the <span class="num" style="color:var(--stone)">8</span> global layers carry a single unified K=V head at 8&nbsp;KiB/token. Total KV at 32K ≈ <span class="num" style="color:var(--stone)">0.6&nbsp;GB</span>, at 256K ≈ <span class="num" style="color:var(--stone)">2.4&nbsp;GB</span> — which is why weight quantization, not KV quantization, is the memory story.</p>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="n">03</span><h2>The moat — the SDPA head-dim gap</h2><span class="eyebrow teal">provable from MLX 0.32 dispatch source</span></div>
+    <p style="margin-bottom:14px;font-size:13.5px">Gemma&nbsp;4's head dimensions (256 local, 512 global) miss MLX's fused attention kernels entirely. That gap — not a hunch — is what a bespoke kernel program (K1/K2) closes. Everything else is inherited from mature MLX.</p>
+    <div class="tbl-wrap">
+      <table>
+        <tr><th>MLX 0.32 fused path</th><th>Supported head_dim</th><th>Gemma 4 local · 256</th><th>Gemma 4 global · 512</th></tr>
+        <tr><td>Full / flash (prefill, q&gt;8)</td><td class="num">64, 80, 128</td><td><span class="pill no">falls back</span></td><td><span class="pill no">falls back</span></td></tr>
+        <tr><td>Vector (decode, q≤8)</td><td class="num">64, 96, 128, 256</td><td><span class="pill yes">fused</span></td><td><span class="pill no">falls back</span></td></tr>
+      </table>
+    </div>
+    <p style="margin-top:12px;font-size:13px;color:var(--stone-dim)">→ Every prefill layer and all global-layer decode/verify run unfused today (the source of Helios's 16K memory blowup and decode tails). <strong style="color:var(--stone)">K1</strong> = global attention kernel (hd&nbsp;512, single K=V read, covers q_len&nbsp;1..γ). <strong style="color:var(--stone)">K2</strong> = windowed-flash prefill (banded hd&nbsp;256 local + hd&nbsp;512 global). <strong style="color:var(--stone)">K3</strong> = NAX/TensorOps probe — stock-first: Apple's M5 gives ~3.5–4× prefill, ~1.2× decode, so custom GEMM only earns its place if it beats stock.</p>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="n">04</span><h2>Shape</h2></div>
+    <div class="flow" style="margin-bottom:10px">
+      <div class="box"><div class="l">Rust · owns policy</div><p>axum dual API (OpenAI + Anthropic), real SSE, tool-call parser + constrained-JSON, sampler, tokenizer + Gemma template, governor policy, conversation cache, bench/eval</p></div>
+      <div class="box native"><div class="l">Native C++ / MLX · owns compute</div><p>one compiled, shape-bucketed step machine; heterogeneous KV (local ring / global K=V); K1/K2 kernels; softcap epilogue; governor mechanics — narrow C ABI, no Python on the request path</p></div>
+    </div>
+    <div class="callout">
+      <div class="k">The execution-model ruling (decided up front — Helios's hardest-won lesson)</div>
+      <p style="font-size:13.5px">No define-by-run re-trace, no <code>concatenate</code>-grow KV, no per-step <code>reset_peak</code>, no deferred global-first eval — those four choices produced decode tails of <span class="num" style="color:var(--stone)">p99&nbsp;511–2162&nbsp;ms</span> against a <span class="num" style="color:var(--stone)">p50&nbsp;82&nbsp;ms</span>. hyperion rules the opposite: bucketed compiled steps, in-place <code>slice_update</code>, one engine thread owning explicit MLX streams.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="n">05</span><h2>Build ladder</h2><span class="eyebrow dim">strict order · gate before advancing</span></div>
+    <div class="ladder">
+      <div class="step"><div class="m">M0–M1</div><div class="t">Canary + baselines</div><p>M5/macOS/MLX pin canary; stock mlx-lm rows on m5-16g (the A-arm forever). Nobody's published these numbers.</p></div>
+      <div class="step"><div class="m">M2</div><div class="t">Native spine + parity</div><p>Geometry-driven graph, heterogeneous KV, compiled step. Gate: <span class="num" style="color:var(--stone)">16K peak ≤ ~10&nbsp;GB</span>, greedy parity vs oracle.</p></div>
+      <div class="step"><div class="m">M3</div><div class="t">Serving + agentic v0</div><p>Dual API, real SSE, tool parser, governor v1. Contract tests; zero uncontrolled OOM.</p></div>
+      <div class="step"><div class="m">M4</div><div class="t">Kernel lane (moat)</div><p>K1/K2/K3 via A/B protocol. Tail gate <span class="num" style="color:var(--stone)">p99&nbsp;≤&nbsp;2×&nbsp;p50</span>; prefill + peak strictly improve.</p></div>
+      <div class="step"><div class="m">M5–M6</div><div class="t">Agentic v1 + cache</div><p>Thinking-mode policy, constrained JSON, + a zero-cost n-gram drafter lane; conversation cache (bitwise-gated exact-prefix reuse — the T0 win, done safely).</p></div>
+      <div class="step"><div class="m">M7–M8</div><div class="t">MTP + family</div><p>Official 400M drafter (target-verified exactness, append-only rollback), ≥+25% gate or park (2-round cap). E4B end-to-end; 26B/31B geometry-validated.</p></div>
+      <div class="step" style="border-left:2px solid var(--teal)"><div class="m" style="color:var(--teal)">M9</div><div class="t">26B-A4B on 16GB <span style="font-family:var(--mono);font-size:10px;color:var(--stone-dim)">POST-V1 · OWNER-GATED</span></div><p>Expert-streaming tier (NunSpark recipe: persistent scatter buffers, two-region cache). Greedy only — spec hurts MoE. Not on the v1 path.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="n">06</span><h2>What carries, what's cut</h2></div>
+    <div class="grid cards-2">
+      <div class="card">
+        <div class="k" style="color:var(--green)">Carry / adapt</div>
+        <ul class="tight" style="margin-top:2px">
+          <li>C ABI shape — opaque handles, status enum, telemetry <span class="pill carry">Helios</span></li>
+          <li>Gemma 4 forward math — 5:1 dispatch, K=V, dual RoPE, softcap <span class="pill carry">Helios</span></li>
+          <li>Dual API + error taxonomy (413/429/529) + real SSE <span class="pill adapt">bonsai</span></li>
+          <li>Predictive memory governor — pattern, Gemma constants <span class="pill adapt">bonsai</span></li>
+          <li>Parity oracle + kernel A/B protocol (G1–G4) <span class="pill carry">bonsai</span></li>
+          <li>Agent-eval harness — re-domained to smart buildings <span class="pill adapt">bonsai</span></li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="k" style="color:var(--stone-dim)">Drop / build-new</div>
+        <ul class="tight" style="margin-top:2px">
+          <li class="r">Define-by-run native model + concat-grow KV <span class="pill drop">drop</span></li>
+          <li class="r">Python-on-request tokenization + faux streaming <span class="pill drop">drop</span></li>
+          <li class="r">KV compression (0.0% active relief) + SSD tier <span class="pill drop">drop</span></li>
+          <li class="r">Ternary/BitLinear kernels (die with Bonsai) <span class="pill drop">drop</span></li>
+          <li>Real sampler — greedy + sampled + penalties <span class="pill new">build</span></li>
+          <li>Constrained-JSON decoder for tool args <span class="pill new">build</span></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="n">07</span><h2>Risks the design refuses to repeat</h2></div>
+    <ul class="tight">
+      <li class="r"><strong style="color:var(--stone)">Fixture-milestone theater.</strong> Helios shipped M06–M11 on stubs; substance was redone. Every gate names tensor-level evidence.</li>
+      <li class="a"><strong style="color:var(--stone)">The MTP marathon.</strong> ~80 goal contracts chasing a +25% gate that stalled at +19.97%. MTP is sequenced late, capped at 2 A/B rounds; opt-in park is a valid outcome.</li>
+      <li class="a"><strong style="color:var(--stone)">Ported-not-derived governor constants.</strong> Bonsai's Qwen ×6 fudge would mispredict on Gemma's KV shape. Constants derived from geometry, calibrated per machine.</li>
+      <li><strong style="color:var(--stone)">Near-miss prefix reuse.</strong> A numerically-attractive 81% TTFT win was rejected for changing one transcript. Reuse is exact-prefix, bitwise-gated only.</li>
+      <li class="a"><strong style="color:var(--stone)">Exactness overclaim (NunSpark, v0.2).</strong> "MTP-on == MTP-off byte-identical" is unachievable — fp16 pass-shape flips a near-tie ~1/110 tokens. Gate is target-verified + a near-tie counter, not byte-identity.</li>
+      <li class="a"><strong style="color:var(--stone)">Governor sizing to the ceiling (NunSpark, v0.2).</strong> More resident memory isn't faster — past the macOS-compressor cliff throughput collapses. Target the measured optimum, below the OOM ceiling.</li>
+    </ul>
+  </section>
+
+  <div class="foot">
+    hyperion goal package v0.2 · 16 spec files + 4 reference sheets · verified by adversarial review (v0.1: 8 findings fixed) + NunSpark exploration (v0.2: A1–A5, B1–B5, M9) ·<br>
+    grounded in live Gemma 4 / MLX 0.32 / M5 research + the Helios, mlx-bonsai &amp; NunSpark codebases · engine + quant are A12 identity-tuple fields — local/dev evidence, not a production claim
+  </div>
+
+</div>
+</body>
+</html>
