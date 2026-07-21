@@ -192,3 +192,48 @@ gate or promotion. Accepted M1 raw evidence is archived as an immutable, content
 GitHub release asset named from the measured commit. The protected workflow downloads the
 asset after upload, compares SHA-256, and emits a retrieval receipt. The finite-retention
 Actions artifact is only a convenience copy and is not the permanent A-arm record.
+
+## Protocol clarification 5 — executable startup and exact model payloads
+
+Oracle entry points execute only as `python -I -S` through the committed isolated launcher.
+Before adding the locked site-packages directory to `sys.path`, that launcher verifies Python
+3.12.13's executable SHA-256, the complete uv-managed runtime tree, and the complete
+site-packages tree. The latter covers every regular non-bytecode file and rejects symlinks;
+only `.DS_Store` and wheel `RECORD` installer receipts are excluded because they are
+non-executable and `RECORD` entry-script rows embed the recreated environment path. Every
+referenced distribution payload, `_virtualenv.py`, every `.pth` file, and any otherwise
+untracked importable or startup-hook file remains covered. The accepted startup identities
+are executable `01564940172b2811e1f39a4dc90e84c7a26a19cf071bbc5de67e456d82627bec`,
+runtime tree `01a580d385a91f4b8bc195c8b2f56c4c2d156f6c1e1ad8768fc4501987c4e12f`
+over 1,897 entries, and site-packages tree
+`db258e22404a3937d46d72ff44083400aafcf34636b8444a91a29c858b297006`
+over 5,470 entries. Oracle setup builds a fresh staging environment, swaps it into place only
+after verification, and restores the prior generated environment on failure.
+
+Each source and converted model verification also requires an exact manifest inventory,
+rejects tree/root symlinks, and hashes every listed payload byte. Hugging Face transport cache
+metadata is ignored only for source snapshots and is never part of a loaded converted tree.
+The benchmark worker rechecks the complete converted tree immediately before its one model
+load; the server-smoke controller repeats that check immediately before each fresh server
+load. An extra `model*.safetensors` shard therefore fails before `mlx_lm.load` can glob it.
+
+## Protocol clarification 6 — authenticated failures, streams, and publication boundary
+
+Every trace verifier resolves the controller-declared sibling stderr filename, hashes its
+actual bytes, validates the exact exit-code/signal shape, and independently recomputes the OOM
+classification. A controlled budget failure requires exit code 1, no signal, exactly one
+structured capacity/allocation failure, and a nonempty controller error set. Signal 9 is always
+uncontrolled. Missing/tampered stderr, forged exit state, and SIGKILL relabeling are negative
+controls and cannot remove a discovery point from eligibility.
+
+Server SSE evidence requires one consistent response identity, one schema-valid choice per
+non-usage chunk, exactly one finish reason, and exactly one terminal usage chunk; arbitrary
+JSON or unknown fields fail verification. Shutdown may end cleanly or by the controller's
+SIGTERM. A server that requires SIGKILL fails the smoke and retains a failure record.
+
+The durable archive has a preregistered whole-run filename allowlist, rejects symlinks and
+extra files, scans every candidate evidence byte for machine paths and credential patterns,
+and compares the allowlist to the content manifest before upload. The release contains two
+permanent assets: the content-addressed evidence ZIP and its retrieval receipt. Repository
+write permission exists only in the protected, manually dispatched archive job; checkout
+never persists credentials, and `GH_TOKEN` is exposed only to the final publishing step.

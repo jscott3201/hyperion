@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,14 @@ ENVIRONMENT = {
     "TOKENIZERS_PARALLELISM": "false",
     "TZ": "UTC",
 }
+ISOLATED_FLAGS = {
+    "ignore_environment": 1,
+    "isolated": 1,
+    "no_site": 1,
+    "no_user_site": 1,
+    "safe_path": True,
+}
+STDERR_BYTES = b"synthetic worker stderr\n"
 
 
 def emit(output: Any, value: dict[str, Any]) -> None:
@@ -79,6 +88,7 @@ def trial(phase: str, trial_index: int) -> dict[str, Any]:
 
 def build(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    path.with_suffix(".stderr.log").write_bytes(STDERR_BYTES)
     with path.open("w", encoding="utf-8") as output:
         emit(
             output,
@@ -108,6 +118,8 @@ def build(path: Path) -> None:
                 "oracle_lock_sha256": ORACLE_LOCK_SHA256,
                 "worker_sha256": "5" * 64,
                 "oracle_identity_source_sha256": "8" * 64,
+                "oracle_launcher_sha256": "7" * 64,
+                "model_identity_source_sha256": "4" * 64,
                 "executable_sha256": "6" * 64,
                 "command": {
                     "program": "hyperion-bench",
@@ -142,6 +154,9 @@ def build(path: Path) -> None:
                 "model_key": "12b",
                 "model_label": MODEL_LABEL,
                 "model_manifest_sha256": MODEL_MANIFEST_SHA256,
+                "model_payload_tree_sha256": "60386542c026e72aa7b8b4a3ffb3e2356fd3e80c3d54939ad75d932d59bff2d7",
+                "model_payload_file_count": 9,
+                "model_exact_inventory": True,
                 "token_file": "synthetic.tokens.u32le",
                 "token_sha256": "d" * 64,
                 "input_tokens": 1024,
@@ -150,6 +165,12 @@ def build(path: Path) -> None:
                 "trials": 5,
                 "arm": "core-default",
                 "python": "3.12.13",
+                "python_executable_sha256": "01564940172b2811e1f39a4dc90e84c7a26a19cf071bbc5de67e456d82627bec",
+                "python_runtime_tree_sha256": "01a580d385a91f4b8bc195c8b2f56c4c2d156f6c1e1ad8768fc4501987c4e12f",
+                "python_runtime_file_count": 1897,
+                "site_packages_tree_sha256": "db258e22404a3937d46d72ff44083400aafcf34636b8444a91a29c858b297006",
+                "site_packages_file_count": 5470,
+                "isolated_flags": ISOLATED_FLAGS,
                 "platform": {"macos": "26.2.0", "machine": "arm64"},
                 "mlx_version": "0.32.0",
                 "mlx_metal_version": "0.32.0",
@@ -165,6 +186,8 @@ def build(path: Path) -> None:
                 "generate_source_sha256": "270778ad53eaca55a8533d82e6752660fe5d2605c4aa0879b48a50a91f69345f",
                 "worker_sha256": "5" * 64,
                 "oracle_identity_source_sha256": "8" * 64,
+                "oracle_launcher_sha256": "7" * 64,
+                "model_identity_source_sha256": "4" * 64,
                 "environment": ENVIRONMENT,
                 "device_info": {"max_recommended_working_set_size": 12_713_115_648},
                 "requested_wired_limit_bytes": 12_713_115_648,
@@ -296,8 +319,8 @@ def build(path: Path) -> None:
                 "worker_exit": {"code": 0, "signal": None},
                 "worker_success": True,
                 "uncontrolled_oom": False,
-                "stderr_file": "synthetic.stderr.log",
-                "stderr_sha256": "7" * 64,
+                "stderr_file": path.with_suffix(".stderr.log").name,
+                "stderr_sha256": hashlib.sha256(STDERR_BYTES).hexdigest(),
                 "os_samples": 18,
                 "os_sample_errors": 0,
                 "validation_errors": [],

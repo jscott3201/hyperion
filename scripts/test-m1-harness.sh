@@ -9,8 +9,9 @@ scratch_dir=$(mktemp -d "${TMPDIR:-/tmp}/hyperion-m1-harness.XXXXXX")
 trap 'rm -rf "$scratch_dir"' EXIT
 
 python3 oracle/build_m1_synthetic_fixtures.py \
-    --output "$scratch_dir/regenerated.jsonl"
-cmp "$fixture" "$scratch_dir/regenerated.jsonl"
+    --output "$scratch_dir/valid-cell.jsonl"
+cmp "$fixture" "$scratch_dir/valid-cell.jsonl"
+cmp "${fixture%.jsonl}.stderr.log" "$scratch_dir/valid-cell.stderr.log"
 "$binary" m1 verify-trace "$fixture" >/dev/null
 
 python3 oracle/mutate_m1_synthetic_fixture.py \
@@ -29,6 +30,11 @@ for mutation in \
     missing-warmup-boundary \
     controller-sample-count \
     trial-event-reorder \
+    missing-stderr \
+    stderr-hash-drift \
+    worker-exit-drift \
+    non-capacity-failure \
+    sigkill-relabel \
     uncontrolled-oom; do
     candidate="$scratch_dir/$mutation.jsonl"
     python3 oracle/mutate_m1_synthetic_fixture.py \

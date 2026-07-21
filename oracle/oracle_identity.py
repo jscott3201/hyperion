@@ -11,6 +11,8 @@ import platform
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from _hyperion_isolated_identity import ORACLE_STARTUP_IDENTITY
+
 
 EXPECTED_PYTHON = "3.12.13"
 EXPECTED_MLX_VERSION = "0.32.0"
@@ -140,6 +142,7 @@ def verify_identity(*, allow_unset_digests: bool = False) -> dict[str, Any]:
     return {
         "schema": "hyperion.m1-oracle-identity.v1",
         "python": python,
+        **ORACLE_STARTUP_IDENTITY,
         "mlx_version": mlx.version,
         "mlx_metal_version": mlx_metal.version,
         "mlx_lm_version": mlx_lm.version,

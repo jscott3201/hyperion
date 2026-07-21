@@ -16,6 +16,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+from model_identity import verify_model_tree
 from oracle_identity import verify_identity
 
 
@@ -177,13 +178,8 @@ def main() -> int:
 
     # Import only after argument and fixture validation so malformed invocations stay model-free.
     token_ids = load_token_ids(args.token_file, args.input_tokens, args.token_sha256)
-    model_manifest = args.model_path / "SHA256SUMS"
-    actual_model_manifest_sha256 = sha256_file(model_manifest)
-    if actual_model_manifest_sha256 != args.model_manifest_sha256:
-        raise RuntimeError(
-            "model manifest SHA-256 mismatch: "
-            f"expected {args.model_manifest_sha256}, got {actual_model_manifest_sha256}"
-        )
+    model_identity = verify_model_tree(args.model_path, args.model_manifest_sha256)
+    actual_model_manifest_sha256 = model_identity["manifest_sha256"]
 
     import mlx.core as mx
     import mlx_lm
@@ -239,6 +235,9 @@ def main() -> int:
             "model_key": args.model_key,
             "model_label": args.model_label,
             "model_manifest_sha256": actual_model_manifest_sha256,
+            "model_payload_tree_sha256": model_identity["payload_tree_sha256"],
+            "model_payload_file_count": model_identity["payload_file_count"],
+            "model_exact_inventory": model_identity["exact_inventory"],
             "token_file": args.token_file.name,
             "token_sha256": args.token_sha256,
             "input_tokens": args.input_tokens,
@@ -247,6 +246,12 @@ def main() -> int:
             "trials": args.trials,
             "arm": args.arm,
             "python": platform.python_version(),
+            "python_executable_sha256": oracle_identity["python_executable_sha256"],
+            "python_runtime_tree_sha256": oracle_identity["python_runtime_tree_sha256"],
+            "python_runtime_file_count": oracle_identity["python_runtime_file_count"],
+            "site_packages_tree_sha256": oracle_identity["site_packages_tree_sha256"],
+            "site_packages_file_count": oracle_identity["site_packages_file_count"],
+            "isolated_flags": oracle_identity["isolated_flags"],
             "platform": {"macos": platform.mac_ver()[0], "machine": platform.machine()},
             "mlx_version": oracle_identity["mlx_version"],
             "mlx_metal_version": oracle_identity["mlx_metal_version"],
@@ -263,6 +268,12 @@ def main() -> int:
             "worker_sha256": sha256_file(worker_path),
             "oracle_identity_source_sha256": sha256_file(
                 worker_path.with_name("oracle_identity.py")
+            ),
+            "oracle_launcher_sha256": sha256_file(
+                worker_path.with_name("isolated_oracle.py")
+            ),
+            "model_identity_source_sha256": sha256_file(
+                worker_path.with_name("model_identity.py")
             ),
             "environment": dict(sorted(os.environ.items())),
             "device_info": device_info,

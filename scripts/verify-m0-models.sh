@@ -9,27 +9,32 @@ verify_tree() {
     local label=$1
     local tree=$2
     local expected_manifest_sha256=$3
-    local manifest="$tree/SHA256SUMS"
-    if [[ ! -f "$manifest" ]]; then
-        echo "$label checksum manifest is missing at $manifest" >&2
-        exit 2
-    fi
-    local actual_manifest_sha256
-    actual_manifest_sha256=$(shasum -a 256 "$manifest" | awk '{print $1}')
-    if [[ "$actual_manifest_sha256" != "$expected_manifest_sha256" ]]; then
-        echo "$label checksum-manifest identity differs from the reviewed artifact" >&2
-        exit 1
-    fi
-    (
-        cd "$tree"
-        shasum -a 256 -c SHA256SUMS
+    local allow_cache=${4:-false}
+    local arguments=(
+        script oracle/model_identity.py
+        --model "$tree"
+        --manifest-sha256 "$expected_manifest_sha256"
     )
+    if [[ "$allow_cache" == true ]]; then
+        arguments+=(--allow-huggingface-cache)
+    fi
+    local identity
+    identity=$(oracle/.venv/bin/python -I -S oracle/isolated_oracle.py "${arguments[@]}")
+    jq -e --arg manifest "$expected_manifest_sha256" '
+        .schema == "hyperion.model-tree-identity.v1" and
+        .manifest_sha256 == $manifest and
+        .exact_inventory == true and
+        .symlinks_rejected == true and
+        (.payload_file_count > 0)
+    ' <<<"$identity" >/dev/null
+    printf 'model-tree-verified: label=%s identity=%s\n' "$label" "$identity"
 }
 
 verify_tree \
     "M0 source" \
     "$source_dir" \
-    6a07a92df9260b71117b113a8ad0b305432a48f895abd850a7616241a636ebed
+    6a07a92df9260b71117b113a8ad0b305432a48f895abd850a7616241a636ebed \
+    true
 verify_tree \
     "M0 converted model" \
     "$converted_dir" \

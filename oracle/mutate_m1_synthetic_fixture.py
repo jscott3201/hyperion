@@ -79,7 +79,13 @@ def mutate(values: list[dict[str, Any]], mutation: str) -> list[dict[str, Any]]:
         )
         values[pending], values[pending + 1] = values[pending + 1], values[pending]
         return values
-    if mutation in ("controlled-failure", "uncontrolled-oom"):
+    if mutation in (
+        "controlled-failure",
+        "uncontrolled-oom",
+        "sigkill-relabel",
+        "worker-exit-drift",
+        "non-capacity-failure",
+    ):
         controller_start = values[0]
         worker_start = next(value for value in values if value.get("kind") == "worker_start")
         model_loaded = next(value for value in values if value.get("kind") == "model_loaded")
@@ -104,7 +110,19 @@ def mutate(values: list[dict[str, Any]], mutation: str) -> list[dict[str, Any]]:
             "message": "synthetic allocation refusal",
             "traceback": ["Traceback (most recent call last):", "RuntimeError: synthetic allocation refusal"],
         }
+        if mutation == "sigkill-relabel":
+            controller_end["worker_exit"] = {"code": None, "signal": 9}
+            controller_end["uncontrolled_oom"] = False
+        elif mutation == "worker-exit-drift":
+            controller_end["worker_exit"] = {"code": 2, "signal": None}
+        elif mutation == "non-capacity-failure":
+            failure["message"] = "synthetic protocol bug"
         return [controller_start, worker_start, model_loaded, failure, controller_end]
+    if mutation == "stderr-hash-drift":
+        values[-1]["stderr_sha256"] = "0" * 64
+        return values
+    if mutation == "missing-stderr":
+        return values
     raise RuntimeError(f"unknown mutation: {mutation}")
 
 
@@ -114,7 +132,12 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--mutation", required=True)
     args = parser.parse_args()
-    write(args.output, mutate(load(args.input), args.mutation))
+    values = mutate(load(args.input), args.mutation)
+    values[-1]["stderr_file"] = args.output.with_suffix(".stderr.log").name
+    write(args.output, values)
+    output_stderr = args.output.with_suffix(".stderr.log")
+    if args.mutation != "missing-stderr":
+        output_stderr.write_bytes(args.input.with_suffix(".stderr.log").read_bytes())
 
 
 if __name__ == "__main__":

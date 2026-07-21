@@ -36,19 +36,9 @@ if [[ ! -f "$run_root/SHA256SUMS" ]]; then
     echo "M1 archive lacks its content manifest" >&2
     exit 1
 fi
+scripts/verify-m1-archive-layout.sh "$run_root" >/dev/null
 scratch_dir=$(mktemp -d "${TMPDIR:-/tmp}/hyperion-m1-archive.XXXXXX")
 trap 'rm -rf "$scratch_dir"' EXIT
-(
-    cd "$run_root"
-    shasum -a 256 -c SHA256SUMS >/dev/null
-    find . -type f ! -name SHA256SUMS ! -name archive-receipt.json -print | LC_ALL=C sort \
-        >"$scratch_dir/actual-files.txt"
-    cut -c 67- SHA256SUMS | LC_ALL=C sort >"$scratch_dir/manifest-files.txt"
-)
-if ! cmp "$scratch_dir/actual-files.txt" "$scratch_dir/manifest-files.txt"; then
-    echo "M1 content manifest does not cover exactly the files selected for archival" >&2
-    exit 1
-fi
 "$binary" m1 summarize --input-dir "$run_root/core" >"$scratch_dir/recomputed-summary.json"
 if ! cmp "$run_root/core-summary.json" "$scratch_dir/recomputed-summary.json" \
     || ! cmp "$run_root/summary.json" "$scratch_dir/recomputed-summary.json"; then
@@ -58,6 +48,7 @@ fi
 
 tag="m1-evidence-$source_commit"
 asset="hyperion-m1-$source_commit.zip"
+receipt_asset="hyperion-m1-$source_commit-receipt.json"
 if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
     echo "refusing to replace immutable M1 evidence release $tag" >&2
     exit 1
@@ -73,7 +64,7 @@ gh release create "$tag" "$archive#Hyperion M1 raw evidence" \
     --repo "$GITHUB_REPOSITORY" \
     --target "$source_commit" \
     --title "Hyperion M1 baseline evidence $source_commit" \
-    --notes "Permanent content-addressed raw M1 baseline evidence. SHA-256: $archive_sha256"
+    --notes "Permanent content-addressed raw M1 baseline evidence. ZIP SHA-256: $archive_sha256. Retrieval receipt asset: $receipt_asset"
 
 download_dir="$scratch_dir/download"
 mkdir -p "$download_dir"
@@ -91,6 +82,7 @@ jq -n \
     --arg source_commit "$source_commit" \
     --arg tag "$tag" \
     --arg asset "$asset" \
+    --arg receipt_asset "$receipt_asset" \
     --arg archive_sha256 "$archive_sha256" \
     --arg retrieved_sha256 "$retrieved_sha256" \
     --arg release_url "$release_url" \
@@ -102,6 +94,7 @@ jq -n \
       archive_kind: "github_release_asset",
       release_tag: $tag,
       asset_name: $asset,
+      receipt_asset_name: $receipt_asset,
       archive_sha256: $archive_sha256,
       retrieved_sha256: $retrieved_sha256,
       retrieval_verified: ($archive_sha256 == $retrieved_sha256),
@@ -109,5 +102,22 @@ jq -n \
       asset_url: $asset_url
     }
     ' >"$run_root/archive-receipt.json"
-printf 'm1-archive-pass: tag=%s asset=%s sha256=%s receipt=%s\n' \
-    "$tag" "$asset" "$archive_sha256" "$run_root/archive-receipt.json"
+cp "$run_root/archive-receipt.json" "$scratch_dir/$receipt_asset"
+gh release upload "$tag" "$scratch_dir/$receipt_asset#M1 durable retrieval receipt" \
+    --repo "$GITHUB_REPOSITORY"
+receipt_download_dir="$scratch_dir/receipt-download"
+mkdir -p "$receipt_download_dir"
+gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$receipt_asset" \
+    --dir "$receipt_download_dir"
+if ! cmp "$scratch_dir/$receipt_asset" "$receipt_download_dir/$receipt_asset"; then
+    echo "retrieved M1 receipt asset differs from the uploaded receipt" >&2
+    exit 1
+fi
+release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag")
+if [[ "$(jq -r --arg archive "$asset" --arg receipt "$receipt_asset" \
+    '[.assets[].name] | contains([$archive, $receipt])' <<<"$release_json")" != true ]]; then
+    echo "M1 release does not contain both permanent evidence assets" >&2
+    exit 1
+fi
+printf 'm1-archive-pass: tag=%s asset=%s sha256=%s receipt_asset=%s receipt=%s\n' \
+    "$tag" "$asset" "$archive_sha256" "$receipt_asset" "$run_root/archive-receipt.json"

@@ -3,6 +3,12 @@
   "protocol": "docs/decisions/0002-m1-baseline-measurement-protocol.md",
   "oracle": {
     "python": "3.12.13",
+    "python_executable_sha256": "01564940172b2811e1f39a4dc90e84c7a26a19cf071bbc5de67e456d82627bec",
+    "python_runtime_tree_sha256": "01a580d385a91f4b8bc195c8b2f56c4c2d156f6c1e1ad8768fc4501987c4e12f",
+    "python_runtime_file_count": 1897,
+    "site_packages_tree_sha256": "db258e22404a3937d46d72ff44083400aafcf34636b8444a91a29c858b297006",
+    "site_packages_file_count": 5470,
+    "startup_mode": "python -I -S through oracle/isolated_oracle.py",
     "mlx": "0.32.0",
     "mlx_metal": "0.32.0",
     "mlx_lm": "0.31.3",
@@ -24,6 +30,18 @@
     "PYTHONHASHSEED": "0",
     "TOKENIZERS_PARALLELISM": "false",
     "TZ": "UTC"
+  },
+  "converted_model_payloads": {
+    "12b": {
+      "manifest_sha256": "9fa3c7f6c49305f621ed1f96edbb34c6402b6229701041db4e607df70e9b4144",
+      "payload_tree_sha256": "60386542c026e72aa7b8b4a3ffb3e2356fd3e80c3d54939ad75d932d59bff2d7",
+      "payload_file_count": 9
+    },
+    "e4b": {
+      "manifest_sha256": "9ba65423d3b2bab1e7c52ea88a1a2b0a33c1f51909b1df66330bf872b7a6c2b0",
+      "payload_tree_sha256": "99e6875ffb1bf4eae37242c7c0736a43b45b38dd0088ed671551283c0e268f16",
+      "payload_file_count": 8
+    }
   },
   "core": {
     "models": ["12b", "e4b"],

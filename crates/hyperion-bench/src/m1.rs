@@ -44,6 +44,14 @@ const MLX_LM_PACKAGE_SHA256: &str =
     "f9ffa88772d26e537a98aa39ab16488a7a0d13cc1fac5d665376132c94b49608";
 const MLX_LM_GENERATE_SHA256: &str =
     "270778ad53eaca55a8533d82e6752660fe5d2605c4aa0879b48a50a91f69345f";
+const PYTHON_EXECUTABLE_SHA256: &str =
+    "01564940172b2811e1f39a4dc90e84c7a26a19cf071bbc5de67e456d82627bec";
+const PYTHON_RUNTIME_TREE_SHA256: &str =
+    "01a580d385a91f4b8bc195c8b2f56c4c2d156f6c1e1ad8768fc4501987c4e12f";
+const PYTHON_RUNTIME_FILE_COUNT: u64 = 1_897;
+const SITE_PACKAGES_TREE_SHA256: &str =
+    "db258e22404a3937d46d72ff44083400aafcf34636b8444a91a29c858b297006";
+const SITE_PACKAGES_FILE_COUNT: u64 = 5_470;
 const RUN_MANIFEST_SCHEMA: &str = "hyperion.m1-run-manifest.v1";
 const SCHEDULE_SCHEMA: &str = "hyperion.m1-schedule.v1";
 const COMMAND_SCHEMA: &str = "hyperion.m1-controller-command.v1";
@@ -88,6 +96,8 @@ struct ModelSpec {
     key: &'static str,
     label: &'static str,
     manifest_sha256: &'static str,
+    payload_tree_sha256: &'static str,
+    payload_file_count: u64,
     default_relative_path: &'static str,
     primary_env: &'static str,
     fallback_env: Option<&'static str>,
@@ -97,6 +107,8 @@ const MODEL_12B: ModelSpec = ModelSpec {
     key: "12b",
     label: "gemma-4-12B-QAT-Q4-g64-affine",
     manifest_sha256: "9fa3c7f6c49305f621ed1f96edbb34c6402b6229701041db4e607df70e9b4144",
+    payload_tree_sha256: "60386542c026e72aa7b8b4a3ffb3e2356fd3e80c3d54939ad75d932d59bff2d7",
+    payload_file_count: 9,
     default_relative_path: "artifacts/models/gemma4-12b-qat-mlx-g64-b4",
     primary_env: "HYPERION_M1_12B_ORACLE_MODEL",
     fallback_env: Some("HYPERION_M0_ORACLE_MODEL"),
@@ -106,6 +118,8 @@ const MODEL_E4B: ModelSpec = ModelSpec {
     key: "e4b",
     label: "gemma-4-E4B-QAT-Q4-g64-affine",
     manifest_sha256: "9ba65423d3b2bab1e7c52ea88a1a2b0a33c1f51909b1df66330bf872b7a6c2b0",
+    payload_tree_sha256: "99e6875ffb1bf4eae37242c7c0736a43b45b38dd0088ed671551283c0e268f16",
+    payload_file_count: 8,
     default_relative_path: "artifacts/models/gemma4-e4b-qat-mlx-g64-b4",
     primary_env: "HYPERION_M1_E4B_ORACLE_MODEL",
     fallback_env: None,
@@ -147,6 +161,8 @@ struct RunManifest {
     worker_sha256: String,
     server_worker_sha256: String,
     oracle_identity_source_sha256: String,
+    oracle_launcher_sha256: String,
+    model_identity_source_sha256: String,
     preflight_log_sha256: String,
     oracle_verification_pre_sha256: String,
     model_verification_pre_sha256: String,
@@ -612,6 +628,7 @@ fn begin_run(arguments: BeginRunArgs) -> Result<(), Error> {
             )));
         }
     }
+    verify_preflight_receipts(&repo, &run_root)?;
 
     let executable = env::current_exe()?;
     let mlx_root =
@@ -691,6 +708,8 @@ fn begin_run(arguments: BeginRunArgs) -> Result<(), Error> {
         "worker_sha256": sha256_file(&repo.join("oracle/m1_bench_worker.py"))?,
         "server_worker_sha256": sha256_file(&repo.join("oracle/m1_server_smoke.py"))?,
         "oracle_identity_source_sha256": sha256_file(&repo.join("oracle/oracle_identity.py"))?,
+        "oracle_launcher_sha256": sha256_file(&repo.join("oracle/isolated_oracle.py"))?,
+        "model_identity_source_sha256": sha256_file(&repo.join("oracle/model_identity.py"))?,
         "preflight_log_sha256": sha256_file(&preflight_log)?,
         "oracle_verification_pre_sha256": sha256_file(&oracle_receipt)?,
         "model_verification_pre_sha256": sha256_file(&model_receipt)?,
@@ -810,6 +829,10 @@ fn run_cell(arguments: RunCellArgs) -> Result<(), Error> {
             != sha256_file(&repo.join("oracle/m1_server_smoke.py"))?
         || run_manifest.oracle_identity_source_sha256
             != sha256_file(&repo.join("oracle/oracle_identity.py"))?
+        || run_manifest.oracle_launcher_sha256
+            != sha256_file(&repo.join("oracle/isolated_oracle.py"))?
+        || run_manifest.model_identity_source_sha256
+            != sha256_file(&repo.join("oracle/model_identity.py"))?
         || run_manifest.schedule_sha256 != sha256_file(&repo.join("benchmarks/m1/schedule.json"))?
         || run_manifest.preflight_log_sha256
             != sha256_file(&run_root.join("preflight/preflight.log"))?
@@ -931,6 +954,8 @@ fn run_cell(arguments: RunCellArgs) -> Result<(), Error> {
             "oracle_lock_sha256": ORACLE_LOCK_SHA256,
             "worker_sha256": sha256_file(&worker)?,
             "oracle_identity_source_sha256": run_manifest.oracle_identity_source_sha256,
+            "oracle_launcher_sha256": run_manifest.oracle_launcher_sha256,
+            "model_identity_source_sha256": run_manifest.model_identity_source_sha256,
             "executable_sha256": sha256_file(&executable)?,
             "command": {
                 "program": "hyperion-bench",
@@ -952,6 +977,9 @@ fn run_cell(arguments: RunCellArgs) -> Result<(), Error> {
     let mut command = Command::new(&python);
     command
         .current_dir(&repo)
+        .args(["-I", "-S"])
+        .arg(repo.join("oracle/isolated_oracle.py"))
+        .arg("script")
         .arg(&worker)
         .args(["--model-path", path_text(&model_path)?])
         .args(["--model-key", arguments.model.key])
@@ -1496,6 +1524,18 @@ fn worker_environment_matches(value: Option<&Value>) -> bool {
         && expected.iter().all(|(key, expected_value)| {
             object.get(*key).and_then(Value::as_str) == Some(*expected_value)
         })
+}
+
+fn isolated_flags_match(value: Option<&Value>) -> bool {
+    let Some(object) = value.and_then(Value::as_object) else {
+        return false;
+    };
+    object.len() == 5
+        && object.get("isolated").and_then(Value::as_u64) == Some(1)
+        && object.get("no_site").and_then(Value::as_u64) == Some(1)
+        && object.get("ignore_environment").and_then(Value::as_u64) == Some(1)
+        && object.get("safe_path").and_then(Value::as_bool) == Some(true)
+        && object.get("no_user_site").and_then(Value::as_u64) == Some(1)
 }
 
 fn send_worker_command(
@@ -2385,6 +2425,9 @@ fn verify_run(directory: &Path) -> Result<(), Error> {
         || manifest.server_worker_sha256 != sha256_file(&repo.join("oracle/m1_server_smoke.py"))?
         || manifest.oracle_identity_source_sha256
             != sha256_file(&repo.join("oracle/oracle_identity.py"))?
+        || manifest.oracle_launcher_sha256 != sha256_file(&repo.join("oracle/isolated_oracle.py"))?
+        || manifest.model_identity_source_sha256
+            != sha256_file(&repo.join("oracle/model_identity.py"))?
         || manifest.preflight_log_sha256 != sha256_file(&run_root.join("preflight/preflight.log"))?
         || manifest.oracle_verification_pre_sha256
             != sha256_file(&run_root.join("preflight/oracle-verification.log"))?
@@ -2429,6 +2472,16 @@ fn verify_run(directory: &Path) -> Result<(), Error> {
     {
         return Err(Error::new(
             "pre/post oracle or full-model verification receipts differ",
+        ));
+    }
+    let (expected_oracle, expected_models) = current_verification_receipts(&repo)?;
+    if fs::read(&pre_oracle)? != expected_oracle
+        || fs::read(&post_oracle)? != expected_oracle
+        || fs::read(&pre_models)? != expected_models
+        || fs::read(&post_models)? != expected_models
+    {
+        return Err(Error::new(
+            "pre/post oracle or model receipt is not the semantic output of current verification",
         ));
     }
 
@@ -2568,20 +2621,8 @@ fn verify_run(directory: &Path) -> Result<(), Error> {
         ));
     }
 
-    let server_12b = verify_server_smoke(
-        &run_root,
-        "12b",
-        MODEL_12B.manifest_sha256,
-        &manifest,
-        &manifest_sha256,
-    )?;
-    let server_e4b = verify_server_smoke(
-        &run_root,
-        "e4b",
-        MODEL_E4B.manifest_sha256,
-        &manifest,
-        &manifest_sha256,
-    )?;
+    let server_12b = verify_server_smoke(&run_root, MODEL_12B, &manifest, &manifest_sha256)?;
+    let server_e4b = verify_server_smoke(&run_root, MODEL_E4B, &manifest, &manifest_sha256)?;
     verify_server_file_set(&run_root.join("server"))?;
     let acca_finish = acca_cells
         .iter()
@@ -2682,12 +2723,13 @@ fn reject_symlinks(directory: &Path) -> Result<(), Error> {
 
 fn verify_server_smoke(
     run_root: &Path,
-    model_key: &str,
-    model_manifest_sha256: &str,
+    model: ModelSpec,
     manifest: &RunManifest,
     run_manifest_sha256: &str,
 ) -> Result<(u64, u64), Error> {
     let server_dir = run_root.join("server");
+    let model_key = model.key;
+    let model_manifest_sha256 = model.manifest_sha256;
     let (model_label, base_port) = match model_key {
         "12b" => (MODEL_12B.label, 18_080_u64),
         "e4b" => (MODEL_E4B.label, 18_090_u64),
@@ -2718,6 +2760,12 @@ fn verify_server_smoke(
         || value.get("server_source_sha256").and_then(Value::as_str) != Some(MLX_LM_SERVER_SHA256)
         || value.get("worker_sha256").and_then(Value::as_str)
             != Some(&manifest.server_worker_sha256)
+        || value.get("oracle_launcher_sha256").and_then(Value::as_str)
+            != Some(&manifest.oracle_launcher_sha256)
+        || value
+            .get("model_identity_source_sha256")
+            .and_then(Value::as_str)
+            != Some(&manifest.model_identity_source_sha256)
         || value.get("deterministic").and_then(Value::as_bool) != Some(true)
         || value.get("repeat_count").and_then(Value::as_u64) != Some(2)
         || value
@@ -2751,6 +2799,27 @@ fn verify_server_smoke(
         .get("oracle_identity")
         .ok_or_else(|| Error::new("server smoke lacks oracle identity"))?;
     if identity.get("python").and_then(Value::as_str) != Some(ORACLE_PYTHON)
+        || identity
+            .get("python_executable_sha256")
+            .and_then(Value::as_str)
+            != Some(PYTHON_EXECUTABLE_SHA256)
+        || identity
+            .get("python_runtime_tree_sha256")
+            .and_then(Value::as_str)
+            != Some(PYTHON_RUNTIME_TREE_SHA256)
+        || identity
+            .get("python_runtime_file_count")
+            .and_then(Value::as_u64)
+            != Some(PYTHON_RUNTIME_FILE_COUNT)
+        || identity
+            .get("site_packages_tree_sha256")
+            .and_then(Value::as_str)
+            != Some(SITE_PACKAGES_TREE_SHA256)
+        || identity
+            .get("site_packages_file_count")
+            .and_then(Value::as_u64)
+            != Some(SITE_PACKAGES_FILE_COUNT)
+        || !isolated_flags_match(identity.get("isolated_flags"))
         || identity.get("mlx_version").and_then(Value::as_str) != Some(MLX_VERSION)
         || identity.get("mlx_metal_version").and_then(Value::as_str) != Some(MLX_METAL_VERSION)
         || identity.get("mlx_lm_version").and_then(Value::as_str) != Some(MLX_LM_VERSION)
@@ -2764,6 +2833,14 @@ fn verify_server_smoke(
     {
         return Err(Error::new(format!(
             "{model_key} server smoke oracle identity is invalid"
+        )));
+    }
+    let initial_model_identity = value
+        .get("initial_model_identity")
+        .ok_or_else(|| Error::new("server smoke lacks initial exact model identity"))?;
+    if !valid_model_identity(initial_model_identity, model) {
+        return Err(Error::new(format!(
+            "{model_key} server smoke initial model identity is invalid"
         )));
     }
     if !worker_environment_matches(value.get("server_environment")) {
@@ -2791,6 +2868,11 @@ fn verify_server_smoke(
             || repeat.get("command") != Some(&expected_server_command(port))
         {
             return Err(Error::new("server repeat command identity is invalid"));
+        }
+        if repeat.get("model_identity") != Some(initial_model_identity) {
+            return Err(Error::new(
+                "server repeat did not revalidate the exact model tree before load",
+            ));
         }
         let warmup = repeat
             .get("warmup")
@@ -2830,22 +2912,11 @@ fn verify_server_smoke(
         if canonical_hashes[index].as_str() != Some(&canonical_sha256) {
             return Err(Error::new("server canonical hash does not recompute"));
         }
-        let returncode = repeat
+        let server_exit = repeat
             .get("server_exit")
-            .and_then(|exit| exit.get("returncode"))
-            .and_then(Value::as_i64)
             .ok_or_else(|| Error::new("server repeat lacks process exit"))?;
-        if !matches!(returncode, 0 | -15 | -9) {
+        if !valid_server_exit(server_exit) {
             return Err(Error::new("server repeat has an unexpected process exit"));
-        }
-        let expected_termination = repeat
-            .get("server_exit")
-            .and_then(|exit| exit.get("expected_termination"))
-            .and_then(Value::as_bool);
-        if expected_termination != Some(returncode != 0) {
-            return Err(Error::new(
-                "server repeat process-exit classification is invalid",
-            ));
         }
         let repeat_path = server_dir.join(format!("{model_key}-repeat-{repeat_number}.json"));
         let repeat_value: Value = serde_json::from_slice(&fs::read(&repeat_path)?)?;
@@ -2911,10 +2982,41 @@ fn valid_usage(value: Option<&Value>) -> bool {
     prompt > 0 && completion > 0 && prompt.checked_add(completion) == Some(total)
 }
 
+fn valid_server_exit(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object.len() != 3 || value.get("forced_kill").and_then(Value::as_bool) != Some(false) {
+        return false;
+    }
+    match value.get("returncode").and_then(Value::as_i64) {
+        Some(0) => value.get("expected_termination").and_then(Value::as_bool) == Some(false),
+        Some(-15) => value.get("expected_termination").and_then(Value::as_bool) == Some(true),
+        _ => false,
+    }
+}
+
+fn valid_model_identity(value: &Value, model: ModelSpec) -> bool {
+    value.get("schema").and_then(Value::as_str) == Some("hyperion.model-tree-identity.v1")
+        && value.get("manifest_sha256").and_then(Value::as_str) == Some(model.manifest_sha256)
+        && value.get("payload_tree_sha256").and_then(Value::as_str)
+            == Some(model.payload_tree_sha256)
+        && value.get("payload_file_count").and_then(Value::as_u64) == Some(model.payload_file_count)
+        && value.get("exact_inventory").and_then(Value::as_bool) == Some(true)
+        && value.get("symlinks_rejected").and_then(Value::as_bool) == Some(true)
+        && value
+            .get("transport_cache_excluded")
+            .and_then(Value::as_bool)
+            == Some(false)
+}
+
 fn expected_server_command(port: u64) -> Value {
     json!([
         "oracle/.venv/bin/python",
-        "-m",
+        "-I",
+        "-S",
+        "oracle/isolated_oracle.py",
+        "module",
         "mlx_lm.server",
         "--model",
         "<MODEL>",
@@ -3050,6 +3152,11 @@ fn validate_server_turn(turn: &Value, kind: &str) -> Result<(), Error> {
         .get("finish_reasons")
         .and_then(Value::as_array)
         .ok_or_else(|| Error::new("server finish_reasons is not an array"))?;
+    if reasons.len() != 1 {
+        return Err(Error::new(
+            "server response must contain exactly one finish reason",
+        ));
+    }
     let terminal = reasons.last().and_then(Value::as_str);
     match kind {
         "warmup" if matches!(terminal, Some("tool_calls" | "stop")) => {}
@@ -3152,6 +3259,7 @@ fn canonical_server_result(first: &Value, final_turn: &Value) -> Result<Value, E
 }
 
 fn assemble_server_chunks(chunks: &[Value]) -> Result<Value, Error> {
+    validate_server_chunk_stream(chunks)?;
     let mut content = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::<Value>::new();
@@ -3161,12 +3269,10 @@ fn assemble_server_chunks(chunks: &[Value]) -> Result<Value, Error> {
         if let Some(value) = chunk.get("usage").filter(|value| !value.is_null()) {
             usage = value.clone();
         }
-        let choices = match chunk.get("choices") {
-            None | Some(Value::Null) => continue,
-            Some(value) => value
-                .as_array()
-                .ok_or_else(|| Error::new("server SSE choices is not an array"))?,
-        };
+        let choices = chunk
+            .get("choices")
+            .and_then(Value::as_array)
+            .expect("chunk schema validation established choices");
         for choice in choices {
             let delta = choice.get("delta").filter(|value| !value.is_null());
             if let Some(delta) = delta {
@@ -3210,6 +3316,165 @@ fn assemble_server_chunks(chunks: &[Value]) -> Result<Value, Error> {
         "finish_reasons": finish_reasons,
         "usage": usage,
     }))
+}
+
+fn validate_server_chunk_stream(chunks: &[Value]) -> Result<(), Error> {
+    if chunks.is_empty() {
+        return Err(Error::new("server SSE emitted no JSON chunks"));
+    }
+    let mut identity = None::<(String, String, String, u64)>;
+    let mut usage_indexes = Vec::new();
+    let mut finish_reasons = 0_u32;
+    for (index, chunk) in chunks.iter().enumerate() {
+        if !object_has_only_keys(
+            chunk,
+            &[
+                "id",
+                "system_fingerprint",
+                "object",
+                "model",
+                "created",
+                "choices",
+                "usage",
+            ],
+        ) || [
+            "id",
+            "system_fingerprint",
+            "object",
+            "model",
+            "created",
+            "choices",
+        ]
+        .iter()
+        .any(|key| chunk.get(*key).is_none())
+        {
+            return Err(Error::new("server SSE chunk has invalid top-level keys"));
+        }
+        let current_identity = (
+            string_field(chunk, "id")?.to_owned(),
+            string_field(chunk, "system_fingerprint")?.to_owned(),
+            string_field(chunk, "model")?.to_owned(),
+            u64_field(chunk, "created")?,
+        );
+        if current_identity.0.is_empty()
+            || current_identity.1.is_empty()
+            || current_identity.2.is_empty()
+            || current_identity.3 == 0
+            || identity
+                .as_ref()
+                .is_some_and(|expected| expected != &current_identity)
+        {
+            return Err(Error::new(
+                "server SSE chunk identity is invalid or changed",
+            ));
+        }
+        identity.get_or_insert(current_identity);
+        let choices = chunk
+            .get("choices")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::new("server SSE choices is not an array"))?;
+        if choices.len() > 1 {
+            return Err(Error::new("server SSE choices has more than one item"));
+        }
+        if choices.is_empty() {
+            let usage = chunk
+                .get("usage")
+                .ok_or_else(|| Error::new("empty-choice SSE chunk lacks usage"))?;
+            if string_field(chunk, "object")? != "chat.completion"
+                || !valid_usage(Some(usage))
+                || !object_has_only_keys(
+                    usage,
+                    &[
+                        "prompt_tokens",
+                        "completion_tokens",
+                        "total_tokens",
+                        "prompt_tokens_details",
+                    ],
+                )
+            {
+                return Err(Error::new("server SSE usage envelope is invalid"));
+            }
+            if let Some(details) = usage.get("prompt_tokens_details")
+                && (!object_has_only_keys(details, &["cached_tokens"])
+                    || details.as_object().is_none_or(|object| object.len() != 1)
+                    || details
+                        .get("cached_tokens")
+                        .and_then(Value::as_u64)
+                        .is_none())
+            {
+                return Err(Error::new("server SSE cached-token details are invalid"));
+            }
+            usage_indexes.push(index);
+            continue;
+        }
+        if chunk.get("usage").is_some_and(|usage| !usage.is_null())
+            || string_field(chunk, "object")? != "chat.completion.chunk"
+        {
+            return Err(Error::new(
+                "nonempty server SSE chunk has usage or the wrong object type",
+            ));
+        }
+        let choice = &choices[0];
+        if !object_has_only_keys(choice, &["index", "finish_reason", "delta"])
+            || choice.get("index").and_then(Value::as_u64) != Some(0)
+        {
+            return Err(Error::new("server SSE choice keys or index are invalid"));
+        }
+        if let Some(reason) = choice.get("finish_reason").filter(|value| !value.is_null()) {
+            if !reason.is_string() {
+                return Err(Error::new("server SSE finish reason is not a string"));
+            }
+            finish_reasons += 1;
+        }
+        let delta = choice
+            .get("delta")
+            .ok_or_else(|| Error::new("server SSE choice lacks delta"))?;
+        if !object_has_only_keys(
+            delta,
+            &[
+                "role",
+                "content",
+                "reasoning",
+                "reasoning_content",
+                "tool_calls",
+            ],
+        ) || delta
+            .get("role")
+            .is_some_and(|role| role.as_str() != Some("assistant"))
+        {
+            return Err(Error::new("server SSE delta keys or role are invalid"));
+        }
+        for field in ["content", "reasoning", "reasoning_content"] {
+            if delta.get(field).is_some_and(|value| !value.is_string()) {
+                return Err(Error::new(format!(
+                    "server SSE delta.{field} is not a string"
+                )));
+            }
+        }
+        if delta.get("tool_calls").is_some_and(|calls| {
+            calls
+                .as_array()
+                .is_none_or(|calls| calls.iter().any(|call| !call.is_object()))
+        }) {
+            return Err(Error::new(
+                "server SSE delta.tool_calls is not an array of objects",
+            ));
+        }
+    }
+    if usage_indexes != [chunks.len() - 1] || finish_reasons != 1 {
+        return Err(Error::new(
+            "server SSE requires one finish reason and one terminal usage chunk",
+        ));
+    }
+    Ok(())
+}
+
+fn object_has_only_keys(value: &Value, allowed: &[&str]) -> bool {
+    value.as_object().is_some_and(|object| {
+        object
+            .keys()
+            .all(|key| allowed.iter().any(|allowed_key| key == allowed_key))
+    })
 }
 
 fn verify_server_journal(path: &Path, expected_turn: &Value) -> Result<(), Error> {
@@ -3396,6 +3661,8 @@ fn load_cell(path: &Path) -> Result<Cell, Error> {
     let mut worker_sha256 = None::<String>;
     let mut executable_sha256 = None::<String>;
     let mut oracle_identity_source_sha256 = None::<String>;
+    let mut oracle_launcher_sha256 = None::<String>;
+    let mut model_identity_source_sha256 = None::<String>;
     let mut native_macos = None::<String>;
     let mut context_tokens = None::<u32>;
     let mut expected_generated_tokens = None::<u32>;
@@ -3422,6 +3689,7 @@ fn load_cell(path: &Path) -> Result<Cell, Error> {
     let mut model_loaded_count = 0_u32;
     let mut worker_end_count = 0_u32;
     let mut worker_failure_count = 0_u32;
+    let mut worker_capacity_failure_count = 0_u32;
     let mut controller_claimed_valid = false;
     let mut controller_worker_success = false;
     let mut uncontrolled_oom = false;
@@ -3455,6 +3723,10 @@ fn load_cell(path: &Path) -> Result<Cell, Error> {
                 executable_sha256 = Some(string_field(value, "executable_sha256")?.to_owned());
                 oracle_identity_source_sha256 =
                     Some(string_field(value, "oracle_identity_source_sha256")?.to_owned());
+                oracle_launcher_sha256 =
+                    Some(string_field(value, "oracle_launcher_sha256")?.to_owned());
+                model_identity_source_sha256 =
+                    Some(string_field(value, "model_identity_source_sha256")?.to_owned());
                 context_tokens = Some(
                     u32::try_from(u64_field(value, "context_tokens")?)
                         .map_err(|_| Error::new("context_tokens exceeds u32"))?,
@@ -3515,6 +3787,11 @@ fn load_cell(path: &Path) -> Result<Cell, Error> {
                         oracle_identity_source_sha256.as_deref().unwrap_or_default(),
                         64,
                     )
+                    || !is_hex_digest(oracle_launcher_sha256.as_deref().unwrap_or_default(), 64)
+                    || !is_hex_digest(
+                        model_identity_source_sha256.as_deref().unwrap_or_default(),
+                        64,
+                    )
                     || !is_hex_digest(executable_sha256.as_deref().unwrap_or_default(), 64)
                     || started_unix_ns == Some(0)
                     || recommended == 0
@@ -3551,6 +3828,11 @@ fn load_cell(path: &Path) -> Result<Cell, Error> {
                     protocol_errors.push("worker_start is out of envelope order".into());
                 }
                 worker_stage = TraceWorkerStage::AwaitingModel;
+                let selected_model = match model_key.as_deref() {
+                    Some("12b") => MODEL_12B,
+                    Some("e4b") => MODEL_E4B,
+                    _ => MODEL_12B,
+                };
                 if worker_start_count != 1
                     || value.get("source_commit").and_then(Value::as_str)
                         != source_commit.as_deref()
@@ -3568,6 +3850,15 @@ fn load_cell(path: &Path) -> Result<Cell, Error> {
                     || value.get("model_label").and_then(Value::as_str) != model_label.as_deref()
                     || value.get("model_manifest_sha256").and_then(Value::as_str)
                         != model_manifest_sha256.as_deref()
+                    || value.get("model_exact_inventory").and_then(Value::as_bool) != Some(true)
+                    || value
+                        .get("model_payload_tree_sha256")
+                        .and_then(Value::as_str)
+                        != Some(selected_model.payload_tree_sha256)
+                    || value
+                        .get("model_payload_file_count")
+                        .and_then(Value::as_u64)
+                        != Some(selected_model.payload_file_count)
                     || value.get("token_sha256").and_then(Value::as_str)
                         != fixture_token_sha256.as_deref()
                     || value
@@ -3586,6 +3877,27 @@ fn load_cell(path: &Path) -> Result<Cell, Error> {
                     || value.get("trials").and_then(Value::as_u64) != expected_trials.map(u64::from)
                     || value.get("wired_limit_effective").and_then(Value::as_bool) != Some(true)
                     || value.get("python").and_then(Value::as_str) != Some(ORACLE_PYTHON)
+                    || value
+                        .get("python_executable_sha256")
+                        .and_then(Value::as_str)
+                        != Some(PYTHON_EXECUTABLE_SHA256)
+                    || value
+                        .get("python_runtime_tree_sha256")
+                        .and_then(Value::as_str)
+                        != Some(PYTHON_RUNTIME_TREE_SHA256)
+                    || value
+                        .get("python_runtime_file_count")
+                        .and_then(Value::as_u64)
+                        != Some(PYTHON_RUNTIME_FILE_COUNT)
+                    || value
+                        .get("site_packages_tree_sha256")
+                        .and_then(Value::as_str)
+                        != Some(SITE_PACKAGES_TREE_SHA256)
+                    || value
+                        .get("site_packages_file_count")
+                        .and_then(Value::as_u64)
+                        != Some(SITE_PACKAGES_FILE_COUNT)
+                    || !isolated_flags_match(value.get("isolated_flags"))
                     || value.get("mlx_version").and_then(Value::as_str) != Some(MLX_VERSION)
                     || value.get("mlx_metal_version").and_then(Value::as_str)
                         != Some(MLX_METAL_VERSION)
@@ -3612,6 +3924,12 @@ fn load_cell(path: &Path) -> Result<Cell, Error> {
                         .get("oracle_identity_source_sha256")
                         .and_then(Value::as_str)
                         != oracle_identity_source_sha256.as_deref()
+                    || value.get("oracle_launcher_sha256").and_then(Value::as_str)
+                        != oracle_launcher_sha256.as_deref()
+                    || value
+                        .get("model_identity_source_sha256")
+                        .and_then(Value::as_str)
+                        != model_identity_source_sha256.as_deref()
                     || !worker_environment_matches(value.get("environment"))
                 {
                     protocol_errors.push(
@@ -3801,10 +4119,26 @@ fn load_cell(path: &Path) -> Result<Cell, Error> {
             }
             (Some(WORKER_SCHEMA), Some("failure")) => {
                 worker_failure_count += 1;
+                let error_type = string_field(value, "error_type")?;
+                let failure_message = string_field(value, "message")?;
+                let normalized_failure = failure_message.to_ascii_lowercase();
+                if error_type == "MemoryError"
+                    || [
+                        "alloc",
+                        "out of memory",
+                        "resource exhausted",
+                        "resource limit",
+                        "wired limit",
+                    ]
+                    .iter()
+                    .any(|needle| normalized_failure.contains(needle))
+                {
+                    worker_capacity_failure_count += 1;
+                }
                 if worker_stage == TraceWorkerStage::AwaitingStart
                     || worker_stage == TraceWorkerStage::Terminated
-                    || string_field(value, "error_type")?.is_empty()
-                    || string_field(value, "message")?.is_empty()
+                    || error_type.is_empty()
+                    || failure_message.is_empty()
                     || value
                         .get("traceback")
                         .and_then(Value::as_array)
@@ -3862,6 +4196,39 @@ fn load_cell(path: &Path) -> Result<Cell, Error> {
                     .get("worker_exit")
                     .ok_or_else(|| Error::new("controller worker_exit is missing"))?;
                 let stderr_name = string_field(value, "stderr_file")?;
+                let code_value = worker_exit.get("code");
+                let signal_value = worker_exit.get("signal");
+                let exit_fields_valid = code_value
+                    .is_some_and(|field| field.is_null() || field.as_i64().is_some())
+                    && signal_value
+                        .is_some_and(|field| field.is_null() || field.as_i64().is_some());
+                let exit_code = code_value.and_then(Value::as_i64);
+                let exit_signal = signal_value.and_then(Value::as_i64);
+                let derived_worker_success = exit_code == Some(0) && exit_signal.is_none();
+                let controlled_failure = exit_code == Some(1)
+                    && exit_signal.is_none()
+                    && worker_failure_count == 1
+                    && worker_capacity_failure_count == 1;
+                let strict_exit_shape = derived_worker_success
+                    || controlled_failure
+                    || (exit_code.is_none() && exit_signal == Some(9));
+                let expected_stderr_name = path
+                    .with_extension("stderr.log")
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .ok_or_else(|| Error::new("cell stderr filename is not UTF-8"))?
+                    .to_owned();
+                let stderr_bytes = if is_plain_filename(stderr_name) {
+                    fs::read(
+                        path.parent()
+                            .ok_or_else(|| Error::new("cell has no parent directory"))?
+                            .join(stderr_name),
+                    )?
+                } else {
+                    Vec::new()
+                };
+                let derived_uncontrolled_oom =
+                    evidence_uncontrolled_oom(exit_signal, &stderr_bytes, worker_failure_count);
                 if value.get("started_unix_ns").and_then(Value::as_u64) != started_unix_ns
                     || worker_stage != TraceWorkerStage::Terminated
                     || value.get("os_samples").and_then(Value::as_u64)
@@ -3872,11 +4239,17 @@ fn load_cell(path: &Path) -> Result<Cell, Error> {
                         .is_none()
                     || !is_plain_filename(stderr_name)
                     || !stderr_name.ends_with(".stderr.log")
-                    || !is_hex_digest(string_field(value, "stderr_sha256")?, 64)
+                    || stderr_name != expected_stderr_name
+                    || string_field(value, "stderr_sha256")? != sha256_bytes(&stderr_bytes)
+                    || !exit_fields_valid
+                    || !strict_exit_shape
+                    || controller_worker_success != derived_worker_success
+                    || uncontrolled_oom != derived_uncontrolled_oom
                     || (controller_worker_success
                         && (worker_exit.get("code").and_then(Value::as_i64) != Some(0)
                             || !worker_exit.get("signal").is_some_and(Value::is_null)
                             || value.get("os_sample_errors").and_then(Value::as_u64) != Some(0)))
+                    || (!controller_worker_success && controller_validation_errors.is_empty())
                     || controller_claimed_valid
                         != (controller_worker_success && controller_validation_errors.is_empty())
                 {
@@ -4314,7 +4687,30 @@ fn ensure_clean_worktree(repo: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-fn command_stdout(repo: &Path, program: &str, arguments: &[&str]) -> Result<String, Error> {
+fn verify_preflight_receipts(repo: &Path, run_root: &Path) -> Result<(), Error> {
+    let (expected_oracle, expected_models) = current_verification_receipts(repo)?;
+    if fs::read(run_root.join("preflight/oracle-verification.log"))? != expected_oracle
+        || fs::read(run_root.join("preflight/model-verification.log"))? != expected_models
+    {
+        return Err(Error::new(
+            "preflight oracle or model receipt is not the semantic output of current verification",
+        ));
+    }
+    Ok(())
+}
+
+fn current_verification_receipts(repo: &Path) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    let expected_oracle = command_output(repo, "scripts/verify-oracle.sh", &[])?;
+    let mut expected_models = command_output(repo, "scripts/verify-m0-models.sh", &[])?;
+    expected_models.extend(command_output(
+        repo,
+        "scripts/verify-m1-e4b-models.sh",
+        &[],
+    )?);
+    Ok((expected_oracle, expected_models))
+}
+
+fn command_output(repo: &Path, program: &str, arguments: &[&str]) -> Result<Vec<u8>, Error> {
     let output = Command::new(program)
         .args(arguments)
         .current_dir(repo)
@@ -4326,7 +4722,15 @@ fn command_stdout(repo: &Path, program: &str, arguments: &[&str]) -> Result<Stri
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    Ok(output.stdout)
+}
+
+fn command_stdout(repo: &Path, program: &str, arguments: &[&str]) -> Result<String, Error> {
+    Ok(
+        String::from_utf8_lossy(&command_output(repo, program, arguments)?)
+            .trim()
+            .to_owned(),
+    )
 }
 
 fn repo_root() -> Result<PathBuf, Error> {
@@ -4412,9 +4816,17 @@ fn uncontrolled_oom(status: ExitStatus, stderr: &[u8], structured_failures: u32)
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt as _;
-        if status.signal() == Some(9) {
-            return true;
-        }
+        evidence_uncontrolled_oom(status.signal().map(i64::from), stderr, structured_failures)
+    }
+    #[cfg(not(unix))]
+    {
+        evidence_uncontrolled_oom(None, stderr, structured_failures)
+    }
+}
+
+fn evidence_uncontrolled_oom(signal: Option<i64>, stderr: &[u8], structured_failures: u32) -> bool {
+    if signal == Some(9) {
+        return true;
     }
     if structured_failures > 0 {
         return false;
@@ -4865,12 +5277,27 @@ mod tests {
     fn server_journal_rebuilds_raw_sse_and_rejects_assembly_drift() {
         let chunks = vec![
             json!({
-                "choices": [{"delta": {"content": "hello", "role": "assistant"}, "finish_reason": null}],
+                "id": "chatcmpl-synthetic",
+                "system_fingerprint": "mlx-lm-0.31.3",
+                "object": "chat.completion.chunk",
+                "model": "default_model",
+                "created": 1,
+                "choices": [{"index": 0, "delta": {"content": "hello", "role": "assistant"}, "finish_reason": null}],
             }),
             json!({
-                "choices": [{"delta": {"content": " world"}, "finish_reason": "stop"}],
+                "id": "chatcmpl-synthetic",
+                "system_fingerprint": "mlx-lm-0.31.3",
+                "object": "chat.completion.chunk",
+                "model": "default_model",
+                "created": 1,
+                "choices": [{"index": 0, "delta": {"content": " world"}, "finish_reason": "stop"}],
             }),
             json!({
+                "id": "chatcmpl-synthetic",
+                "system_fingerprint": "mlx-lm-0.31.3",
+                "object": "chat.completion",
+                "model": "default_model",
+                "created": 1,
                 "choices": [],
                 "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
             }),
@@ -4927,7 +5354,22 @@ mod tests {
         assert!(verify_server_journal(&path, &expected).is_ok());
         expected["assembled"]["content"] = Value::String("tampered".into());
         assert!(verify_server_journal(&path, &expected).is_err());
+        assert!(assemble_server_chunks(&[json!({"usage": {}})]).is_err());
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn server_exit_rejects_forced_sigkill() {
+        assert!(valid_server_exit(&json!({
+            "returncode": -15,
+            "expected_termination": true,
+            "forced_kill": false,
+        })));
+        assert!(!valid_server_exit(&json!({
+            "returncode": -9,
+            "expected_termination": true,
+            "forced_kill": true,
+        })));
     }
 
     #[test]

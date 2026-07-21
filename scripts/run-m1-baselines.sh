@@ -3,8 +3,13 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 run_id=${1:?usage: scripts/run-m1-baselines.sh RUN_ID}
+archive_mode=${2:-archive}
 if [[ ! "$run_id" =~ ^[a-zA-Z0-9._-]+$ ]]; then
     echo "M1 run ID contains unsafe characters" >&2
+    exit 64
+fi
+if [[ "$archive_mode" != archive && "$archive_mode" != --defer-archive ]]; then
+    echo "usage: scripts/run-m1-baselines.sh RUN_ID [--defer-archive]" >&2
     exit 64
 fi
 cd "$repo_root"
@@ -35,7 +40,11 @@ scripts/verify-oracle.sh | tee "$run_root/postflight/oracle-verification.log"
     cd "$run_root"
     find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 shasum -a 256 >SHA256SUMS
 )
-scripts/archive-m1-evidence.sh "$run_id"
+if [[ "$archive_mode" == archive ]]; then
+    scripts/archive-m1-evidence.sh "$run_id"
+else
+    echo "m1-archive-deferred: run=$run_id"
+fi
 printf 'm1-baselines-pass: run=%s manifest_sha256=%s\n' \
     "$run_id" \
     "$(shasum -a 256 "$run_root/SHA256SUMS" | awk '{print $1}')"

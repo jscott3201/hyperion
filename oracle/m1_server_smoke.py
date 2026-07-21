@@ -15,6 +15,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+from model_identity import verify_model_tree
 from oracle_identity import verify_identity
 
 
@@ -228,6 +229,95 @@ def stream_request(port: int, body: dict[str, Any], journal_path: Path) -> dict[
 
 
 def validate_stream(result: dict[str, Any], *, expect_tool_call: bool) -> None:
+    chunks = result["chunks"]
+    if not chunks:
+        raise RuntimeError("stream emitted no JSON chunks")
+    identity: tuple[Any, ...] | None = None
+    usage_indexes: list[int] = []
+    for index, chunk in enumerate(chunks):
+        if not isinstance(chunk, dict):
+            raise RuntimeError("stream chunk is not an object")
+        required = {"id", "system_fingerprint", "object", "model", "created", "choices"}
+        allowed = required | {"usage"}
+        if not required <= set(chunk) or set(chunk) - allowed:
+            raise RuntimeError(f"stream chunk has invalid top-level keys: {sorted(chunk)}")
+        chunk_identity = (
+            chunk["id"],
+            chunk["system_fingerprint"],
+            chunk["model"],
+            chunk["created"],
+        )
+        if (
+            not isinstance(chunk["id"], str)
+            or not chunk["id"]
+            or not isinstance(chunk["system_fingerprint"], str)
+            or not chunk["system_fingerprint"]
+            or not isinstance(chunk["model"], str)
+            or not chunk["model"]
+            or not isinstance(chunk["created"], int)
+            or chunk["created"] <= 0
+        ):
+            raise RuntimeError("stream chunk identity fields are invalid")
+        if identity is None:
+            identity = chunk_identity
+        elif identity != chunk_identity:
+            raise RuntimeError("stream chunk identity changed during one response")
+        choices = chunk["choices"]
+        if not isinstance(choices, list) or len(choices) > 1:
+            raise RuntimeError("stream chunk choices must be an array of zero or one item")
+        usage = chunk.get("usage")
+        if not choices:
+            if not isinstance(usage, dict) or chunk["object"] != "chat.completion":
+                raise RuntimeError("empty-choice stream chunk must be the usage envelope")
+            usage_allowed = {
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+                "prompt_tokens_details",
+            }
+            if set(usage) - usage_allowed:
+                raise RuntimeError("stream usage envelope has unsupported fields")
+            details = usage.get("prompt_tokens_details")
+            if details is not None and (
+                not isinstance(details, dict)
+                or set(details) != {"cached_tokens"}
+                or not isinstance(details["cached_tokens"], int)
+                or details["cached_tokens"] < 0
+            ):
+                raise RuntimeError("stream cached-token usage details are invalid")
+            usage_indexes.append(index)
+            continue
+        if usage is not None or chunk["object"] != "chat.completion.chunk":
+            raise RuntimeError("nonempty stream chunk has an invalid object or usage field")
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            raise RuntimeError("stream choice is not an object")
+        choice_allowed = {"index", "finish_reason", "delta"}
+        if set(choice) - choice_allowed or choice.get("index") != 0:
+            raise RuntimeError("stream choice keys or index are invalid")
+        if choice.get("finish_reason") is not None and not isinstance(
+            choice["finish_reason"], str
+        ):
+            raise RuntimeError("stream finish_reason is not null or a string")
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            raise RuntimeError("stream choice delta is not an object")
+        delta_allowed = {"role", "content", "reasoning", "reasoning_content", "tool_calls"}
+        if set(delta) - delta_allowed:
+            raise RuntimeError(f"stream delta has unsupported keys: {sorted(delta)}")
+        if "role" in delta and delta["role"] != "assistant":
+            raise RuntimeError("stream delta role is not assistant")
+        for field in ("content", "reasoning", "reasoning_content"):
+            if field in delta and not isinstance(delta[field], str):
+                raise RuntimeError(f"stream delta {field} is not a string")
+        if "tool_calls" in delta and (
+            not isinstance(delta["tool_calls"], list)
+            or not all(isinstance(call, dict) for call in delta["tool_calls"])
+        ):
+            raise RuntimeError("stream delta tool_calls is not an array of objects")
+    if usage_indexes != [len(chunks) - 1]:
+        raise RuntimeError("stream requires one terminal usage chunk")
+
     assembled = result["assembled"]
     if assembled["reasoning_content"]:
         raise RuntimeError("thinking-disabled server response emitted reasoning")
@@ -237,9 +327,16 @@ def validate_stream(result: dict[str, Any], *, expect_tool_call: bool) -> None:
     for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
         if not isinstance(usage.get(field), int) or usage[field] < 0:
             raise RuntimeError(f"stream usage field {field} is invalid")
+    if (
+        usage["prompt_tokens"] <= 0
+        or usage["completion_tokens"] <= 0
+        or usage["prompt_tokens"] + usage["completion_tokens"]
+        != usage["total_tokens"]
+    ):
+        raise RuntimeError("stream usage totals do not recompute")
     reasons = assembled["finish_reasons"]
-    if not reasons:
-        raise RuntimeError("stream emitted no finish reason")
+    if len(reasons) != 1:
+        raise RuntimeError("stream must emit exactly one finish reason")
     expected = {"tool_calls", "stop"} if expect_tool_call else {"stop"}
     if reasons[-1] not in expected:
         raise RuntimeError(f"unexpected terminal finish reason: {reasons[-1]!r}")
@@ -309,7 +406,10 @@ def run_repeat(args: argparse.Namespace, repeat: int, port: int) -> dict[str, An
     with log_path.open("xb") as log:
         command = [
             str(args.repo_root / "oracle/.venv/bin/python"),
-            "-m",
+            "-I",
+            "-S",
+            str(args.repo_root / "oracle/isolated_oracle.py"),
+            "module",
             "mlx_lm.server",
             "--model",
             str(args.model_path),
@@ -337,8 +437,15 @@ def run_repeat(args: argparse.Namespace, repeat: int, port: int) -> dict[str, An
             for item in command
         ]
         evidence_command = [
+            "oracle/isolated_oracle.py"
+            if item == str(args.repo_root / "oracle/isolated_oracle.py")
+            else item
+            for item in evidence_command
+        ]
+        evidence_command = [
             "<MODEL>" if item == str(args.model_path) else item for item in evidence_command
         ]
+        model_identity = verify_model_tree(args.model_path, args.model_manifest_sha256)
         process = subprocess.Popen(
             command,
             cwd=args.repo_root,
@@ -399,11 +506,13 @@ def run_repeat(args: argparse.Namespace, repeat: int, port: int) -> dict[str, An
                 "server_log": log_path.name,
             }
         finally:
+            forced_kill = False
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGTERM)
                 try:
                     process.wait(timeout=15)
                 except subprocess.TimeoutExpired:
+                    forced_kill = True
                     os.killpg(process.pid, signal.SIGKILL)
                     process.wait(timeout=15)
             log.flush()
@@ -411,7 +520,9 @@ def run_repeat(args: argparse.Namespace, repeat: int, port: int) -> dict[str, An
             sanitize_server_log(log_path, args.repo_root, args.model_path)
         if result is None:
             raise RuntimeError("server repeat completed without a result")
-        if process.returncode not in (0, -signal.SIGTERM, -signal.SIGKILL):
+        if forced_kill:
+            raise RuntimeError("server ignored SIGTERM and required forced SIGKILL")
+        if process.returncode not in (0, -signal.SIGTERM):
             raise RuntimeError(f"server exited unexpectedly with {process.returncode}")
         prefix = f"{args.model_key}-repeat-{repeat + 1}"
         journals = {
@@ -427,8 +538,10 @@ def run_repeat(args: argparse.Namespace, repeat: int, port: int) -> dict[str, An
         }
         result["server_exit"] = {
             "returncode": process.returncode,
-            "expected_termination": process.returncode in (-signal.SIGTERM, -signal.SIGKILL),
+            "expected_termination": process.returncode == -signal.SIGTERM,
+            "forced_kill": False,
         }
+        result["model_identity"] = model_identity
         result["server_log_sha256"] = sha256_file(log_path)
         result["journals"] = journals
         write_json_exclusive(
@@ -441,7 +554,8 @@ def run_repeat(args: argparse.Namespace, repeat: int, port: int) -> dict[str, An
 def main() -> None:
     args = parse_args()
     args.repo_root = args.repo_root.resolve()
-    args.model_path = args.model_path.resolve()
+    if not args.model_path.is_absolute():
+        args.model_path = Path.cwd() / args.model_path
     args.run_manifest = args.run_manifest.resolve()
     args.output_dir = args.output_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -461,9 +575,8 @@ def main() -> None:
         if sha256_file(model_receipt) != run_manifest.get("model_verification_pre_sha256"):
             raise RuntimeError("server-smoke model receipt differs from the run manifest")
         oracle_identity = verify_identity()
-        actual_manifest = sha256_file(args.model_path / "SHA256SUMS")
-        if actual_manifest != args.model_manifest_sha256:
-            raise RuntimeError("server-smoke model manifest differs from the accepted identity")
+        initial_model_identity = verify_model_tree(args.model_path, args.model_manifest_sha256)
+        actual_manifest = initial_model_identity["manifest_sha256"]
         server_path = (
             args.repo_root
             / "oracle/.venv/lib/python3.12/site-packages/mlx_lm/server.py"
@@ -502,8 +615,15 @@ def main() -> None:
             "model_key": args.model_key,
             "model_label": args.model_label,
             "model_manifest_sha256": actual_manifest,
+            "initial_model_identity": initial_model_identity,
             "server_source_sha256": server_source_sha256,
             "worker_sha256": sha256_file(Path(__file__).resolve()),
+            "oracle_launcher_sha256": sha256_file(
+                Path(__file__).resolve().with_name("isolated_oracle.py")
+            ),
+            "model_identity_source_sha256": sha256_file(
+                Path(__file__).resolve().with_name("model_identity.py")
+            ),
             "oracle_identity": oracle_identity,
             "server_environment": SERVER_ENVIRONMENT,
             "thinking_enabled": False,
