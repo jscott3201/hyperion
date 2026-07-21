@@ -14,7 +14,7 @@ from transformers import AutoTokenizer
 
 
 SCHEMA = "hyperion.m1-corpus.v1"
-TARGETS = (512, 1024, 4096, 8192, 16384, 32768)
+TARGETS = (512, 1024, 4096, 8192, 16384, 32768, 131072)
 FAMILIES = (
     "fdd_explanation",
     "energy_recommendation",
@@ -290,7 +290,7 @@ def validate_model(model: dict[str, str], model_path: Path) -> None:
 
 def write_corpus(repo_root: Path, output: Path) -> None:
     output.mkdir(parents=True, exist_ok=True)
-    records = [record(index) for index in range(1024)]
+    records = [record(index) for index in range(2048)]
     records_path = output / "records.jsonl"
     records_bytes = "".join(canonical_json(item) + "\n" for item in records).encode()
     records_path.write_bytes(records_bytes)

@@ -180,6 +180,28 @@
       "tokenizer_sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
     },
     {
+      "actual_tokens": 131072,
+      "model_key": "12b",
+      "model_label": "gemma-4-12B-QAT-Q4-g64-affine",
+      "model_manifest_sha256": "9fa3c7f6c49305f621ed1f96edbb34c6402b6229701041db4e607df70e9b4144",
+      "record_count": 1547,
+      "rendered_file": "12b-131072.rendered.txt",
+      "rendered_sha256": "bf9abf32ff76977573ddb6a31eeeb33ffce83173f1878df13eb10f3829e333b5",
+      "tail_fragments": [
+        " airflow",
+        " alarm",
+        " boiler",
+        " building",
+        " comfort"
+      ],
+      "target_tokens": 131072,
+      "template_sha256": "ae53464bf3be25802b3a5b37def7fd89667067d7577049b3b2d74c4d8de4c6d4",
+      "token_encoding": "little-endian-u32",
+      "token_file": "12b-131072.tokens.u32le",
+      "token_sha256": "7ee02a921ceb2b56327817ceddae059a6bb8affd5ea8f4607534ffdd298996e8",
+      "tokenizer_sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+    },
+    {
       "actual_tokens": 512,
       "model_key": "e4b",
       "model_label": "gemma-4-E4B-QAT-Q4-g64-affine",
@@ -341,13 +363,39 @@
       "token_file": "e4b-32768.tokens.u32le",
       "token_sha256": "8cc8ee54e2ab4c9727a7d6478161bafbece29f11304083987fdcce5e06a442c9",
       "tokenizer_sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+    },
+    {
+      "actual_tokens": 131072,
+      "model_key": "e4b",
+      "model_label": "gemma-4-E4B-QAT-Q4-g64-affine",
+      "model_manifest_sha256": "9ba65423d3b2bab1e7c52ea88a1a2b0a33c1f51909b1df66330bf872b7a6c2b0",
+      "record_count": 1547,
+      "rendered_file": "e4b-131072.rendered.txt",
+      "rendered_sha256": "85e5b369e66c86a7af0746109cfd1d4e5c333375d3ad0b34ad17db3bd269304f",
+      "tail_fragments": [
+        " airflow",
+        " alarm",
+        " boiler",
+        " building",
+        " comfort",
+        " cooling",
+        " damper",
+        " energy",
+        " equipment"
+      ],
+      "target_tokens": 131072,
+      "template_sha256": "0a2c8073c878ab1da004bee933a998606537bbb62016310352c7285c3f01c5b5",
+      "token_encoding": "little-endian-u32",
+      "token_file": "e4b-131072.tokens.u32le",
+      "token_sha256": "29008f37c0c5316c977e97d0539745cc77ee7ff7c9d30cb4e251c86480091eff",
+      "tokenizer_sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
     }
   ],
   "generator": "oracle/build_m1_corpus.py",
-  "generator_sha256": "b9337c6bd3c08ce62c7230913402711499d63048ded776ee69cab7d0ed839929",
-  "record_count": 1024,
+  "generator_sha256": "e56cd696dff8526c6c0f03c106b87693d1d9b4782348168b57cbc65e0b0cbb6d",
+  "record_count": 2048,
   "records_file": "records.jsonl",
-  "records_sha256": "e67295ab1fad708e6d6664a4f7e1e41e882d9120cf8c22f01790d6ecaa7ea039",
+  "records_sha256": "7c5dfc0fe494282a11606c4142c6534f95f25136ff14eedb7e057061cf3b71a0",
   "schema": "hyperion.m1-corpus.v1",
   "targets": [
     512,
@@ -355,6 +403,7 @@
     4096,
     8192,
     16384,
-    32768
+    32768,
+    131072
   ]
 }

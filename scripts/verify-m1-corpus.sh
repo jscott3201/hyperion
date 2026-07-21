@@ -24,8 +24,8 @@ jq -e \
     .schema == "hyperion.m1-corpus.v1" and
     .generator == "oracle/build_m1_corpus.py" and
     .generator_sha256 == $generator_sha256 and
-    .record_count == 1024 and
-    .targets == [512, 1024, 4096, 8192, 16384, 32768] and
+    .record_count == 2048 and
+    .targets == [512, 1024, 4096, 8192, 16384, 32768, 131072] and
     .families == [
         "fdd_explanation",
         "energy_recommendation",
@@ -36,17 +36,18 @@ jq -e \
         "short_chat",
         "compound_parallel_tool_chain"
     ] and
-    (.fixtures | length) == 12 and
-    ([.fixtures[] | [.model_key, .target_tokens]] | unique | length) == 12 and
+    (.fixtures | length) == 14 and
+    ([.fixtures[] | [.model_key, .target_tokens]] | unique | length) == 14 and
     ([.fixtures[] | select(
         (.model_key == "12b" or .model_key == "e4b") and
         (.target_tokens == 512 or .target_tokens == 1024 or
          .target_tokens == 4096 or .target_tokens == 8192 or
-         .target_tokens == 16384 or .target_tokens == 32768) and
+         .target_tokens == 16384 or .target_tokens == 32768 or
+         .target_tokens == 131072) and
         .actual_tokens == .target_tokens and
         .token_encoding == "little-endian-u32" and
         .record_count >= 8
-    )] | length) == 12
+    )] | length) == 14
     ' "$manifest" >/dev/null
 
 case "$records_file" in
@@ -118,5 +119,5 @@ done < <(
     ] | @tsv' "$manifest"
 )
 
-printf 'm1-corpus-verified: manifest=%s fixtures=12 tokens=512,1024,4096,8192,16384,32768\n' \
+printf 'm1-corpus-verified: manifest=%s fixtures=14 tokens=512,1024,4096,8192,16384,32768,131072\n' \
     "$(shasum -a 256 "$manifest" | awk '{print $1}')"

@@ -8,7 +8,8 @@ if [[ ! "$run_id" =~ ^[a-zA-Z0-9._-]+$ ]]; then
     exit 64
 fi
 cd "$repo_root"
-binary="$repo_root/target/release/hyperion-bench"
+binary="$repo_root/target/m1-release/release/hyperion-bench"
+run_manifest="benchmarks/raw/m1/$run_id/run-manifest.json"
 for model in 12b e4b; do
     "$binary" m1 run-cell \
         --model "$model" \
@@ -16,6 +17,7 @@ for model in 12b e4b; do
         --arm nightly-512x128 \
         --wired-limit default \
         --generated-tokens 129 \
+        --run-manifest "$run_manifest" \
         --output "benchmarks/raw/m1/$run_id/nightly/$model-512x128.jsonl"
 done
 "$binary" m1 summarize --input-dir "benchmarks/raw/m1/$run_id/nightly" \

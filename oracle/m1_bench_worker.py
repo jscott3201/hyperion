@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.metadata
 import json
 import math
 import os
@@ -17,13 +16,57 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+from oracle_identity import verify_identity
+
 
 TRIAL_SCHEMA = "hyperion.m1-trial.v1"
 EVENT_SCHEMA = "hyperion.m1-worker-event.v1"
+COMMAND_SCHEMA = "hyperion.m1-controller-command.v1"
+EXPECTED_ENVIRONMENT = {
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PYTHONHASHSEED": "0",
+    "TOKENIZERS_PARALLELISM": "false",
+    "TZ": "UTC",
+}
+PERFORMANCE_ENV_PREFIXES = (
+    "CARGO",
+    "DYLD_",
+    "HF_",
+    "METAL_",
+    "MKL_",
+    "MLX_",
+    "MTL_",
+    "NUMEXPR_",
+    "OMP_",
+    "OPENBLAS_",
+    "PYTORCH_",
+    "RUST",
+    "TRANSFORMERS_",
+    "VECLIB_",
+)
 
 
 def emit(value: dict[str, Any]) -> None:
     print(json.dumps(value, sort_keys=True, separators=(",", ":")), flush=True)
+
+
+def await_controller(command: str, phase: str, trial_index: int) -> None:
+    line = sys.stdin.readline()
+    if not line:
+        raise RuntimeError(f"controller closed the handshake pipe before {command}")
+    try:
+        message = json.loads(line)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"controller handshake was not JSON: {error}") from error
+    expected = {
+        "schema": COMMAND_SCHEMA,
+        "command": command,
+        "phase": phase,
+        "trial_index": trial_index,
+    }
+    if message != expected:
+        raise RuntimeError(f"unexpected controller handshake: {message!r}")
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -92,6 +135,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wired-limit", required=True)
     parser.add_argument("--arm", required=True)
     parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--session-id", required=True)
+    parser.add_argument("--run-manifest-sha256", required=True)
+    parser.add_argument("--schedule-sha256", required=True)
+    parser.add_argument("--model-verification-receipt-sha256", required=True)
+    parser.add_argument("--expected-recommended-working-set", type=int, required=True)
     return parser.parse_args()
 
 
@@ -99,8 +148,32 @@ def main() -> int:
     args = parse_args()
     if args.input_tokens <= 0 or args.generated_tokens < 2:
         raise RuntimeError("input tokens must be positive and generated tokens must be >= 2")
-    if args.warmups != 1 or args.trials != 5:
-        raise RuntimeError("M1 scored cells require exactly one warmup and five trials")
+    stretch = (
+        args.input_tokens == 131_072
+        and args.generated_tokens == 129
+        and args.arm == "stretch-128k"
+        and 1 <= args.trials < 5
+    )
+    if args.warmups != 1 or (args.trials != 5 and not stretch):
+        raise RuntimeError(
+            "M1 cells require one warmup and five trials, except explicit 128K low-N stretch rows"
+        )
+
+    for key, expected in EXPECTED_ENVIRONMENT.items():
+        if os.environ.get(key) != expected:
+            raise RuntimeError(
+                f"worker environment {key} must be {expected!r}, found {os.environ.get(key)!r}"
+            )
+    forbidden = sorted(
+        key
+        for key in os.environ
+        if key != "TOKENIZERS_PARALLELISM"
+        and key.startswith(PERFORMANCE_ENV_PREFIXES)
+    )
+    if forbidden:
+        raise RuntimeError(f"worker inherited performance-sensitive variables: {forbidden}")
+
+    oracle_identity = verify_identity()
 
     # Import only after argument and fixture validation so malformed invocations stay model-free.
     token_ids = load_token_ids(args.token_file, args.input_tokens, args.token_sha256)
@@ -120,6 +193,18 @@ def main() -> int:
 
     device_info = json_safe(mx.device_info())
     recommended = int(device_info["max_recommended_working_set_size"])
+    if platform.machine() != "arm64" or tuple(map(int, platform.mac_ver()[0].split(".")[:2])) < (
+        26,
+        2,
+    ):
+        raise RuntimeError(
+            f"M1 requires arm64 macOS 26.2+, found {platform.machine()} {platform.mac_ver()[0]}"
+        )
+    if recommended != args.expected_recommended_working_set:
+        raise RuntimeError(
+            "worker recommended working set differs from the run-bound native canary: "
+            f"expected {args.expected_recommended_working_set}, found {recommended}"
+        )
     requested_wired_limit = (
         recommended if args.wired_limit == "default" else int(args.wired_limit)
     )
@@ -143,7 +228,14 @@ def main() -> int:
             "schema": EVENT_SCHEMA,
             "kind": "worker_start",
             "pid": os.getpid(),
+            "unix_ns": time.time_ns(),
+            "monotonic_ns": time.perf_counter_ns(),
             "source_commit": args.source_commit,
+            "run_id": args.run_id,
+            "session_id": args.session_id,
+            "run_manifest_sha256": args.run_manifest_sha256,
+            "schedule_sha256": args.schedule_sha256,
+            "model_verification_receipt_sha256": args.model_verification_receipt_sha256,
             "model_key": args.model_key,
             "model_label": args.model_label,
             "model_manifest_sha256": actual_model_manifest_sha256,
@@ -156,11 +248,23 @@ def main() -> int:
             "arm": args.arm,
             "python": platform.python_version(),
             "platform": {"macos": platform.mac_ver()[0], "machine": platform.machine()},
-            "mlx_version": importlib.metadata.version("mlx"),
-            "mlx_lm_version": importlib.metadata.version("mlx-lm"),
+            "mlx_version": oracle_identity["mlx_version"],
+            "mlx_metal_version": oracle_identity["mlx_metal_version"],
+            "mlx_lm_version": oracle_identity["mlx_lm_version"],
+            "mlx_lm_commit": oracle_identity["mlx_lm_commit"],
+            "mlx_tree_sha256": oracle_identity["mlx_tree_sha256"],
+            "mlx_tree_file_count": oracle_identity["mlx_tree_file_count"],
+            "mlx_metal_tree_sha256": oracle_identity["mlx_metal_tree_sha256"],
+            "mlx_metal_tree_file_count": oracle_identity["mlx_metal_tree_file_count"],
+            "mlx_lm_tree_sha256": oracle_identity["mlx_lm_tree_sha256"],
+            "mlx_lm_tree_file_count": oracle_identity["mlx_lm_tree_file_count"],
             "mlx_lm_package_sha256": sha256_file(package_path),
             "generate_source_sha256": sha256_file(generate_path),
             "worker_sha256": sha256_file(worker_path),
+            "oracle_identity_source_sha256": sha256_file(
+                worker_path.with_name("oracle_identity.py")
+            ),
+            "environment": dict(sorted(os.environ.items())),
             "device_info": device_info,
             "requested_wired_limit_bytes": requested_wired_limit,
             "recommended_working_set_bytes": recommended,
@@ -180,6 +284,8 @@ def main() -> int:
         {
             "schema": EVENT_SCHEMA,
             "kind": "model_loaded",
+            "unix_ns": time.time_ns(),
+            "monotonic_ns": time.perf_counter_ns(),
             "load_duration_ns": load_finished_ns - load_started_ns,
             "memory": memory_snapshot(mx),
         }
@@ -202,9 +308,22 @@ def main() -> int:
         emit(
             {
                 "schema": EVENT_SCHEMA,
+                "kind": "trial_start_pending",
+                "phase": phase,
+                "trial_index": trial_index,
+                "unix_ns": time.time_ns(),
+                "monotonic_ns": time.perf_counter_ns(),
+            }
+        )
+        await_controller("pre_trial_sampled", phase, trial_index)
+        emit(
+            {
+                "schema": EVENT_SCHEMA,
                 "kind": "trial_start",
                 "phase": phase,
                 "trial_index": trial_index,
+                "unix_ns": time.time_ns(),
+                "monotonic_ns": time.perf_counter_ns(),
             }
         )
         started_ns = time.perf_counter_ns()
@@ -250,6 +369,9 @@ def main() -> int:
             {
                 "schema": TRIAL_SCHEMA,
                 "kind": "trial",
+                "unix_ns": time.time_ns(),
+                "started_monotonic_ns": started_ns,
+                "finished_monotonic_ns": time.perf_counter_ns(),
                 "phase": phase,
                 "trial_index": trial_index,
                 "arm": args.arm,
@@ -275,26 +397,42 @@ def main() -> int:
                 "requested_wired_limit_bytes": requested_wired_limit,
             }
         )
-        emit(
-            {
-                "schema": EVENT_SCHEMA,
-                "kind": "trial_end",
-                "phase": phase,
-                "trial_index": trial_index,
-            }
-        )
-
         del iterator
         del prompt_cache
         del outputs
         del offsets_ns
         mx.synchronize()
         mx.clear_cache()
+        mx.synchronize()
+        emit(
+            {
+                "schema": EVENT_SCHEMA,
+                "kind": "trial_post_cleanup_pending",
+                "phase": phase,
+                "trial_index": trial_index,
+                "unix_ns": time.time_ns(),
+                "monotonic_ns": time.perf_counter_ns(),
+                "mlx_memory_post_cleanup": memory_snapshot(mx),
+            }
+        )
+        await_controller("post_cleanup_sampled", phase, trial_index)
+        emit(
+            {
+                "schema": EVENT_SCHEMA,
+                "kind": "trial_end",
+                "phase": phase,
+                "trial_index": trial_index,
+                "unix_ns": time.time_ns(),
+                "monotonic_ns": time.perf_counter_ns(),
+            }
+        )
 
     emit(
         {
             "schema": EVENT_SCHEMA,
             "kind": "worker_end",
+            "unix_ns": time.time_ns(),
+            "monotonic_ns": time.perf_counter_ns(),
             "measured_trials": args.trials,
             "warmups": args.warmups,
             "measured_output_token_sha256": measured_output_sha256,
@@ -314,6 +452,8 @@ if __name__ == "__main__":
             {
                 "schema": EVENT_SCHEMA,
                 "kind": "failure",
+                "unix_ns": time.time_ns(),
+                "monotonic_ns": time.perf_counter_ns(),
                 "error_type": type(error).__name__,
                 "message": str(error),
                 "traceback": traceback.format_exc().splitlines(),

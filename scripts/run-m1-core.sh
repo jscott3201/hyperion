@@ -8,7 +8,8 @@ if [[ ! "$run_id" =~ ^[a-zA-Z0-9._-]+$ ]]; then
     exit 64
 fi
 cd "$repo_root"
-binary="$repo_root/target/release/hyperion-bench"
+binary="$repo_root/target/m1-release/release/hyperion-bench"
+run_manifest="benchmarks/raw/m1/$run_id/run-manifest.json"
 if [[ ! -x "$binary" ]]; then
     echo "release benchmark binary is missing; run scripts/m1-preflight.sh" >&2
     exit 2
@@ -22,6 +23,7 @@ for model in 12b e4b; do
             --context "$context" \
             --arm core-default \
             --wired-limit default \
+            --run-manifest "$run_manifest" \
             --output "$output"
     done
 done

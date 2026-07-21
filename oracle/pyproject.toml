@@ -2,7 +2,7 @@
 name = "hyperion-oracle"
 version = "0.0.0"
 description = "Bench-only pinned mlx-lm oracle for Hyperion parity work"
-requires-python = ">=3.11,<3.15"
+requires-python = "==3.12.*"
 dependencies = [
     "mlx==0.32.0",
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm.git@8239c72de5a0e42c539e30489021db73c7fe258c",

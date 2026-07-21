@@ -153,3 +153,42 @@ reset or allocator-cache clear inside the iterator. The pinned, unchanged `gener
 implementation itself calls `mx.clear_cache()` at its stock prefill-chunk and 256-token
 boundaries. Those upstream calls remain part of the immutable A-arm and must not be removed,
 patched, or relabeled as Hyperion behavior.
+
+## Protocol clarification 2 — fail-closed oracle identity
+
+The oracle project now narrows its resolver range to Python 3.12 and the setup and runtime
+checks require patch release 3.12.13 exactly. Regenerating `oracle/uv.lock` under that narrower
+range removed irrelevant Python-version alternatives without changing the Python 3.12 package
+realization; its accepted SHA-256 is
+`b3603b4ebbc7f5883afe3d8cc10fc1767239837f5256985bd591b777c993dbaf`.
+The immutable boundary is checked by canonical hashes over every installed non-bytecode
+payload in the `mlx`, `mlx-metal`, and `mlx-lm` packages and their immutable distribution
+metadata, not only three entry-point sources. The accepted tree hashes are MLX
+`bacebd4f46680155a129301ffefc516402142183584f2b47673bc91b561f0cd9`, mlx-metal
+`628a99548b65855148fb03f71cac83ce46eae42140f119fa8d1b51285c2abefd`, and mlx-lm
+`40dc49399a07cdf22e3516070cfe222e89ec2f0ff29cd6e257e1b069edc3472f`.
+The run manifest separately hashes the exact benchmark executable, its loaded native MLX
+dylib, and the compiled canary metallib at both run creation and the final master gate.
+
+## Protocol clarification 3 — causal boundaries and authoritative schedule
+
+Every trial uses a bidirectional controller handshake. The worker blocks after constructing
+the fresh prompt cache until the controller takes the settled pre-trial OS sample, and blocks
+again after synchronized cleanup until the controller takes the post-cleanup sample. Periodic
+samples are attributed only when the trial stage is unchanged across the OS sampling syscall;
+cross-boundary samples remain unattributed. The committed
+`benchmarks/m1/schedule.json` is the machine-readable schedule. The master gate requires the
+exact core matrix, all eight coarse budget outcomes, both refinement outcomes derived from the
+best eligible coarse point, fresh chronological A-C-C-A blocks bound to the saved selection,
+and both server smokes. Controlled failed budget points remain in the curve as ineligible
+outcomes; missing points, uncontrolled OOM, or failures in core/confirmation remain fatal.
+
+## Protocol clarification 4 — low-N stretch and durable evidence
+
+The optional 128K sentinel is an explicit non-gating `stretch-128k` row with 129 generated IDs,
+one warmup, and one to four measured trials. Its model-specific 131,072-token fixtures are
+hash-frozen with the corpus, and every such row is labeled `low_n`; it cannot satisfy a core
+gate or promotion. Accepted M1 raw evidence is archived as an immutable, content-addressed
+GitHub release asset named from the measured commit. The protected workflow downloads the
+asset after upload, compares SHA-256, and emits a retrieval receipt. The finite-retention
+Actions artifact is only a convenience copy and is not the permanent A-arm record.
