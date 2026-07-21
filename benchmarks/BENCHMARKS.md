@@ -77,3 +77,59 @@ MEASURED {"schema":"hyperion.canary.v1","model_scope":"gemma-4","abi_version":1,
 
 - Verdict: `PASS (capability observation)` — all required dtype/shape cells executed on the
   M5. No kernel promotion or NAX-route claim is made from this probe.
+
+### `HYP-M0-ORACLE-001` — pinned Gemma 4 generation smoke
+
+- Classification: `MEASURED`
+- Source commit: `094664919bc2e28fd0d93b3c1034db7511d1aca3`
+- Worktree: clean for tracked files; source and converted model payloads ignored by policy
+- Machine state: `m5-16g-local-2026-07-21`
+- Exact parent command: `scripts/ci-release.sh`
+- Exact oracle stage: `scripts/oracle-smoke.sh`
+- Oracle lock SHA-256: `5e6e51756f1420e078f09badc0748e010eaaa7a5f1b81adfebbe9ca24a0e8883`
+- Source repository/revision: `google/gemma-4-12B-it-qat-q4_0-unquantized` at
+  `b6ed86275a6a5735884e208bfed95b445a684ca2`
+- Source SHA-256 manifest digest:
+  `6a07a92df9260b71117b113a8ad0b305432a48f895abd850a7616241a636ebed`
+- Converted identity: affine Q4, group size 64, 4 bits; converted SHA-256 manifest digest
+  `9fa3c7f6c49305f621ed1f96edbb34c6402b6229701041db4e607df70e9b4144`
+- Generation controls: greedy temperature `0.0`, seed `0`, maximum 128 tokens, checkpoint
+  chat template with thinking explicitly disabled, exact full-response comparison
+- Trials: one functional generation smoke; this is not a performance row
+- Exit status: `0`
+- Output:
+
+```text
+MEASURED {"schema":"hyperion.oracle-smoke.v1","model":"gemma-4-12B-QAT-Q4-g64-affine","prompt":"HYPERION_M0_OK","generated":true}
+HYPERION_M0_OK
+```
+
+- Verdict: `PASS` — the hash-bound converted checkpoint performed real generation and its
+  complete response exactly matched the frozen marker.
+
+### `HYP-M0-GATE-001` — pre-review full release gate
+
+- Classification: `MEASURED`
+- Source commit: `094664919bc2e28fd0d93b3c1034db7511d1aca3`
+- Worktree: clean for tracked files; model and build artifacts ignored by policy
+- Machine state: `m5-16g-local-2026-07-21`
+- Exact command: `scripts/ci-release.sh`
+- Cargo lock SHA-256: `63bf01240e9139a52d71d7bf6d8e8ee76a4ad28246dd2e6f27c5794242df98e8`
+- Oracle lock SHA-256: `5e6e51756f1420e078f09badc0748e010eaaa7a5f1b81adfebbe9ca24a0e8883`
+- Gate order: fast PR checks; all native CMake tests; ignored Rust real-M5 canary; native
+  canary executable; strict Gemma oracle generation. The native executable exited before the
+  Python oracle process started.
+- Fast checks: locked workspace build, Clippy with warnings denied, Rust tests, six-crate
+  no-orphan graph, unsafe confinement, two-symbol C ABI surface, append-only ledger guard,
+  and model-free CMake build/tests all passed.
+- Full native checks: all three CMake tests passed, including the runtime canary; the ignored
+  Rust real-M5 canary passed; the standalone canary reported MLX `0.32.0`, Apple10 family,
+  a device-derived `12,064,746,749`-byte effective budget, MLX result `4.0`, and custom
+  metallib result `42.0`.
+- Oracle output: strict full response `HYPERION_M0_OK` from the hash-bound converted Gemma 4
+  artifact.
+- Trials: one complete functional release-gate run; this is not a performance row
+- Exit status: `0`
+- Verdict: `PASS (pre-review)` — every M0 fast and heavy gate passed sequentially on the real
+  target machine. Final milestone acceptance remains withheld until the mandatory adversarial
+  review is addressed and the resulting commit is rerun.
