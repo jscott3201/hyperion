@@ -1,0 +1,15 @@
+[package]
+name = "hyperion-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hyperion-ffi = { path = "../hyperion-ffi" }
+hyperion-model = { path = "../hyperion-model" }
+hyperion-tokenizer = { path = "../hyperion-tokenizer" }
+
+[lints]
+workspace = true

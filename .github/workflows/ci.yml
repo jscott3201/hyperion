@@ -1,0 +1,36 @@
+name: tier1
+
+on:
+  pull_request:
+    branches: [development]
+  push:
+    branches: [development]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tier1-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  model-free:
+    name: model-free / Rust 1.95 / MLX 0.32
+    runs-on: macos-26
+    timeout-minutes: 20
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      MLX_ROOT: /opt/homebrew/opt/mlx
+      HYPERION_BASE_REF: origin/development
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Install exact Rust floor
+        run: rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt
+      - name: Install native dependencies
+        run: |
+          brew install cmake mlx
+          test "$(brew list --versions mlx | awk '{print $2}')" = "0.32.0"
+      - name: Run cumulative model-free tier 1
+        run: scripts/ci-pr.sh

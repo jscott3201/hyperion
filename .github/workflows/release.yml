@@ -1,0 +1,28 @@
+name: release-gate
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  m5-full:
+    name: full M5 milestone gate
+    runs-on: [self-hosted, macOS, ARM64, hyperion-m5]
+    timeout-minutes: 360
+    env:
+      MLX_ROOT: /opt/homebrew/opt/mlx
+      HYPERION_BASE_REF: origin/main
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Run cumulative release gate
+        run: scripts/ci-release.sh
