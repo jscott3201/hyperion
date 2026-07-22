@@ -30,6 +30,13 @@ fn main() {
         native_dir.join("src/platform_policy.cc"),
         native_dir.join("src/platform_policy.h"),
         native_dir.join("src/runtime.mm"),
+        native_dir.join("src/abi_error.cc"),
+        native_dir.join("src/abi_error.h"),
+        native_dir.join("src/geometry.cc"),
+        native_dir.join("src/geometry.h"),
+        native_dir.join("src/dispatch.cc"),
+        native_dir.join("src/dispatch.h"),
+        native_dir.join("src/model.cc"),
     ] {
         println!("cargo:rerun-if-changed={}", path.display());
     }

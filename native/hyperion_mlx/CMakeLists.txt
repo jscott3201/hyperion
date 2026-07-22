@@ -32,8 +32,10 @@ mlx_build_metallib(
 add_library(hyperion_mlx STATIC
     src/platform_policy.cc
     src/runtime.mm
+    src/abi_error.cc
     src/geometry.cc
     src/dispatch.cc
+    src/model.cc
 )
 add_dependencies(hyperion_mlx hyperion_canary_metallib)
 target_include_directories(hyperion_mlx
