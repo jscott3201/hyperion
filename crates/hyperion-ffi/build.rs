@@ -36,6 +36,8 @@ fn main() {
         native_dir.join("src/geometry.h"),
         native_dir.join("src/dispatch.cc"),
         native_dir.join("src/dispatch.h"),
+        native_dir.join("src/kv.cc"),
+        native_dir.join("src/kv.h"),
         native_dir.join("src/model.cc"),
     ] {
         println!("cargo:rerun-if-changed={}", path.display());

@@ -32,7 +32,7 @@ else
         --test-dir "$hyp_build_dir" \
         --output-on-failure \
         -C Release \
-        -R 'hyperion_(platform_policy(_negative_control)?|abi_contract|geometry|dispatch)$'
+        -R 'hyperion_(platform_policy(_negative_control)?|abi_contract|geometry|dispatch|kv)$'
 fi
 
 metallib_sha256=$(shasum -a 256 "$hyp_build_dir/hyperion_canary.metallib" | awk '{print $1}')
