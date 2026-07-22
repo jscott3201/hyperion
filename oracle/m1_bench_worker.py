@@ -121,6 +121,38 @@ def memory_snapshot(mx: Any) -> dict[str, int]:
     }
 
 
+def verified_startup_environment() -> dict[str, str]:
+    """Return the exact inherited environment before stock package imports mutate it."""
+
+    actual = dict(os.environ)
+    if actual != EXPECTED_ENVIRONMENT:
+        raise RuntimeError(
+            f"worker environment must be exactly {EXPECTED_ENVIRONMENT}, found {actual}"
+        )
+    forbidden = sorted(
+        key
+        for key in actual
+        if key != "TOKENIZERS_PARALLELISM"
+        and key.startswith(PERFORMANCE_ENV_PREFIXES)
+    )
+    if forbidden:
+        raise RuntimeError(f"worker inherited performance-sensitive variables: {forbidden}")
+    return actual.copy()
+
+
+def canonical_macos_version(value: str) -> str:
+    """Normalize platform.mac_ver() to the native canary's major.minor.patch form."""
+
+    components = value.split(".")
+    if not 1 <= len(components) <= 3 or any(
+        not component.isascii() or not component.isdigit() for component in components
+    ):
+        raise RuntimeError(f"macOS version is not numeric major.minor.patch: {value!r}")
+    numbers = [int(component) for component in components]
+    numbers.extend([0] * (3 - len(numbers)))
+    return ".".join(str(number) for number in numbers)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=Path, required=True)
@@ -160,19 +192,7 @@ def main() -> int:
             "M1 cells require one warmup and five trials, except explicit 128K low-N stretch rows"
         )
 
-    if dict(os.environ) != EXPECTED_ENVIRONMENT:
-        raise RuntimeError(
-            f"worker environment must be exactly {EXPECTED_ENVIRONMENT}, "
-            f"found {dict(os.environ)}"
-        )
-    forbidden = sorted(
-        key
-        for key in os.environ
-        if key != "TOKENIZERS_PARALLELISM"
-        and key.startswith(PERFORMANCE_ENV_PREFIXES)
-    )
-    if forbidden:
-        raise RuntimeError(f"worker inherited performance-sensitive variables: {forbidden}")
+    startup_environment = verified_startup_environment()
 
     oracle_identity = verify_identity()
 
@@ -189,10 +209,9 @@ def main() -> int:
 
     device_info = json_safe(mx.device_info())
     recommended = int(device_info["max_recommended_working_set_size"])
-    if platform.machine() != "arm64" or tuple(map(int, platform.mac_ver()[0].split(".")[:2])) < (
-        26,
-        2,
-    ):
+    macos = canonical_macos_version(platform.mac_ver()[0])
+    macos_numbers = tuple(map(int, macos.split(".")))
+    if platform.machine() != "arm64" or macos_numbers[:2] < (26, 2):
         raise RuntimeError(
             f"M1 requires arm64 macOS 26.2+, found {platform.machine()} {platform.mac_ver()[0]}"
         )
@@ -254,7 +273,7 @@ def main() -> int:
             "startup_flags": oracle_identity["startup_flags"],
             "pycache_prefix": oracle_identity["pycache_prefix"],
             "hash_seed_probe": oracle_identity["hash_seed_probe"],
-            "platform": {"macos": platform.mac_ver()[0], "machine": platform.machine()},
+            "platform": {"macos": macos, "machine": platform.machine()},
             "mlx_version": oracle_identity["mlx_version"],
             "mlx_metal_version": oracle_identity["mlx_metal_version"],
             "mlx_lm_version": oracle_identity["mlx_lm_version"],
@@ -277,7 +296,7 @@ def main() -> int:
             "model_identity_source_sha256": sha256_file(
                 worker_path.with_name("model_identity.py")
             ),
-            "environment": dict(sorted(os.environ.items())),
+            "environment": startup_environment,
             "device_info": device_info,
             "requested_wired_limit_bytes": requested_wired_limit,
             "recommended_working_set_bytes": recommended,

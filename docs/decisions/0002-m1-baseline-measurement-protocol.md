@@ -290,3 +290,18 @@ The direct and server load guards perform their second identity check in a `fina
 including when the underlying loader raises. Model-free mutation controls require both guards
 to reject a payload change made inside the synthetic loader and prohibit a successful server
 load receipt for that changed tree.
+
+## Protocol clarification 9 — canonical worker-start provenance
+
+The worker environment receipt is the exact five-variable launch snapshot verified before any
+stock package import. It does not misclassify environment variables set internally by the
+unchanged pinned package after startup as ambient controller input; in particular, pinned
+`mlx_lm` sets `TRANSFORMERS_NO_ADVISORY_WARNINGS=1` during import. Hyperion neither supplies nor
+changes that stock-internal setting. The worker retains the immutable launch snapshot for its
+receipt while the controller continues to reject every extra inherited variable.
+
+The worker also canonicalizes `platform.mac_ver()` to numeric `major.minor.patch`, padding
+omitted components with zero, before comparing it to the native canary. Thus equivalent host
+reports such as `26.6` and `26.6.0` have one exact run-bound representation. The first
+unscored 12B 512×128 pilot was retained as rejected evidence after exposing both encoding
+mismatches; it cannot satisfy any M1 gate, and E4B was not started in that attempt.

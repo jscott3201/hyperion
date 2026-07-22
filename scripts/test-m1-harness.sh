@@ -8,6 +8,8 @@ fixture="$repo_root/benchmarks/m1/fixtures/valid-cell.jsonl"
 scratch_dir=$(mktemp -d "${TMPDIR:-/tmp}/hyperion-m1-harness.XXXXXX")
 trap 'rm -rf "$scratch_dir"' EXIT
 
+python3 -B oracle/test_m1_worker_envelope.py
+
 python3 oracle/build_m1_synthetic_fixtures.py \
     --output "$scratch_dir/valid-cell.jsonl"
 cmp "$fixture" "$scratch_dir/valid-cell.jsonl"
@@ -26,6 +28,8 @@ for mutation in \
     oracle-tree-drift \
     controller-envelope-drift \
     worker-source-drift \
+    worker-environment-drift \
+    worker-platform-drift \
     os-summary-drift \
     missing-warmup-boundary \
     controller-sample-count \

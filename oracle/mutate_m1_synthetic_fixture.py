@@ -53,6 +53,16 @@ def mutate(values: list[dict[str, Any]], mutation: str) -> list[dict[str, Any]]:
             "generate_source_sha256"
         ] = "9" * 64
         return values
+    if mutation == "worker-environment-drift":
+        next(value for value in values if value.get("kind") == "worker_start")[
+            "environment"
+        ]["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+        return values
+    if mutation == "worker-platform-drift":
+        next(value for value in values if value.get("kind") == "worker_start")[
+            "platform"
+        ]["macos"] = "26.2"
+        return values
     if mutation == "os-summary-drift":
         next(value for value in values if value.get("kind") == "os_trial_summary")[
             "max_lifetime_phys_footprint_bytes"
