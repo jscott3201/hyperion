@@ -337,10 +337,12 @@ the interpreter code while leaving the install location unbound; this generalize
 path-embedded artifact. Stripping the prefix was still insufficient: uv re-signs every Mach-O
 it relocates adhoc, and the adhoc CodeDirectory signs the install-name page, so the signature
 blob itself differs per machine for the same release. `canonical_tree` therefore also accepts
-`strip_codesignature`: Mach-O files (detected by magic) are hashed over their unsigned content
-(`codesign --remove-signature` on a temp copy, never mutating the source), then prefix-
-normalized. The runtime tree is now tree
-`ec2127c8632e03a35c1db303946f07ad92dac07cd7f8e47555efc75dc5330bb6` over 1,897 entries. Runtime
+`strip_codesignature`: for Mach-O files (detected by magic) the `LC_CODE_SIGNATURE` load command
+is parsed to locate the embedded code-signature SuperBlob and that byte range is excluded from
+the hash (then prefix-normalized) — no rewrite and no `codesign` subprocess, because
+`codesign --remove-signature` rewrites `__LINKEDIT` in a tool-version-dependent way that drifted
+two bytes between the dev and CI runners. The runtime tree is now tree
+`84fdd9dcc811d7dab39be0d36dcb375526287b8b033b663864d3fd896a67efcb` over 1,897 entries. Runtime
 integrity is still anchored by the interpreter-launcher SHA-256, by every non-bytecode regular
 file and in-tree link in the base prefix with the install prefix normalized and the adhoc
 signature removed, and by the independently hash-rejected site-packages tree; the losses are

@@ -8,10 +8,8 @@ import json
 import os
 import re
 import runpy
-import shutil
-import subprocess
+import struct
 import sys
-import tempfile
 import types
 from pathlib import Path
 from typing import Any
@@ -22,7 +20,7 @@ EXPECTED_PYTHON_EXECUTABLE_SHA256 = (
     "01564940172b2811e1f39a4dc90e84c7a26a19cf071bbc5de67e456d82627bec"
 )
 EXPECTED_PYTHON_RUNTIME_TREE_SHA256 = (
-    "ec2127c8632e03a35c1db303946f07ad92dac07cd7f8e47555efc75dc5330bb6"
+    "84fdd9dcc811d7dab39be0d36dcb375526287b8b033b663864d3fd896a67efcb"
 )
 EXPECTED_PYTHON_RUNTIME_FILE_COUNT = 1897
 EXPECTED_SITE_PACKAGES_TREE_SHA256 = (
@@ -54,10 +52,10 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-# Mach-O magic numbers (the first four bytes on disk). The runtime tree is hashed
-# over unsigned content because uv re-signs every Mach-O it relocates adhoc, and
-# the adhoc CodeDirectory signs the install-name page, so signature bytes differ
-# per machine even for the same release.
+# Mach-O magic numbers (the first four bytes on disk). The runtime tree excludes
+# embedded code signatures because uv re-signs every Mach-O it relocates adhoc,
+# and the adhoc CodeDirectory signs the install-name page, so signature bytes
+# differ per machine even for the same release.
 _MACHO_MAGICS = frozenset(
     {
         b"\xcf\xfa\xed\xfe",  # MH_MAGIC_64 (arm64)
@@ -67,39 +65,41 @@ _MACHO_MAGICS = frozenset(
     }
 )
 
+# LC_CODE_SIGNATURE load command id; its payload is (cmd, cmdsize, dataoff, datasize).
+_LC_CODE_SIGNATURE = 0x1D
 
-def _macho_unsigned_bytes(path: Path) -> bytes | None:
-    """Return ``path``'s bytes with its embedded code signature removed.
 
-    Works on a temp copy so the source is never mutated. Returns ``None`` when
-    ``codesign`` is unavailable or the file is not signed, so the caller falls
-    back to hashing the raw bytes.
+def _macho_codesignature_range(path: Path) -> tuple[int, int] | None:
+    """Return ``(offset, size)`` of ``path``'s embedded code signature, or None.
+
+    Mach-O thin binaries only (the arm64 base-prefix binaries); fat archives and
+    unrecognized magics return None so the caller hashes the raw bytes. ``codesign
+    --remove-signature`` rewrites ``__LINKEDIT`` in a tool-version-dependent way (a
+    2-byte drift between the dev and CI runners broke the prior approach), so we
+    instead parse the ``LC_CODE_SIGNATURE`` load command and exclude exactly that
+    byte range from the hash — no rewrite, no subprocess, no tool drift.
     """
-    temp_file = tempfile.NamedTemporaryFile(
-        prefix="hyperion-identity-",
-        suffix=".macho",
-        delete=False,
-    )
-    temp_file.close()
-    temp_path = Path(temp_file.name)
-    try:
-        shutil.copyfile(path, temp_path)
-        result = subprocess.run(
-            ["codesign", "--remove-signature", str(temp_path)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        if result.returncode != 0:
+    with path.open("rb") as handle:
+        magic = handle.read(4)
+        if magic == b"\xcf\xfa\xed\xfe":  # MH_MAGIC_64, little-endian
+            header_size = 32
+        elif magic == b"\xce\xfa\xed\xfe":  # MH_MAGIC, little-endian
+            header_size = 28
+        else:
             return None
-        return temp_path.read_bytes()
-    except (OSError, subprocess.SubprocessError):
-        return None
-    finally:
-        try:
-            temp_path.unlink()
-        except OSError:
-            pass
+        handle.seek(16)  # ncmds follows magic, cputype, cpusubtype, filetype
+        (ncmds,) = struct.unpack("<I", handle.read(4))
+        offset = header_size
+        for _ in range(ncmds):
+            handle.seek(offset)
+            cmd, cmdsize = struct.unpack("<II", handle.read(8))
+            if cmd == _LC_CODE_SIGNATURE:
+                if cmdsize < 16:
+                    return None
+                dataoff, datasize = struct.unpack("<II", handle.read(8))
+                return dataoff, datasize
+            offset += cmdsize
+    return None
 
 
 def _normalized_file_bytes(
@@ -108,16 +108,14 @@ def _normalized_file_bytes(
     path_prefix: str | None,
     strip_codesignature: bool,
 ) -> bytes:
-    """Read ``path`` for hashing, optionally unsigned and prefix-normalized."""
+    """Read ``path`` for hashing, optionally signature-excluded and prefix-normalized."""
+    data = path.read_bytes()
     if strip_codesignature:
-        with path.open("rb") as handle:
-            magic = handle.read(4)
-        unsigned = (
-            _macho_unsigned_bytes(path) if magic in _MACHO_MAGICS else None
-        )
-        data = unsigned if unsigned is not None else path.read_bytes()
-    else:
-        data = path.read_bytes()
+        signature = _macho_codesignature_range(path)
+        if signature is not None:
+            offset, size = signature
+            if size > 0 and offset + size <= len(data):
+                data = data[:offset] + data[offset + size :]
     if path_prefix:
         prefix_bytes = path_prefix.encode()
         if prefix_bytes and prefix_bytes in data:
