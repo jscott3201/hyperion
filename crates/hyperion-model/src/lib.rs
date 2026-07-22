@@ -1,5 +1,7 @@
 //! Gemma 4 model identity and, from M2 onward, validated geometry.
 
+pub mod geometry;
+
 /// The only model family accepted by Hyperion v1.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModelFamily {
