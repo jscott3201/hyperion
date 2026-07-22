@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from isolated_oracle import canonical_tree
+import isolated_oracle
 
 
 class CanonicalTreeTests(unittest.TestCase):
@@ -100,6 +101,26 @@ class CanonicalTreeTests(unittest.TestCase):
                 canonical_tree(root_a, allow_symlinks=True, ignore_bytecode=True),
                 canonical_tree(root_b, allow_symlinks=True, ignore_bytecode=True),
             )
+
+    def test_validate_expected_relax_skips_runtime_tree(self) -> None:
+        # Cross-machine runners relax the runtime-tree pin; a wrong runtime tree
+        # must raise in strict mode and be skipped in relaxed mode (the launcher
+        # binary and site-packages tree stay pinned in both).
+        wrong = {
+            "python_executable_sha256": isolated_oracle.EXPECTED_PYTHON_EXECUTABLE_SHA256,
+            "python_runtime_tree_sha256": "0" * 64,
+            "python_runtime_file_count": 0,
+            "site_packages_tree_sha256": isolated_oracle.EXPECTED_SITE_PACKAGES_TREE_SHA256,
+            "site_packages_file_count": isolated_oracle.EXPECTED_SITE_PACKAGES_FILE_COUNT,
+        }
+        isolated_oracle.RELAX_RUNTIME_TREE = False
+        with self.assertRaisesRegex(RuntimeError, "python_runtime_tree_sha256"):
+            isolated_oracle.validate_expected(dict(wrong))
+        isolated_oracle.RELAX_RUNTIME_TREE = True
+        try:
+            isolated_oracle.validate_expected(dict(wrong))
+        finally:
+            isolated_oracle.RELAX_RUNTIME_TREE = False
 
     def test_site_tree_rejects_regular_bytecode(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

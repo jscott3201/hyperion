@@ -22,6 +22,10 @@ jobs:
       HOMEBREW_NO_AUTO_UPDATE: "1"
       MLX_ROOT: /opt/homebrew/opt/mlx
       HYPERION_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+      # The relocated uv base interpreter prefix is not byte-reproducible across
+      # machines (adhoc re-signature + residual per-machine structural drift).
+      # Relax the runtime-tree pin here; the self-hosted M5 release-gate enforces it.
+      HYPERION_RELAX_RUNTIME_TREE: "1"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -47,11 +51,6 @@ jobs:
             xcodebuild -downloadComponent MetalToolchain
           fi
           xcrun metal --version
-      - name: Diagnostic runtime manifest
-        continue-on-error: true
-        run: |
-          uv sync --project oracle --frozen --no-dev
-          scripts/run-isolated-oracle.sh identity --derive --manifest
       - name: Recreate the locked model-free oracle
         run: scripts/setup-oracle.sh
       - name: Run cumulative model-free tier 1

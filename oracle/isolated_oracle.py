@@ -43,6 +43,19 @@ EXPECTED_ENVIRONMENT = {
 # every non-prefix byte is bound.
 PATH_PREFIX_TOKEN = b"<<HYPERION_PREFIX>>"
 
+# When True, validate_expected skips the two python_runtime_tree_* fields. The
+# relocated uv base interpreter prefix (libpython3.12.dylib adhoc re-signature plus
+# a residual per-machine structural drift) is not byte-reproducible across machines,
+# so the strict runtime-tree pin is enforced only where relocation is reproducible
+# (the self-hosted M5 release gate and the dev machine). Cross-machine CI sets
+# HYPERION_RELAX_RUNTIME_TREE=1 and forwards --relax-runtime-tree. The launcher
+# binary, site-packages tree, uv lock, hash probe, environment, and startup flags
+# remain pinned in both modes.
+RELAX_RUNTIME_TREE = False
+
+# Fields dropped from validate_expected when RELAX_RUNTIME_TREE is set.
+_RELAXED_FIELDS = ("python_runtime_tree_sha256", "python_runtime_file_count")
+
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -355,6 +368,9 @@ def validate_expected(identity: dict[str, Any]) -> None:
         "site_packages_tree_sha256": EXPECTED_SITE_PACKAGES_TREE_SHA256,
         "site_packages_file_count": EXPECTED_SITE_PACKAGES_FILE_COUNT,
     }
+    if RELAX_RUNTIME_TREE:
+        for field in _RELAXED_FIELDS:
+            expected.pop(field, None)
     actual = {key: identity[key] for key in expected}
     if actual != expected:
         raise RuntimeError(f"oracle startup substrate differs: expected {expected}, found {actual}")
@@ -369,13 +385,19 @@ def install_identity_module(identity: dict[str, Any]) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) < 2:
+    global RELAX_RUNTIME_TREE
+    argv = sys.argv[1:]
+    if "--relax-runtime-tree" in argv:
+        RELAX_RUNTIME_TREE = True
+        argv = [arg for arg in argv if arg != "--relax-runtime-tree"]
+    if not argv:
         raise SystemExit(
-            "usage: isolated_oracle.py identity [--derive [--manifest]] | script PATH [ARGS...]"
+            "usage: isolated_oracle.py [--relax-runtime-tree] identity "
+            "[--derive [--manifest]] | script PATH [ARGS...]"
         )
-    action = sys.argv[1]
+    action = argv[0]
     if action == "identity":
-        args = sys.argv[2:]
+        args = argv[1:]
         derive = "--derive" in args
         manifest = "--manifest" in args
         if args and not (derive or manifest):
@@ -402,20 +424,12 @@ def main() -> None:
     oracle_dir = Path(__file__).resolve().parent
     sys.path.extend([str(oracle_dir), str(identity["site_packages"])])
     if action == "script":
-        if len(sys.argv) < 3:
+        if len(argv) < 2:
             raise SystemExit("isolated_oracle.py script requires a target")
-
-    validate_expected(identity)
-    install_identity_module(identity)
-    oracle_dir = Path(__file__).resolve().parent
-    sys.path.extend([str(oracle_dir), str(identity["site_packages"])])
-    if action == "script":
-        if len(sys.argv) < 3:
-            raise SystemExit("isolated_oracle.py script requires a target")
-        target = Path(sys.argv[2]).resolve()
+        target = Path(argv[1]).resolve()
         if target.parent != oracle_dir or target.suffix != ".py":
             raise RuntimeError("isolated oracle script target must be a direct oracle/*.py file")
-        sys.argv = [str(target), *sys.argv[3:]]
+        sys.argv = [str(target), *argv[2:]]
         runpy.run_path(str(target), run_name="__main__")
     else:
         raise SystemExit(f"unsupported isolated oracle action: {action}")

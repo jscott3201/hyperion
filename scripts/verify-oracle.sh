@@ -16,12 +16,22 @@ if [[ ! -x oracle/.venv/bin/python ]]; then
 fi
 
 identity=$(scripts/run-isolated-oracle.sh script oracle/oracle_identity.py)
+
+# The relocated uv base interpreter prefix is not byte-reproducible off the
+# self-hosted M5, so cross-machine runners (HYPERION_RELAX_RUNTIME_TREE=1) omit
+# the runtime-tree assertions. The launcher binary, site-packages tree, uv lock,
+# startup flags, hash probe, environment, and MLX trees stay pinned in both modes.
+runtime_pin='    .python_runtime_tree_sha256 == "84fdd9dcc811d7dab39be0d36dcb375526287b8b033b663864d3fd896a67efcb" and
+    .python_runtime_file_count == 1897 and'
+if [[ "${HYPERION_RELAX_RUNTIME_TREE:-0}" == "1" ]]; then
+    runtime_pin=""
+fi
+
 jq -e '
     .schema == "hyperion.m1-oracle-identity.v1" and
     .python == "3.12.13" and
     .python_executable_sha256 == "01564940172b2811e1f39a4dc90e84c7a26a19cf071bbc5de67e456d82627bec" and
-    .python_runtime_tree_sha256 == "84fdd9dcc811d7dab39be0d36dcb375526287b8b033b663864d3fd896a67efcb" and
-    .python_runtime_file_count == 1897 and
+'"$runtime_pin"'
     .site_packages_tree_sha256 == "db258e22404a3937d46d72ff44083400aafcf34636b8444a91a29c858b297006" and
     .site_packages_file_count == 5470 and
     .startup_flags == {
@@ -64,4 +74,8 @@ jq -e '
     .mlx_lm_tree_sha256 == "40dc49399a07cdf22e3516070cfe222e89ec2f0ff29cd6e257e1b069edc3472f" and
     .mlx_lm_tree_file_count == 176
 ' <<<"$identity" >/dev/null
-printf 'oracle-verified: lock=%s identity=%s\n' "$expected_lock_sha256" "$identity"
+mode=strict
+if [[ "${HYPERION_RELAX_RUNTIME_TREE:-0}" == "1" ]]; then
+    mode=relaxed
+fi
+printf 'oracle-verified: mode=%s lock=%s identity=%s\n' "$mode" "$expected_lock_sha256" "$identity"

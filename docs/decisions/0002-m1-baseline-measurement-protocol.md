@@ -351,6 +351,20 @@ detection of a tampered-but-source-present stdlib `.pyc`, of a prefix-only edit 
 tree, the rest of the unsigned dylib's bytes, and the launcher binary hash. Because M1 is
 deferred, this re-preregistration lands before any scored run and supersedes no evidence.
 
+The strict runtime-tree pin is enforced only where the relocated uv prefix is reproducible:
+the self-hosted M5 release-gate runner and the dev machine (where `84fdd9dc…`/1,897 holds).
+Signature exclusion still leaves a residual per-machine structural drift in
+`libpython3.12.dylib` outside the signature SuperBlob (a consistent two-byte gap across
+machines), so cross-machine runners cannot assert the dylib byte-for-byte. The GitHub Actions
+`macos-26` tier-1 runner therefore sets `HYPERION_RELAX_RUNTIME_TREE=1`, which forwards
+`--relax-runtime-tree` through the isolated launcher and drops the two
+`python_runtime_tree_*` fields from `validate_expected` and `verify-oracle.sh`. The launcher
+binary SHA-256, the site-packages tree, the uv lock digest, the startup flags, the hash probe,
+the scrubbed environment, and the MLX/mlx-lm trees remain pinned in both modes, so CI still
+binds the interpreter-launcher and every installed package. The strict runtime-tree value
+stays the M1 protocol constant for the measurement machine; a future M1 run re-derives it on
+the actual self-hosted M5 if that machine differs from the dev derivation.
+
 ## Owner-directed disposition — implementation-first defer
 
 On 2026-07-21 the owner stopped the preregistered run
