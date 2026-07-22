@@ -47,6 +47,11 @@ jobs:
             xcodebuild -downloadComponent MetalToolchain
           fi
           xcrun metal --version
+      - name: Diagnostic runtime manifest
+        continue-on-error: true
+        run: |
+          uv sync --project oracle --frozen --no-dev
+          scripts/run-isolated-oracle.sh identity --derive --manifest
       - name: Recreate the locked model-free oracle
         run: scripts/setup-oracle.sh
       - name: Run cumulative model-free tier 1

@@ -135,6 +135,7 @@ def canonical_tree(
     ignore_wheel_records: bool = False,
     path_prefix: str | None = None,
     strip_codesignature: bool = False,
+    entries_out: list[str] | None = None,
 ) -> tuple[str, int]:
     """Hash a complete tree using location-independent relative names.
 
@@ -161,7 +162,7 @@ def canonical_tree(
     root = root.resolve()
     if not root.is_dir():
         raise RuntimeError(f"identity root is not a directory: {root}")
-    entries: list[str] = []
+    entries: list[str] = entries_out if entries_out is not None else []
     for directory, directories, files in os.walk(root, followlinks=False):
         directory_path = Path(directory)
         kept_directories: list[str] = []
@@ -248,7 +249,7 @@ def scrubbed_environment() -> dict[str, str]:
     return dict(EXPECTED_ENVIRONMENT)
 
 
-def startup_identity() -> dict[str, Any]:
+def startup_identity(manifest_out: list[str] | None = None) -> dict[str, Any]:
     if sys.version.split()[0] != EXPECTED_PYTHON:
         raise RuntimeError(f"expected Python {EXPECTED_PYTHON}, found {sys.version.split()[0]}")
     environment = scrubbed_environment()
@@ -322,6 +323,7 @@ def startup_identity() -> dict[str, Any]:
         ignore_bytecode=True,
         path_prefix=str(runtime_root),
         strip_codesignature=True,
+        entries_out=manifest_out,
     )
     site_sha256, site_count = canonical_tree(
         # Wheel RECORD files are non-executable installer receipts and uv rewrites
@@ -370,15 +372,24 @@ def install_identity_module(identity: dict[str, Any]) -> None:
 
 def main() -> None:
     if len(sys.argv) < 2:
-        raise SystemExit("usage: isolated_oracle.py identity [--derive] | script PATH [ARGS...]")
+        raise SystemExit(
+            "usage: isolated_oracle.py identity [--derive [--manifest]] | script PATH [ARGS...]"
+        )
     action = sys.argv[1]
-    identity = startup_identity()
     if action == "identity":
-        derive = sys.argv[2:] == ["--derive"]
-        if sys.argv[2:] not in ([], ["--derive"]):
-            raise SystemExit("usage: isolated_oracle.py identity [--derive]")
+        args = sys.argv[2:]
+        derive = "--derive" in args
+        manifest = "--manifest" in args
+        if args and not (derive or manifest):
+            raise SystemExit("usage: isolated_oracle.py identity [--derive [--manifest]]")
+        manifest_lines: list[str] = []
+        identity = startup_identity(manifest_out=manifest_lines if manifest else None)
         if not derive:
             validate_expected(identity)
+        if manifest:
+            for line in sorted(manifest_lines):
+                print(line, end="")
+            return
         print(
             json.dumps(
                 {key: value for key, value in identity.items() if key != "site_packages"},
@@ -386,6 +397,15 @@ def main() -> None:
             )
         )
         return
+
+    identity = startup_identity()
+    validate_expected(identity)
+    install_identity_module(identity)
+    oracle_dir = Path(__file__).resolve().parent
+    sys.path.extend([str(oracle_dir), str(identity["site_packages"])])
+    if action == "script":
+        if len(sys.argv) < 3:
+            raise SystemExit("isolated_oracle.py script requires a target")
 
     validate_expected(identity)
     install_identity_module(identity)
