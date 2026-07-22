@@ -1,5 +1,7 @@
 #pragma once
 
+#include "hyperion_mlx.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -78,6 +80,15 @@ struct Geometry {
     /// Re-check the graph-critical invariants. Returns ``std::nullopt`` on
     /// success or an explanatory message on failure (no exceptions across ABI).
     [[nodiscard]] std::optional<std::string> validate() const;
+
+    /// Build a C++ ``Geometry`` from the ABI ``HypGeometryParams`` the Rust side
+    /// (``hyperion_model::Geometry``) validated and passed across. On success fills
+    /// ``out`` and returns ``std::nullopt``; on a malformed ABI struct (a null
+    /// ``layer_types`` pointer, a bad enum value, etc.) returns an error message — a
+    /// second line of defense against ABI misuse, never trusting the caller.
+    [[nodiscard]] static std::optional<std::string> from_abi(
+        const HypGeometryParams& params,
+        Geometry& out);
 
     /// Indices of the full (global) layers, ascending.
     [[nodiscard]] std::vector<std::size_t> global_layer_indices() const;

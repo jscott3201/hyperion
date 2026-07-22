@@ -1,7 +1,7 @@
 {
   "metadata": {
-    "total_size": 4096,
-    "total_parameters": 4096
+    "total_size": 708620,
+    "total_parameters": 708620
   },
   "weight_map": {
     "language_model.model.embed_tokens.biases": "model-00002-of-00002.safetensors",
@@ -19,6 +19,7 @@
     "language_model.model.layers.0.mlp.up_proj.scales": "model-00001-of-00002.safetensors",
     "language_model.model.layers.0.mlp.up_proj.weight": "model-00001-of-00002.safetensors",
     "language_model.model.layers.0.post_attention_layernorm.weight": "model-00001-of-00002.safetensors",
+    "language_model.model.layers.0.post_feedforward_layernorm.weight": "model-00001-of-00002.safetensors",
     "language_model.model.layers.0.pre_feedforward_layernorm.weight": "model-00001-of-00002.safetensors",
     "language_model.model.layers.0.self_attn.k_norm.weight": "model-00001-of-00002.safetensors",
     "language_model.model.layers.0.self_attn.k_proj.biases": "model-00001-of-00002.safetensors",
@@ -46,6 +47,7 @@
     "language_model.model.layers.1.mlp.up_proj.scales": "model-00001-of-00002.safetensors",
     "language_model.model.layers.1.mlp.up_proj.weight": "model-00001-of-00002.safetensors",
     "language_model.model.layers.1.post_attention_layernorm.weight": "model-00001-of-00002.safetensors",
+    "language_model.model.layers.1.post_feedforward_layernorm.weight": "model-00001-of-00002.safetensors",
     "language_model.model.layers.1.pre_feedforward_layernorm.weight": "model-00001-of-00002.safetensors",
     "language_model.model.layers.1.self_attn.k_norm.weight": "model-00001-of-00002.safetensors",
     "language_model.model.layers.1.self_attn.k_proj.biases": "model-00001-of-00002.safetensors",
@@ -73,6 +75,7 @@
     "language_model.model.layers.2.mlp.up_proj.scales": "model-00001-of-00002.safetensors",
     "language_model.model.layers.2.mlp.up_proj.weight": "model-00001-of-00002.safetensors",
     "language_model.model.layers.2.post_attention_layernorm.weight": "model-00001-of-00002.safetensors",
+    "language_model.model.layers.2.post_feedforward_layernorm.weight": "model-00001-of-00002.safetensors",
     "language_model.model.layers.2.pre_feedforward_layernorm.weight": "model-00001-of-00002.safetensors",
     "language_model.model.layers.2.self_attn.k_norm.weight": "model-00001-of-00002.safetensors",
     "language_model.model.layers.2.self_attn.k_proj.biases": "model-00001-of-00002.safetensors",
@@ -100,6 +103,7 @@
     "language_model.model.layers.3.mlp.up_proj.scales": "model-00001-of-00002.safetensors",
     "language_model.model.layers.3.mlp.up_proj.weight": "model-00001-of-00002.safetensors",
     "language_model.model.layers.3.post_attention_layernorm.weight": "model-00001-of-00002.safetensors",
+    "language_model.model.layers.3.post_feedforward_layernorm.weight": "model-00001-of-00002.safetensors",
     "language_model.model.layers.3.pre_feedforward_layernorm.weight": "model-00001-of-00002.safetensors",
     "language_model.model.layers.3.self_attn.k_norm.weight": "model-00001-of-00002.safetensors",
     "language_model.model.layers.3.self_attn.k_proj.biases": "model-00001-of-00002.safetensors",
@@ -127,6 +131,7 @@
     "language_model.model.layers.4.mlp.up_proj.scales": "model-00002-of-00002.safetensors",
     "language_model.model.layers.4.mlp.up_proj.weight": "model-00002-of-00002.safetensors",
     "language_model.model.layers.4.post_attention_layernorm.weight": "model-00002-of-00002.safetensors",
+    "language_model.model.layers.4.post_feedforward_layernorm.weight": "model-00002-of-00002.safetensors",
     "language_model.model.layers.4.pre_feedforward_layernorm.weight": "model-00002-of-00002.safetensors",
     "language_model.model.layers.4.self_attn.k_norm.weight": "model-00002-of-00002.safetensors",
     "language_model.model.layers.4.self_attn.k_proj.biases": "model-00002-of-00002.safetensors",
@@ -154,6 +159,7 @@
     "language_model.model.layers.5.mlp.up_proj.scales": "model-00002-of-00002.safetensors",
     "language_model.model.layers.5.mlp.up_proj.weight": "model-00002-of-00002.safetensors",
     "language_model.model.layers.5.post_attention_layernorm.weight": "model-00002-of-00002.safetensors",
+    "language_model.model.layers.5.post_feedforward_layernorm.weight": "model-00002-of-00002.safetensors",
     "language_model.model.layers.5.pre_feedforward_layernorm.weight": "model-00002-of-00002.safetensors",
     "language_model.model.layers.5.self_attn.k_norm.weight": "model-00002-of-00002.safetensors",
     "language_model.model.layers.5.self_attn.k_proj.biases": "model-00002-of-00002.safetensors",
