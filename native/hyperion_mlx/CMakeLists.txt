@@ -111,6 +111,16 @@ if(BUILD_TESTING)
     target_include_directories(hyperion_kv_cache_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_compile_options(hyperion_kv_cache_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME hyperion_kv_cache COMMAND hyperion_kv_cache_test)
+
+    # M5-gated: loads the REAL 12B q_proj and checks quantized_matmul vs a
+    # dequantize+matmul reference. Builds wherever MLX/Metal link; runs only on
+    # the self-hosted M5 (NOT in scripts/test-native.sh --model-free). Also
+    # self-skips (exit 0) when HYPERION_12B_ARTIFACT is unset (CI).
+    add_executable(hyperion_weights_test tests/weights_test.cc)
+    target_link_libraries(hyperion_weights_test PRIVATE hyperion_mlx mlx)
+    target_include_directories(hyperion_weights_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_options(hyperion_weights_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME hyperion_weights COMMAND hyperion_weights_test)
 endif()
 
 install(TARGETS hyperion_mlx ARCHIVE DESTINATION lib)

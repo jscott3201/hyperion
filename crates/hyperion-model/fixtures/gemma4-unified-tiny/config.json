@@ -1,0 +1,29 @@
+{
+  "architectures": [
+    "Gemma4ForCausalLM"
+  ],
+  "model_type": "gemma4_unified",
+  "tie_word_embeddings": true,
+  "quantization": {
+    "group_size": 64,
+    "bits": 4,
+    "mode": "affine"
+  },
+  "quantization_config": {
+    "group_size": 64,
+    "bits": 4,
+    "mode": "affine"
+  },
+  "text_config": {
+    "model_type": "gemma4_unified",
+    "num_hidden_layers": 6,
+    "layer_types": [
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention"
+    ]
+  }
+}
