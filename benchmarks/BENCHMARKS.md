@@ -214,3 +214,22 @@ HYPERION_M0_OK
 - Verdict: `PASS (post-review release gate)` — every M0 fast and heavy gate passed
   sequentially on the reviewed target commit. Milestone acceptance remains pending the
   non-draft feature PR's required CI and merge into `development`.
+
+### `HYP-M1-DEFER-001` — scored baseline run deferred for implementation progress
+
+- Classification: `DECIDED`
+- Source commit: `c782f6feb8a3d90aff71f4c4b9cffb1e9ab21f06`
+- Run ID: `m1-c782f6f-scored`
+- Run status: intentionally interrupted during the 6 GiB discovery cell; local raw evidence
+  preserved, not archived, and permanently invalid for acceptance
+- Valid engineering signal: the separate unscored `m1-pilot-c782f6f` completed one warmup
+  and five measured-shape trials for both 12B and E4B at 512 input / 129 output IDs with
+  deterministic outputs and independently valid traces
+- Invalid for claims: the interrupted run's completed core and partial discovery cells are
+  diagnostic only and are not MEASURED ledger rows
+- Owner decision: prioritize native implementation progress and defer, rather than weaken,
+  the full five-trial matrix, budget curve, A-C-C-A confirmation, server smoke, archive, and
+  evidence review
+- Consequence: M2 implementation may proceed, but M1 remains unaccepted; no throughput-optimal
+  cap or relative M2 decode-performance gate may be claimed until a fresh compliant M1 run
+- Verdict: `DEFERRED (NO PERFORMANCE CLAIM)`

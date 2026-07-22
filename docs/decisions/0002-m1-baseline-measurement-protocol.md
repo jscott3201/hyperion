@@ -305,3 +305,32 @@ omitted components with zero, before comparing it to the native canary. Thus equ
 reports such as `26.6` and `26.6.0` have one exact run-bound representation. The first
 unscored 12B 512×128 pilot was retained as rejected evidence after exposing both encoding
 mismatches; it cannot satisfy any M1 gate, and E4B was not started in that attempt.
+
+## Owner-directed disposition — implementation-first defer
+
+On 2026-07-21 the owner stopped the preregistered run
+`m1-c782f6f-scored` during the 6 GiB discovery cell because the remaining repeated inference
+was consuming disproportionate wall-clock time relative to implementation progress. The
+controller and worker were terminated, the raw local directory was preserved without an
+archive or ledger promotion, and the run is permanently classified as **aborted and invalid
+for M1 acceptance**. Its completed core cells and partial budget cells are diagnostic only;
+they are not MEASURED rows and support no throughput, optimum, or promotion claim.
+
+The fresh unscored `m1-pilot-c782f6f` remains a successful functional smoke of both model
+paths, and the committed corpus, provenance checks, trace verifier, archive tooling, and
+model-free negative controls remain accepted engineering infrastructure. They do not satisfy
+the five-trial matrix, complete budget curve, A-C-C-A confirmation, server smoke, durable
+archive, or evidence-review requirements above.
+
+The owner explicitly prioritizes forward implementation work, so M1's scored evidence gate is
+**deferred rather than silently weakened** and M2 implementation may proceed as an owner
+exception to strict milestone order. Until a fresh run completes this protocol:
+
+1. Hyperion makes no claim that M1 is accepted or that a throughput-optimal resident cap was
+   identified.
+2. Governor development uses only the device-derived safety ceiling and labels its operating
+   point uncalibrated; incomplete sweep observations cannot become a default.
+3. M2 parity, graph, cache, and memory work may land, but its relative decode-performance gate
+   cannot be accepted against an absent permanent M1 A-arm.
+4. Any future M1 acceptance requires a fresh run ID from a clean reviewed commit; neither the
+   aborted directory nor its partial cells may be resumed, overwritten, or repackaged.
