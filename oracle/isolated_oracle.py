@@ -19,7 +19,7 @@ EXPECTED_PYTHON_EXECUTABLE_SHA256 = (
     "01564940172b2811e1f39a4dc90e84c7a26a19cf071bbc5de67e456d82627bec"
 )
 EXPECTED_PYTHON_RUNTIME_TREE_SHA256 = (
-    "01a580d385a91f4b8bc195c8b2f56c4c2d156f6c1e1ad8768fc4501987c4e12f"
+    "460f0a2ec052487b0b15c77765cd58676c0bfe2431643dc16e32ecb8da74cedb"
 )
 EXPECTED_PYTHON_RUNTIME_FILE_COUNT = 1897
 EXPECTED_SITE_PACKAGES_TREE_SHA256 = (
@@ -34,6 +34,13 @@ EXPECTED_ENVIRONMENT = {
     "TOKENIZERS_PARALLELISM": "false",
     "TZ": "UTC",
 }
+
+# Fixed replacement for the resolved interpreter install prefix when hashing the
+# runtime tree. The uv base prefix is relocated per machine (HOME-embedded in
+# libpython3.12.dylib and _sysconfigdata), so the prefix bytes are stripped from
+# each file's content before hashing; code tampering is still detected because
+# every non-prefix byte is bound.
+PATH_PREFIX_TOKEN = b"<<HYPERION_PREFIX>>"
 
 
 def sha256_file(path: Path) -> str:
@@ -52,6 +59,7 @@ def canonical_tree(
     reject_bytecode: bool = False,
     ignore_bytecode: bool = False,
     ignore_wheel_records: bool = False,
+    path_prefix: str | None = None,
 ) -> tuple[str, int]:
     """Hash a complete tree using location-independent relative names.
 
@@ -60,6 +68,13 @@ def canonical_tree(
     fails loudly. The runtime tree ignores bytecode instead, because the runtime
     root is the shared uv base interpreter prefix and its ``__pycache__`` content
     accumulates non-deterministically as other tools import the same interpreter.
+
+    ``path_prefix`` (runtime tree only) is the resolved interpreter install prefix
+    stripped from each file's content before hashing. The uv base prefix is
+    relocated per machine — the prefix is HOME-embedded in ``libpython3.12.dylib``
+    (the dynamically-linked interpreter core) and ``_sysconfigdata`` — so the raw
+    bytes differ across machines even for the same release. Stripping the prefix
+    pins the interpreter code while leaving the install location unbound.
     """
 
     root = root.resolve()
@@ -113,9 +128,17 @@ def canonical_tree(
                 )
                 if name in ignored_names or wheel_record:
                     continue
-                entries.append(
-                    f"F {sha256_file(candidate)} {candidate.stat().st_size} {relative}\n"
-                )
+                if path_prefix is None:
+                    digest_hex = sha256_file(candidate)
+                    size = candidate.stat().st_size
+                else:
+                    prefix_bytes = path_prefix.encode()
+                    data = candidate.read_bytes()
+                    if prefix_bytes and prefix_bytes in data:
+                        data = data.replace(prefix_bytes, PATH_PREFIX_TOKEN)
+                    digest_hex = hashlib.sha256(data).hexdigest()
+                    size = len(data)
+                entries.append(f"F {digest_hex} {size} {relative}\n")
             else:
                 raise RuntimeError(f"identity tree contains a special file: {candidate}")
     entries.sort()
@@ -215,6 +238,7 @@ def startup_identity() -> dict[str, Any]:
         allow_symlinks=True,
         ignored_names=frozenset({".DS_Store"}),
         ignore_bytecode=True,
+        path_prefix=str(runtime_root),
     )
     site_sha256, site_count = canonical_tree(
         # Wheel RECORD files are non-executable installer receipts and uv rewrites

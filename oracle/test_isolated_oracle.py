@@ -54,6 +54,38 @@ class CanonicalTreeTests(unittest.TestCase):
                 base,
             )
 
+    def test_runtime_tree_normalizes_install_prefix(self) -> None:
+        # The uv base prefix is relocated per machine: the install path is
+        # HOME-embedded in libpython3.12.dylib and _sysconfigdata. Stripping
+        # each tree's own prefix must make two machines with identical code but
+        # different install paths hash identically.
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            root_a = Path(a) / "cpython"
+            root_b = Path(b) / "cpython"
+            root_a.mkdir()
+            root_b.mkdir()
+            payload = 'EXENAME = "{prefix}/bin/python3"\nDATA = "same"\n'
+            (root_a / "sysconfig.py").write_text(payload.format(prefix=root_a))
+            (root_b / "sysconfig.py").write_text(payload.format(prefix=root_b))
+            normalized_a = canonical_tree(
+                root_a,
+                allow_symlinks=True,
+                ignore_bytecode=True,
+                path_prefix=str(root_a),
+            )
+            normalized_b = canonical_tree(
+                root_b,
+                allow_symlinks=True,
+                ignore_bytecode=True,
+                path_prefix=str(root_b),
+            )
+            self.assertEqual(normalized_a, normalized_b)
+            # Without prefix normalization the two machines differ.
+            self.assertNotEqual(
+                canonical_tree(root_a, allow_symlinks=True, ignore_bytecode=True),
+                canonical_tree(root_b, allow_symlinks=True, ignore_bytecode=True),
+            )
+
     def test_site_tree_rejects_regular_bytecode(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

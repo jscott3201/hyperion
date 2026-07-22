@@ -324,13 +324,25 @@ amount of uv or Python pinning closes, because the oracle's own `-B` /
 `canonical_tree` therefore accepts an `ignore_bytecode` mode that skips `.pyc` files and prunes
 `__pycache__` directories; the runtime tree is now hashed with `ignore_bytecode=True`, matching
 the site-packages tree's existing bytecode posture in effect (the site tree keeps
-`reject_bytecode=True` so any post-clean `.pyc` insertion still fails loudly). The runtime tree
-is now tree `01a580d385a91f4b8bc195c8b2f56c4c2d156f6c1e1ad8768fc4501987c4e12f` over 1,897
-entries. Runtime integrity is still anchored by the interpreter-binary SHA-256, by every
-non-bytecode regular file and in-tree link in the base prefix, and by the independently
-hash-rejected site-packages tree; the only loss is detection of a tampered-but-source-present
-stdlib `.pyc`, which the surviving `.py` source tree and binary hash continue to cover. Because
-M1 is deferred, this re-preregistration lands before any scored run and supersedes no evidence.
+`reject_bytecode=True` so any post-clean `.pyc` insertion still fails loudly). With bytecode
+excluded the file set is reproducible (1,897 entries on both the dev and CI prefixes), but the
+content hash still differed: two non-bytecode files embed the resolved install prefix as a
+relocated, HOME-absolute path — `libpython3.12.dylib` and `lib/python3.12/_sysconfigdata*.py`.
+Excluding them is not an option: `bin/python3.12` is a ~50 KB launcher that dynamically links
+`@rpath/libpython3.12.dylib`, so the dylib *is* the interpreter core the oracle loads and the
+runtime tree is precisely what pins it (`python_executable_sha256` pins only the thin
+launcher). `canonical_tree` therefore accepts a `path_prefix` that strips each tree's own
+resolved install prefix from file content before hashing (replaced with a fixed token), pinning
+the interpreter code while leaving the install location unbound; this generalizes to any future
+path-embedded artifact. The runtime tree is now tree
+`460f0a2ec052487b0b15c77765cd58676c0bfe2431643dc16e32ecb8da74cedb` over 1,897 entries. Runtime
+integrity is still anchored by the interpreter-launcher SHA-256, by every non-bytecode regular
+file and in-tree link in the base prefix with the install prefix normalized, and by the
+independently hash-rejected site-packages tree; the losses are detection of a tampered-but-
+source-present stdlib `.pyc` and of a prefix-only edit to the dylib or `_sysconfigdata`, both
+covered by the surviving `.py` source tree, the rest of the dylib's bytes, and the launcher
+binary hash. Because M1 is deferred, this re-preregistration lands before any scored run and
+supersedes no evidence.
 
 ## Owner-directed disposition — implementation-first defer
 
