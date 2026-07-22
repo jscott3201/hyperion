@@ -32,6 +32,8 @@ mlx_build_metallib(
 add_library(hyperion_mlx STATIC
     src/platform_policy.cc
     src/runtime.mm
+    src/geometry.cc
+    src/dispatch.cc
 )
 add_dependencies(hyperion_mlx hyperion_canary_metallib)
 target_include_directories(hyperion_mlx
@@ -78,6 +80,18 @@ if(BUILD_TESTING)
     target_link_libraries(hyperion_runtime_canary_test PRIVATE hyperion_mlx)
     target_compile_options(hyperion_runtime_canary_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME hyperion_runtime_canary COMMAND hyperion_runtime_canary_test)
+
+    add_executable(hyperion_geometry_test tests/geometry_test.cc)
+    target_link_libraries(hyperion_geometry_test PRIVATE hyperion_mlx)
+    target_include_directories(hyperion_geometry_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_options(hyperion_geometry_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME hyperion_geometry COMMAND hyperion_geometry_test)
+
+    add_executable(hyperion_dispatch_test tests/dispatch_test.cc)
+    target_link_libraries(hyperion_dispatch_test PRIVATE hyperion_mlx)
+    target_include_directories(hyperion_dispatch_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_options(hyperion_dispatch_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME hyperion_dispatch COMMAND hyperion_dispatch_test)
 endif()
 
 install(TARGETS hyperion_mlx ARCHIVE DESTINATION lib)
