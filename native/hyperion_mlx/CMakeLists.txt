@@ -35,6 +35,7 @@ add_library(hyperion_mlx STATIC
     src/abi_error.cc
     src/geometry.cc
     src/dispatch.cc
+    src/kv.cc
     src/model.cc
 )
 add_dependencies(hyperion_mlx hyperion_canary_metallib)
@@ -94,6 +95,12 @@ if(BUILD_TESTING)
     target_include_directories(hyperion_dispatch_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_compile_options(hyperion_dispatch_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME hyperion_dispatch COMMAND hyperion_dispatch_test)
+
+    add_executable(hyperion_kv_test tests/kv_test.cc)
+    target_link_libraries(hyperion_kv_test PRIVATE hyperion_mlx)
+    target_include_directories(hyperion_kv_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_options(hyperion_kv_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME hyperion_kv COMMAND hyperion_kv_test)
 endif()
 
 install(TARGETS hyperion_mlx ARCHIVE DESTINATION lib)
