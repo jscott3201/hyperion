@@ -2,6 +2,7 @@
 #import <Metal/Metal.h>
 
 #include "hyperion_mlx.h"
+#include "abi_error.h"
 #include "platform_policy.h"
 
 #include <mlx/mlx.h>
@@ -30,7 +31,6 @@ namespace mx = mlx::core;
 namespace {
 
 constexpr std::uint32_t kAbiVersion = 1;
-constexpr std::size_t kLastErrorCapacity = 1024;
 
 static_assert(MLX_VERSION_MAJOR == 0);
 static_assert(MLX_VERSION_MINOR == 32);
@@ -39,8 +39,6 @@ static_assert(sizeof(HypCanaryInfo) == 224);
 static_assert(offsetof(HypCanaryInfo, recommended_working_set_bytes) == 32);
 static_assert(offsetof(HypCanaryInfo, mlx_runtime_version) == 64);
 static_assert(offsetof(HypCanaryInfo, gpu_name) == 96);
-
-thread_local std::array<char, kLastErrorCapacity> g_last_error{};
 
 class NativeError final : public std::runtime_error {
   public:
@@ -54,11 +52,7 @@ class NativeError final : public std::runtime_error {
 };
 
 void store_error(const char* message) noexcept {
-    std::snprintf(
-        g_last_error.data(),
-        g_last_error.size(),
-        "%s",
-        message != nullptr ? message : "unknown native error");
+    hyperion::abi::set_last_error(message);
 }
 
 HypStatus fail(HypStatus status, const char* message) noexcept {
@@ -67,14 +61,14 @@ HypStatus fail(HypStatus status, const char* message) noexcept {
 }
 
 HypStatus ok() noexcept {
-    g_last_error[0] = '\0';
+    hyperion::abi::clear_last_error();
     return HYP_STATUS_OK;
 }
 
 HypStatus fail_unexpected(const char* operation) noexcept {
     std::snprintf(
-        g_last_error.data(),
-        g_last_error.size(),
+        hyperion::abi::g_last_error.data(),
+        hyperion::abi::g_last_error.size(),
         "%s failed with a non-standard exception",
         operation != nullptr ? operation : "native operation");
     return HYP_STATUS_INTERNAL;
@@ -294,7 +288,7 @@ HypStatus hyp_last_error(char* buffer, size_t buffer_len) {
                 HYP_STATUS_INVALID_ARGUMENT,
                 "hyp_last_error requires a writable non-empty buffer");
         }
-        std::snprintf(buffer, buffer_len, "%s", g_last_error.data());
+        std::snprintf(buffer, buffer_len, "%s", hyperion::abi::g_last_error.data());
         return HYP_STATUS_OK;
     } catch (...) {
         return fail(HYP_STATUS_INTERNAL, "hyp_last_error failed unexpectedly");
