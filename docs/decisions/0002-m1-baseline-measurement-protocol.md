@@ -334,15 +334,20 @@ runtime tree is precisely what pins it (`python_executable_sha256` pins only the
 launcher). `canonical_tree` therefore accepts a `path_prefix` that strips each tree's own
 resolved install prefix from file content before hashing (replaced with a fixed token), pinning
 the interpreter code while leaving the install location unbound; this generalizes to any future
-path-embedded artifact. The runtime tree is now tree
-`460f0a2ec052487b0b15c77765cd58676c0bfe2431643dc16e32ecb8da74cedb` over 1,897 entries. Runtime
+path-embedded artifact. Stripping the prefix was still insufficient: uv re-signs every Mach-O
+it relocates adhoc, and the adhoc CodeDirectory signs the install-name page, so the signature
+blob itself differs per machine for the same release. `canonical_tree` therefore also accepts
+`strip_codesignature`: Mach-O files (detected by magic) are hashed over their unsigned content
+(`codesign --remove-signature` on a temp copy, never mutating the source), then prefix-
+normalized. The runtime tree is now tree
+`ec2127c8632e03a35c1db303946f07ad92dac07cd7f8e47555efc75dc5330bb6` over 1,897 entries. Runtime
 integrity is still anchored by the interpreter-launcher SHA-256, by every non-bytecode regular
-file and in-tree link in the base prefix with the install prefix normalized, and by the
-independently hash-rejected site-packages tree; the losses are detection of a tampered-but-
-source-present stdlib `.pyc` and of a prefix-only edit to the dylib or `_sysconfigdata`, both
-covered by the surviving `.py` source tree, the rest of the dylib's bytes, and the launcher
-binary hash. Because M1 is deferred, this re-preregistration lands before any scored run and
-supersedes no evidence.
+file and in-tree link in the base prefix with the install prefix normalized and the adhoc
+signature removed, and by the independently hash-rejected site-packages tree; the losses are
+detection of a tampered-but-source-present stdlib `.pyc`, of a prefix-only edit to the dylib or
+`_sysconfigdata`, and of a code-only signature swap, all covered by the surviving `.py` source
+tree, the rest of the unsigned dylib's bytes, and the launcher binary hash. Because M1 is
+deferred, this re-preregistration lands before any scored run and supersedes no evidence.
 
 ## Owner-directed disposition — implementation-first defer
 

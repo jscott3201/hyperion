@@ -54,6 +54,21 @@ class CanonicalTreeTests(unittest.TestCase):
                 base,
             )
 
+    def test_runtime_tree_codesignature_strip_passes_through_non_macho(self) -> None:
+        # Signature stripping only applies to Mach-O files; a plain source file
+        # must hash identically whether or not strip_codesignature is requested.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "module.py").write_bytes(b"plain source")
+            without = canonical_tree(root, allow_symlinks=True, ignore_bytecode=True)
+            with_strip = canonical_tree(
+                root,
+                allow_symlinks=True,
+                ignore_bytecode=True,
+                strip_codesignature=True,
+            )
+            self.assertEqual(without, with_strip)
+
     def test_runtime_tree_normalizes_install_prefix(self) -> None:
         # The uv base prefix is relocated per machine: the install path is
         # HOME-embedded in libpython3.12.dylib and _sysconfigdata. Stripping

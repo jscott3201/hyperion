@@ -8,7 +8,10 @@ import json
 import os
 import re
 import runpy
+import shutil
+import subprocess
 import sys
+import tempfile
 import types
 from pathlib import Path
 from typing import Any
@@ -19,7 +22,7 @@ EXPECTED_PYTHON_EXECUTABLE_SHA256 = (
     "01564940172b2811e1f39a4dc90e84c7a26a19cf071bbc5de67e456d82627bec"
 )
 EXPECTED_PYTHON_RUNTIME_TREE_SHA256 = (
-    "460f0a2ec052487b0b15c77765cd58676c0bfe2431643dc16e32ecb8da74cedb"
+    "ec2127c8632e03a35c1db303946f07ad92dac07cd7f8e47555efc75dc5330bb6"
 )
 EXPECTED_PYTHON_RUNTIME_FILE_COUNT = 1897
 EXPECTED_SITE_PACKAGES_TREE_SHA256 = (
@@ -51,6 +54,77 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+# Mach-O magic numbers (the first four bytes on disk). The runtime tree is hashed
+# over unsigned content because uv re-signs every Mach-O it relocates adhoc, and
+# the adhoc CodeDirectory signs the install-name page, so signature bytes differ
+# per machine even for the same release.
+_MACHO_MAGICS = frozenset(
+    {
+        b"\xcf\xfa\xed\xfe",  # MH_MAGIC_64 (arm64)
+        b"\xce\xfa\xed\xfe",  # MH_MAGIC
+        b"\xca\xfe\xba\xbe",  # FAT_MAGIC
+        b"\xbe\xba\xfe\xca",  # FAT_MAGIC_64
+    }
+)
+
+
+def _macho_unsigned_bytes(path: Path) -> bytes | None:
+    """Return ``path``'s bytes with its embedded code signature removed.
+
+    Works on a temp copy so the source is never mutated. Returns ``None`` when
+    ``codesign`` is unavailable or the file is not signed, so the caller falls
+    back to hashing the raw bytes.
+    """
+    temp_file = tempfile.NamedTemporaryFile(
+        prefix="hyperion-identity-",
+        suffix=".macho",
+        delete=False,
+    )
+    temp_file.close()
+    temp_path = Path(temp_file.name)
+    try:
+        shutil.copyfile(path, temp_path)
+        result = subprocess.run(
+            ["codesign", "--remove-signature", str(temp_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        return temp_path.read_bytes()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+
+
+def _normalized_file_bytes(
+    path: Path,
+    *,
+    path_prefix: str | None,
+    strip_codesignature: bool,
+) -> bytes:
+    """Read ``path`` for hashing, optionally unsigned and prefix-normalized."""
+    if strip_codesignature:
+        with path.open("rb") as handle:
+            magic = handle.read(4)
+        unsigned = (
+            _macho_unsigned_bytes(path) if magic in _MACHO_MAGICS else None
+        )
+        data = unsigned if unsigned is not None else path.read_bytes()
+    else:
+        data = path.read_bytes()
+    if path_prefix:
+        prefix_bytes = path_prefix.encode()
+        if prefix_bytes and prefix_bytes in data:
+            data = data.replace(prefix_bytes, PATH_PREFIX_TOKEN)
+    return data
+
+
 def canonical_tree(
     root: Path,
     *,
@@ -60,6 +134,7 @@ def canonical_tree(
     ignore_bytecode: bool = False,
     ignore_wheel_records: bool = False,
     path_prefix: str | None = None,
+    strip_codesignature: bool = False,
 ) -> tuple[str, int]:
     """Hash a complete tree using location-independent relative names.
 
@@ -75,6 +150,12 @@ def canonical_tree(
     (the dynamically-linked interpreter core) and ``_sysconfigdata`` — so the raw
     bytes differ across machines even for the same release. Stripping the prefix
     pins the interpreter code while leaving the install location unbound.
+
+    ``strip_codesignature`` (runtime tree only) hashes Mach-O files over their
+    unsigned content. Relocation re-signs every patched Mach-O adhoc, and the adhoc
+    CodeDirectory signs the install-name page, so signature bytes differ per
+    machine for the same release; removing the signature (then normalizing the
+    prefix) makes the interpreter code reproducible across machines.
     """
 
     root = root.resolve()
@@ -128,14 +209,15 @@ def canonical_tree(
                 )
                 if name in ignored_names or wheel_record:
                     continue
-                if path_prefix is None:
+                if path_prefix is None and not strip_codesignature:
                     digest_hex = sha256_file(candidate)
                     size = candidate.stat().st_size
                 else:
-                    prefix_bytes = path_prefix.encode()
-                    data = candidate.read_bytes()
-                    if prefix_bytes and prefix_bytes in data:
-                        data = data.replace(prefix_bytes, PATH_PREFIX_TOKEN)
+                    data = _normalized_file_bytes(
+                        candidate,
+                        path_prefix=path_prefix,
+                        strip_codesignature=strip_codesignature,
+                    )
                     digest_hex = hashlib.sha256(data).hexdigest()
                     size = len(data)
                 entries.append(f"F {digest_hex} {size} {relative}\n")
@@ -239,6 +321,7 @@ def startup_identity() -> dict[str, Any]:
         ignored_names=frozenset({".DS_Store"}),
         ignore_bytecode=True,
         path_prefix=str(runtime_root),
+        strip_codesignature=True,
     )
     site_sha256, site_count = canonical_tree(
         # Wheel RECORD files are non-executable installer receipts and uv rewrites
