@@ -64,9 +64,21 @@ class VerifiedModelProvider(server.ModelProvider):
             raise RuntimeError("server model identity differs at the stock load boundary")
 
         # The next operation enters the pinned provider's unchanged load path.
-        super()._load(model_path, adapter_path, draft_model_path)
-        if verify_model_tree(self._verified_path, self._manifest_sha256) != identity:
-            raise RuntimeError("server model identity changed while the stock loader ran")
+        try:
+            super()._load(model_path, adapter_path, draft_model_path)
+        finally:
+            try:
+                loaded_identity = verify_model_tree(
+                    self._verified_path, self._manifest_sha256
+                )
+            except Exception as error:
+                raise RuntimeError(
+                    "server model identity changed while the stock loader ran"
+                ) from error
+            if loaded_identity != identity:
+                raise RuntimeError(
+                    "server model identity changed while the stock loader ran"
+                )
         print(
             LOAD_RECEIPT_PREFIX + json.dumps(identity, sort_keys=True, separators=(",", ":")),
             file=sys.stderr,

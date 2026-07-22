@@ -60,6 +60,13 @@ cache_verify=(
     '.transport_cache_separately_bound and .transport_cache_tree_sha256 == $cache' \
     >/dev/null
 
+mkdir "$model/.cache/huggingface/unexpected-empty-directory"
+if "${cache_verify[@]}" >"$scratch_dir/cache-empty-directory.out" 2>&1; then
+    echo "model identity accepted an extra empty transport-cache directory" >&2
+    exit 1
+fi
+rmdir "$model/.cache/huggingface/unexpected-empty-directory"
+
 mv "$model/.cache/huggingface/trees/revision.json" "$scratch_dir/revision.json"
 ln -s "$scratch_dir/revision.json" "$model/.cache/huggingface/trees/revision.json"
 if "${cache_verify[@]}" >"$scratch_dir/cache-file-symlink.out" 2>&1; then
@@ -90,6 +97,7 @@ if "${cache_verify[@]}" >"$scratch_dir/cache-shard.out" 2>&1; then
     exit 1
 fi
 
+python3 -B oracle/test_transport_cache_identity.py
 python3 -B oracle/test_model_load_boundary.py
 
 echo "model-identity-exact-inventory-controls: pass"

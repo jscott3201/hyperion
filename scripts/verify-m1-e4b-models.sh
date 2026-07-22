@@ -74,7 +74,7 @@ verify_tree \
     "$source_dir" \
     "$source_manifest_sha256" \
     true \
-    bffa1f7553e9bbc094174133554c6bc8df2cfad630a0dd7c1a00805baaf17027
+    2ee372adf9573c9e7037dd5c4a740d8dc14112b37eabe831b5a58a0e6f702eb7
 verify_tree "M1 E4B converted model" "$converted_dir" "$converted_manifest_sha256"
 verify_e4b_geometry "$source_dir/config.json"
 verify_e4b_geometry "$converted_dir/config.json"

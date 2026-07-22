@@ -17,6 +17,7 @@ from pathlib import Path
 class FakeModelProvider:
     def __init__(self, _cli_args: argparse.Namespace) -> None:
         self.loaded = False
+        self.mutate_during_load = None
 
     def _load(
         self,
@@ -25,6 +26,8 @@ class FakeModelProvider:
         _draft_model_path: str | None = None,
     ) -> None:
         self.loaded = True
+        if self.mutate_during_load is not None:
+            self.mutate_during_load()
 
 
 fake_core = types.ModuleType("mlx.core")
@@ -94,6 +97,24 @@ class VerifiedServerLoadTests(unittest.TestCase):
                 if line.startswith(LOAD_RECEIPT_PREFIX)
             ]
             self.assertEqual(len(receipts), 1)
+
+    def test_mutation_inside_stock_provider_is_rejected_after_load(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            weights, manifest_sha256, early = make_model(root)
+            provider = self.provider(root, manifest_sha256, early)
+            provider.mutate_during_load = lambda: weights.write_bytes(
+                b"mutated inside stock provider"
+            )
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "server model identity changed while the stock loader ran",
+                ):
+                    provider._load(str(root))
+            self.assertTrue(provider.loaded)
+            self.assertNotIn(LOAD_RECEIPT_PREFIX, stderr.getvalue())
 
 
 if __name__ == "__main__":

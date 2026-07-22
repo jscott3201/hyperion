@@ -50,7 +50,7 @@ verify_tree \
     "$source_dir" \
     6a07a92df9260b71117b113a8ad0b305432a48f895abd850a7616241a636ebed \
     true \
-    09b457cc0d497d5603265bea079d1c534ec1d54779ea0280844d9ba7a958fbf0
+    8ee7b68d0ece0fd7a1d281f3c1e9c9d82ece65bcb1cacfbaa04c5864baba9be7
 verify_tree \
     "M0 converted model" \
     "$converted_dir" \

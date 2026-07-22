@@ -274,3 +274,19 @@ matching is prohibited. SSE tool-call objects require exactly `index`, `id`, `ty
 `function`; the nested function requires exactly string `name` and string `arguments` fields.
 Both live validation and raw-journal replay enforce these shapes. Every workflow checkout,
 including model-free PR CI, disables persisted credentials.
+
+## Protocol clarification 8 — exact transport topology and post-load checks
+
+This premeasurement clarification supersedes clarification 7's source-cache tree identities.
+The canonical transport-cache digest now includes a typed entry for every nested directory as
+well as the hash, size, and path of every regular file. Traversal errors fail closed, so an
+empty or unreadable auxiliary directory cannot disappear from the identity. The accepted 12B
+tree is `8ee7b68d0ece0fd7a1d281f3c1e9c9d82ece65bcb1cacfbaa04c5864baba9be7` and
+the accepted E4B tree is
+`2ee372adf9573c9e7037dd5c4a740d8dc14112b37eabe831b5a58a0e6f702eb7`, each
+with 21 regular files and two nested directories.
+
+The direct and server load guards perform their second identity check in a `finally` boundary,
+including when the underlying loader raises. Model-free mutation controls require both guards
+to reject a payload change made inside the synthetic loader and prohibit a successful server
+load receipt for that changed tree.

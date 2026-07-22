@@ -27,6 +27,8 @@ def sha256_file(path: Path) -> str:
 
 
 def transport_cache_identity(root: Path) -> tuple[str, int]:
+    """Bind directory topology and regular-file bytes; return digest and file count."""
+
     cache_root = root / ".cache"
     if cache_root.is_symlink() or not cache_root.is_dir():
         raise RuntimeError("source model .cache must be a real directory")
@@ -38,33 +40,56 @@ def transport_cache_identity(root: Path) -> tuple[str, int]:
         raise RuntimeError("source model .cache/huggingface must be a real directory")
 
     entries: list[str] = []
-    for directory, directories, files in os.walk(huggingface, followlinks=False):
-        directory_path = Path(directory)
-        for name in directories:
-            candidate = directory_path / name
-            relative = candidate.relative_to(root).as_posix()
-            mode = candidate.lstat().st_mode
-            if stat.S_ISLNK(mode):
-                raise RuntimeError(f"transport cache contains a directory symlink: {relative}")
-            if not stat.S_ISDIR(mode):
-                raise RuntimeError(f"transport cache contains a special directory: {relative}")
-        for name in files:
-            candidate = directory_path / name
-            relative = candidate.relative_to(root).as_posix()
-            mode = candidate.lstat().st_mode
-            if stat.S_ISLNK(mode):
-                raise RuntimeError(f"transport cache contains a file symlink: {relative}")
-            if not stat.S_ISREG(mode):
-                raise RuntimeError(f"transport cache contains a special file: {relative}")
-            if candidate.suffix.lower() in SUSPICIOUS_CACHE_PAYLOAD_SUFFIXES:
-                raise RuntimeError(f"transport cache contains an unexpected model payload: {relative}")
-            entries.append(
-                f"F {sha256_file(candidate)} {candidate.stat().st_size} {relative}\n"
-            )
+    file_count = 0
+
+    def traversal_failed(error: OSError) -> None:
+        raise RuntimeError(f"transport cache traversal failed closed: {error}") from error
+
+    try:
+        for directory, directories, files in os.walk(
+            huggingface,
+            followlinks=False,
+            onerror=traversal_failed,
+        ):
+            directories.sort()
+            files.sort()
+            directory_path = Path(directory)
+            for name in directories:
+                candidate = directory_path / name
+                relative = candidate.relative_to(root).as_posix()
+                mode = candidate.lstat().st_mode
+                if stat.S_ISLNK(mode):
+                    raise RuntimeError(
+                        f"transport cache contains a directory symlink: {relative}"
+                    )
+                if not stat.S_ISDIR(mode):
+                    raise RuntimeError(
+                        f"transport cache contains a special directory: {relative}"
+                    )
+                entries.append(f"D {relative}\n")
+            for name in files:
+                candidate = directory_path / name
+                relative = candidate.relative_to(root).as_posix()
+                metadata = candidate.lstat()
+                mode = metadata.st_mode
+                if stat.S_ISLNK(mode):
+                    raise RuntimeError(f"transport cache contains a file symlink: {relative}")
+                if not stat.S_ISREG(mode):
+                    raise RuntimeError(f"transport cache contains a special file: {relative}")
+                if candidate.suffix.lower() in SUSPICIOUS_CACHE_PAYLOAD_SUFFIXES:
+                    raise RuntimeError(
+                        f"transport cache contains an unexpected model payload: {relative}"
+                    )
+                entries.append(
+                    f"F {sha256_file(candidate)} {metadata.st_size} {relative}\n"
+                )
+                file_count += 1
+    except OSError as error:
+        raise RuntimeError(f"transport cache inspection failed closed: {error}") from error
     entries.sort()
-    if not entries:
+    if file_count == 0:
         raise RuntimeError("source model transport cache is empty")
-    return hashlib.sha256("".join(entries).encode()).hexdigest(), len(entries)
+    return hashlib.sha256("".join(entries).encode()).hexdigest(), file_count
 
 
 def verify_model_tree(
@@ -182,9 +207,15 @@ def verified_model_load(
     boundary_identity = verify_model_tree(root, expected_manifest_sha256)
     if boundary_identity != expected_identity:
         raise RuntimeError("model identity changed before the actual load boundary")
-    loaded = loader(str(root), *args, **kwargs)
-    if verify_model_tree(root, expected_manifest_sha256) != boundary_identity:
-        raise RuntimeError("model identity changed while the actual loader ran")
+    try:
+        loaded = loader(str(root), *args, **kwargs)
+    finally:
+        try:
+            loaded_identity = verify_model_tree(root, expected_manifest_sha256)
+        except Exception as error:
+            raise RuntimeError("model identity changed while the actual loader ran") from error
+        if loaded_identity != boundary_identity:
+            raise RuntimeError("model identity changed while the actual loader ran")
     return loaded
 
 

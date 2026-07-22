@@ -41,6 +41,37 @@ class ModelLoadBoundaryTests(unittest.TestCase):
                 )
             self.assertFalse(called)
 
+    def test_mutation_inside_loader_is_rejected_after_callback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            weights = root / "model.safetensors"
+            weights.write_bytes(b"reviewed weights")
+            payload_sha256 = hashlib.sha256(weights.read_bytes()).hexdigest()
+            manifest = root / "SHA256SUMS"
+            manifest.write_text(
+                f"{payload_sha256}  ./model.safetensors\n", encoding="utf-8"
+            )
+            manifest_sha256 = hashlib.sha256(manifest.read_bytes()).hexdigest()
+            early = verify_model_tree(root, manifest_sha256)
+            called = False
+
+            def mutating_loader(_path: str) -> object:
+                nonlocal called
+                called = True
+                weights.write_bytes(b"mutated inside synthetic loader")
+                return object()
+
+            with self.assertRaisesRegex(
+                RuntimeError, "model identity changed while the actual loader ran"
+            ):
+                verified_model_load(
+                    root,
+                    manifest_sha256,
+                    early,
+                    mutating_loader,
+                )
+            self.assertTrue(called)
+
 
 if __name__ == "__main__":
     unittest.main()
