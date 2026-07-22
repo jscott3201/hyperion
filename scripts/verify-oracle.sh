@@ -20,8 +20,8 @@ jq -e '
     .schema == "hyperion.m1-oracle-identity.v1" and
     .python == "3.12.13" and
     .python_executable_sha256 == "01564940172b2811e1f39a4dc90e84c7a26a19cf071bbc5de67e456d82627bec" and
-    .python_runtime_tree_sha256 == "63c25fabba8839ccb349e3554fedf9c46011d9e414c76912448a19869f666cac" and
-    .python_runtime_file_count == 2122 and
+    .python_runtime_tree_sha256 == "01a580d385a91f4b8bc195c8b2f56c4c2d156f6c1e1ad8768fc4501987c4e12f" and
+    .python_runtime_file_count == 1897 and
     .site_packages_tree_sha256 == "db258e22404a3937d46d72ff44083400aafcf34636b8444a91a29c858b297006" and
     .site_packages_file_count == 5470 and
     .startup_flags == {

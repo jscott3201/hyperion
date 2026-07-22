@@ -306,6 +306,32 @@ reports such as `26.6` and `26.6.0` have one exact run-bound representation. The
 unscored 12B 512×128 pilot was retained as rejected evidence after exposing both encoding
 mismatches; it cannot satisfy any M1 gate, and E4B was not started in that attempt.
 
+## Protocol clarification 10 — runtime tree excludes bytecode
+
+This premeasurement clarification supersedes the bytecode wording in clarification 7, which
+recorded the runtime tree as hashing "every regular file, including all existing
+standard-library bytecode," over 2,122 entries, as tree
+`63c25fabba8839ccb349e3554fedf9c46011d9e414c76912448a19869f666cac`. Verification on the
+self-hosted M5 runner and the GitHub Actions `macos-26` runner (2026-07-22) proved that wording
+non-reproducible: `runtime_root` is the resolved uv base interpreter prefix
+(`sys.executable.resolve().parent.parent`), whose `__pycache__` content accumulates as other
+tools import the same shared interpreter. A used dev prefix carried 2,122 entries (225 `.pyc`
+files) while a freshly `uv python install`ed CI prefix carried 2,021 (124 `.pyc` files) against
+the same interpreter-binary and site-packages hashes — a 101-file non-deterministic gap that no
+amount of uv or Python pinning closes, because the oracle's own `-B` /
+`-X pycache_prefix=/dev/null` only prevents the oracle from writing bytecode, not other tools.
+
+`canonical_tree` therefore accepts an `ignore_bytecode` mode that skips `.pyc` files and prunes
+`__pycache__` directories; the runtime tree is now hashed with `ignore_bytecode=True`, matching
+the site-packages tree's existing bytecode posture in effect (the site tree keeps
+`reject_bytecode=True` so any post-clean `.pyc` insertion still fails loudly). The runtime tree
+is now tree `01a580d385a91f4b8bc195c8b2f56c4c2d156f6c1e1ad8768fc4501987c4e12f` over 1,897
+entries. Runtime integrity is still anchored by the interpreter-binary SHA-256, by every
+non-bytecode regular file and in-tree link in the base prefix, and by the independently
+hash-rejected site-packages tree; the only loss is detection of a tampered-but-source-present
+stdlib `.pyc`, which the surviving `.py` source tree and binary hash continue to cover. Because
+M1 is deferred, this re-preregistration lands before any scored run and supersedes no evidence.
+
 ## Owner-directed disposition — implementation-first defer
 
 On 2026-07-21 the owner stopped the preregistered run

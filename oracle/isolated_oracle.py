@@ -19,9 +19,9 @@ EXPECTED_PYTHON_EXECUTABLE_SHA256 = (
     "01564940172b2811e1f39a4dc90e84c7a26a19cf071bbc5de67e456d82627bec"
 )
 EXPECTED_PYTHON_RUNTIME_TREE_SHA256 = (
-    "63c25fabba8839ccb349e3554fedf9c46011d9e414c76912448a19869f666cac"
+    "01a580d385a91f4b8bc195c8b2f56c4c2d156f6c1e1ad8768fc4501987c4e12f"
 )
-EXPECTED_PYTHON_RUNTIME_FILE_COUNT = 2122
+EXPECTED_PYTHON_RUNTIME_FILE_COUNT = 1897
 EXPECTED_SITE_PACKAGES_TREE_SHA256 = (
     "db258e22404a3937d46d72ff44083400aafcf34636b8444a91a29c858b297006"
 )
@@ -50,9 +50,17 @@ def canonical_tree(
     allow_symlinks: bool,
     ignored_names: frozenset[str] = frozenset(),
     reject_bytecode: bool = False,
+    ignore_bytecode: bool = False,
     ignore_wheel_records: bool = False,
 ) -> tuple[str, int]:
-    """Hash a complete tree using location-independent relative names."""
+    """Hash a complete tree using location-independent relative names.
+
+    ``reject_bytecode`` and ``ignore_bytecode`` are mutually exclusive in intent.
+    The site-packages tree rejects bytecode so any post-clean ``.pyc`` insertion
+    fails loudly. The runtime tree ignores bytecode instead, because the runtime
+    root is the shared uv base interpreter prefix and its ``__pycache__`` content
+    accumulates non-deterministically as other tools import the same interpreter.
+    """
 
     root = root.resolve()
     if not root.is_dir():
@@ -75,13 +83,18 @@ def canonical_tree(
                 continue
             if not candidate.is_dir():
                 raise RuntimeError(f"identity tree contains a special directory: {candidate}")
-            if reject_bytecode and name == "__pycache__":
-                raise RuntimeError(f"identity tree contains a bytecode directory: {candidate}")
+            if name == "__pycache__":
+                if reject_bytecode:
+                    raise RuntimeError(f"identity tree contains a bytecode directory: {candidate}")
+                if ignore_bytecode:
+                    continue
             kept_directories.append(name)
         directories[:] = kept_directories
         for name in files:
             candidate = directory_path / name
             relative = candidate.relative_to(root).as_posix()
+            if ignore_bytecode and name.endswith(".pyc"):
+                continue
             if candidate.is_symlink():
                 if not allow_symlinks:
                     raise RuntimeError(f"identity tree contains a file symlink: {candidate}")
@@ -198,7 +211,10 @@ def startup_identity() -> dict[str, Any]:
     runtime_root = Path(sys.executable).resolve().parent.parent
     executable_sha256 = sha256_file(Path(sys.executable))
     runtime_sha256, runtime_count = canonical_tree(
-        runtime_root, allow_symlinks=True, ignored_names=frozenset({".DS_Store"})
+        runtime_root,
+        allow_symlinks=True,
+        ignored_names=frozenset({".DS_Store"}),
+        ignore_bytecode=True,
     )
     site_sha256, site_count = canonical_tree(
         # Wheel RECORD files are non-executable installer receipts and uv rewrites

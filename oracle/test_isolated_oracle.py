@@ -11,15 +11,48 @@ from isolated_oracle import canonical_tree
 
 
 class CanonicalTreeTests(unittest.TestCase):
-    def test_runtime_hash_binds_mutated_bytecode(self) -> None:
+    def test_runtime_tree_ignores_bytecode(self) -> None:
+        # The runtime root is the shared uv base interpreter prefix; its
+        # __pycache__ content accumulates non-deterministically as other tools
+        # import the same interpreter, so the runtime tree excludes bytecode.
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            source = root / "module.py"
+            source.write_bytes(b"first-source")
             bytecode = root / "module.pyc"
-            bytecode.write_bytes(b"first")
-            first = canonical_tree(root, allow_symlinks=True)
-            bytecode.write_bytes(b"second")
-            second = canonical_tree(root, allow_symlinks=True)
-            self.assertNotEqual(first, second)
+            bytecode.write_bytes(b"first-bytecode")
+            base = canonical_tree(root, allow_symlinks=True, ignore_bytecode=True)
+            # Mutating bytecode content must not change the runtime tree.
+            bytecode.write_bytes(b"second-bytecode")
+            self.assertEqual(
+                canonical_tree(root, allow_symlinks=True, ignore_bytecode=True),
+                base,
+            )
+            # Adding or removing bytecode must not change the runtime tree.
+            bytecode.unlink()
+            self.assertEqual(
+                canonical_tree(root, allow_symlinks=True, ignore_bytecode=True),
+                base,
+            )
+            # Mutating real source still binds the runtime tree.
+            source.write_bytes(b"second-source")
+            self.assertNotEqual(
+                canonical_tree(root, allow_symlinks=True, ignore_bytecode=True),
+                base,
+            )
+
+    def test_runtime_tree_prunes_pycache_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "module.py").write_bytes(b"src")
+            base = canonical_tree(root, allow_symlinks=True, ignore_bytecode=True)
+            cache = root / "__pycache__"
+            cache.mkdir()
+            (cache / "module.cpython-312.pyc").write_bytes(b"compiled")
+            self.assertEqual(
+                canonical_tree(root, allow_symlinks=True, ignore_bytecode=True),
+                base,
+            )
 
     def test_site_tree_rejects_regular_bytecode(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
