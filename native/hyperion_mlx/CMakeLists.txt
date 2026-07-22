@@ -37,6 +37,9 @@ add_library(hyperion_mlx STATIC
     src/dispatch.cc
     src/kv.cc
     src/kv_cache.cc
+    src/weights_loader.cc
+    src/rope.cc
+    src/forward.cc
     src/model.cc
 )
 add_dependencies(hyperion_mlx hyperion_canary_metallib)
@@ -121,6 +124,17 @@ if(BUILD_TESTING)
     target_include_directories(hyperion_weights_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_compile_options(hyperion_weights_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME hyperion_weights COMMAND hyperion_weights_test)
+
+    # M5-gated: the native forward-pass math (M2-2.3a) on a committed tiny
+    # fixture, compared op-for-op against an inline MLX reference. Builds
+    # wherever MLX/Metal link; runs only on the self-hosted M5 (NOT in
+    # scripts/test-native.sh --model-free). Self-skips (exit 0) when the tiny
+    # fixture dir is unset/absent (CI).
+    add_executable(hyperion_forward_test tests/forward_test.cc)
+    target_link_libraries(hyperion_forward_test PRIVATE hyperion_mlx mlx)
+    target_include_directories(hyperion_forward_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_options(hyperion_forward_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME hyperion_forward COMMAND hyperion_forward_test)
 endif()
 
 install(TARGETS hyperion_mlx ARCHIVE DESTINATION lib)

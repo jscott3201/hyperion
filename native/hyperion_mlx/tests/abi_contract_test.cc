@@ -41,34 +41,43 @@ int main() {
     require(hyp_model_create(&model) == HYP_STATUS_OK, "model create must succeed");
     require(model != nullptr, "model handle must be non-null after create");
 
+    // hyp_model_load is real (M2-2.3a): a minimal geometry (num_hidden_layers=0,
+    // empty layer_types) is rejected by from_abi + Geometry::validate BEFORE any MLX or
+    // I/O — so this stays model-free (no GPU / no artifact needed). The successful load
+    // path + prefill/decode stubs are exercised by the M5-gated hyperion_forward_test.
     HypGeometryParams geometry{};
-    geometry.hidden_size = 3840; // load stub does not read geometry fields.
+    geometry.hidden_size = 3840;
     require(
-        hyp_model_load(model, &geometry, "weights") == HYP_STATUS_UNSUPPORTED,
-        "hyp_model_load stub must return UNSUPPORTED until M2-2.2");
+        hyp_model_load(model, &geometry, "weights") == HYP_STATUS_INVALID_ARGUMENT,
+        "hyp_model_load rejects an invalid (empty-layer_types) geometry");
 
+    // kvstate_create requires a loaded model; the model above never loaded.
     HypKvState kv = nullptr;
-    require(hyp_kvstate_create(model, &kv) == HYP_STATUS_OK, "kvstate create must succeed");
-    require(kv != nullptr, "kvstate handle must be non-null");
+    require(
+        hyp_kvstate_create(model, &kv) == HYP_STATUS_INVALID_ARGUMENT,
+        "kvstate create on an unloaded model must reject");
+    require(kv == nullptr, "a rejected kvstate create must not produce a handle");
 
     HypStepResult result = nullptr;
     require(hyp_step_result_create(&result) == HYP_STATUS_OK, "step result create must succeed");
     require(result != nullptr, "step result handle must be non-null");
 
+    // prefill/decode with a null kvstate hit the kvstate validation guard (the stubs
+    // never reach the UNSUPPORTED return without a valid kvstate; the full stub path is
+    // in hyperion_forward_test's test_abi_load).
     HypTokenStream tokens{nullptr, 0, 1};
     require(
-        hyp_prefill_chunk(model, kv, &tokens, result) == HYP_STATUS_UNSUPPORTED,
-        "hyp_prefill_chunk stub must return UNSUPPORTED until M2-2.6");
+        hyp_prefill_chunk(model, nullptr, &tokens, result) == HYP_STATUS_INVALID_ARGUMENT,
+        "prefill with a null kvstate must reject, not UB");
     require(
-        hyp_decode_block(model, kv, 1, result) == HYP_STATUS_UNSUPPORTED,
-        "hyp_decode_block stub must return UNSUPPORTED until M2-2.6/2.7");
+        hyp_decode_block(model, nullptr, 1, result) == HYP_STATUS_INVALID_ARGUMENT,
+        "decode with a null kvstate must reject, not UB");
 
     require(hyp_step_result_free(&result) == HYP_STATUS_OK, "step result free must succeed");
     require(result == nullptr, "step result handle must be nulled after free");
     require(
         hyp_step_result_free(&result) == HYP_STATUS_OK,
         "double-free of a nulled handle is an idempotent no-op (no UB)");
-    require(hyp_kvstate_free(&kv) == HYP_STATUS_OK, "kvstate free must succeed");
     require(hyp_model_free(&model) == HYP_STATUS_OK, "model free must succeed");
     require(model == nullptr, "model handle must be nulled after free");
 

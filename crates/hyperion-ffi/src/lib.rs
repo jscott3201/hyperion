@@ -424,6 +424,7 @@ fn char_array<const N: usize>(value: &[c_char; N]) -> String {
 
 /// Owned model handle. The native `hyp_model_free` nulls on drop, so double-drop
 /// is a no-op. Not `Send` — the engine thread owns all native state (02-architecture).
+#[derive(Debug)]
 pub struct Model(raw::HypModel);
 
 impl Model {
@@ -465,6 +466,7 @@ impl Drop for Model {
 }
 
 /// Owned KV-state handle (bound to a model).
+#[derive(Debug)]
 pub struct KvState(raw::HypKvState);
 
 impl KvState {
@@ -521,6 +523,7 @@ impl Drop for KvState {
 }
 
 /// Owned step-result handle (caller-owned, reused across decode steps at 2.x).
+#[derive(Debug)]
 pub struct StepResult(raw::HypStepResult);
 
 impl StepResult {
@@ -629,9 +632,11 @@ mod tests {
     #[test]
     fn kvstate_and_step_result_create_drop() {
         let model = Model::create().expect("model create");
-        let kv = KvState::create(&model).expect("kvstate create");
+        // kvstate_create requires a loaded model (M2-2.3a); on a bare handle it rejects.
+        let kv_err =
+            KvState::create(&model).expect_err("kvstate create on an unloaded model must reject");
+        assert_eq!(kv_err.status, Status::InvalidArgument);
         let result = StepResult::create().expect("step result create");
-        drop(kv);
         drop(result);
         drop(model);
     }
@@ -684,25 +689,39 @@ mod tests {
     }
 
     #[test]
-    fn load_prefill_decode_are_unsupported_until_2x() {
+    fn load_validates_geometry_and_kvstate_requires_loaded() {
+        // hyp_model_load is real (M2-2.3a). This is the model-free Rust tier: a VALID
+        // tiny geometry gets past from_abi + Geometry::validate and hits the
+        // not-found-directory check, which returns NotFound BEFORE any MLX/GPU call — so
+        // it runs without a Metal device or an artifact. The successful load + the
+        // prefill/decode UNSUPPORTED stubs are exercised by the M5-gated native
+        // hyperion_forward_test on the committed tiny fixture.
         let model = Model::create().expect("model create");
-        let kv = KvState::create(&model).expect("kvstate create");
         let result = StepResult::create().expect("step result create");
 
+        // 5:1 tiny geometry (mirrors the committed gemma4-unified-tiny fixture).
+        let layer_types: [c_int; 6] = [
+            raw::HYP_LAYER_SLIDING,
+            raw::HYP_LAYER_SLIDING,
+            raw::HYP_LAYER_SLIDING,
+            raw::HYP_LAYER_SLIDING,
+            raw::HYP_LAYER_SLIDING,
+            raw::HYP_LAYER_FULL,
+        ];
         let geometry = raw::HypGeometryParams {
             model_type: raw::HYP_GEMMA4_UNIFIED_TEXT,
-            hidden_size: 3840,
-            intermediate_size: 15360,
-            num_hidden_layers: 48,
-            layer_types: std::ptr::null(),
-            num_attention_heads: 16,
-            head_dim_local: 256,
-            head_dim_global: 512,
-            num_kv_heads_local: 8,
+            hidden_size: 128,
+            intermediate_size: 256,
+            num_hidden_layers: 6,
+            layer_types: layer_types.as_ptr(),
+            num_attention_heads: 4,
+            head_dim_local: 64,
+            head_dim_global: 128,
+            num_kv_heads_local: 2,
             num_kv_heads_global: 1,
             attention_k_eq_v_global: 1,
             num_kv_shared_layers: 0,
-            sliding_window: 1024,
+            sliding_window: 8,
             rope_local: raw::HypRopeSpec {
                 theta: 10000.0,
                 has_partial_rotary_factor: 0,
@@ -718,8 +737,8 @@ mod tests {
             final_logit_softcapping: 30.0,
             rms_norm_eps: 1e-6,
             attention_bias: 0,
-            vocab_size: 262144,
-            max_position_embeddings: 262144,
+            vocab_size: 128,
+            max_position_embeddings: 256,
             tie_word_embeddings: 1,
             ple_hidden_per_layer_input: 0,
             ple_vocab_per_layer_input: 0,
@@ -732,22 +751,18 @@ mod tests {
             },
         };
 
-        let load_error = model.load(&geometry, "/nonexistent/weights").unwrap_err();
-        assert_eq!(load_error.status, Status::Unsupported);
+        // Valid geometry + nonexistent directory -> NotFound (before any MLX call).
+        let load_error = model
+            .load(&geometry, "/nonexistent/weights")
+            .expect_err("load on a nonexistent dir must return an error");
+        assert_eq!(load_error.status, Status::NotFound);
 
-        // SAFETY: valid handles; the stub validates then returns Unsupported.
-        let tokens = raw::HypTokenStream {
-            tokens: std::ptr::null(),
-            count: 0,
-            is_prompt: 1,
-        };
-        unsafe {
-            let prefill_status = raw::hyp_prefill_chunk(model.0, kv.0, &tokens, result.0);
-            assert_eq!(native_error(prefill_status).status, Status::Unsupported);
+        // kvstate_create requires a loaded model; the load above never succeeded.
+        let kv_error = KvState::create(&model)
+            .expect_err("kvstate create on an unloaded model must return an error");
+        assert_eq!(kv_error.status, Status::InvalidArgument);
 
-            let decode_status = raw::hyp_decode_block(model.0, kv.0, 1, result.0);
-            assert_eq!(native_error(decode_status).status, Status::Unsupported);
-        }
+        drop(result);
     }
 
     #[test]
