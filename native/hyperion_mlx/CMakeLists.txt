@@ -36,6 +36,7 @@ add_library(hyperion_mlx STATIC
     src/geometry.cc
     src/dispatch.cc
     src/kv.cc
+    src/kv_cache.cc
     src/model.cc
 )
 add_dependencies(hyperion_mlx hyperion_canary_metallib)
@@ -101,6 +102,15 @@ if(BUILD_TESTING)
     target_include_directories(hyperion_kv_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_compile_options(hyperion_kv_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME hyperion_kv COMMAND hyperion_kv_test)
+
+    # M5-gated: exercises the real MLX runtime (mx::array + slice_update + GPU
+    # eval). Builds wherever MLX/Metal link; runs only on the self-hosted M5
+    # (NOT in scripts/test-native.sh --model-free, like hyperion_runtime_canary).
+    add_executable(hyperion_kv_cache_test tests/kv_cache_test.cc)
+    target_link_libraries(hyperion_kv_cache_test PRIVATE hyperion_mlx mlx)
+    target_include_directories(hyperion_kv_cache_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_options(hyperion_kv_cache_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME hyperion_kv_cache COMMAND hyperion_kv_cache_test)
 endif()
 
 install(TARGETS hyperion_mlx ARCHIVE DESTINATION lib)
