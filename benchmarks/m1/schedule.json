@@ -1,0 +1,139 @@
+{
+  "schema": "hyperion.m1-schedule.v1",
+  "protocol": "docs/decisions/0002-m1-baseline-measurement-protocol.md",
+  "oracle": {
+    "python": "3.12.13",
+    "python_executable_sha256": "01564940172b2811e1f39a4dc90e84c7a26a19cf071bbc5de67e456d82627bec",
+    "python_runtime_tree_sha256": "84fdd9dcc811d7dab39be0d36dcb375526287b8b033b663864d3fd896a67efcb",
+    "python_runtime_file_count": 1897,
+    "site_packages_tree_sha256": "db258e22404a3937d46d72ff44083400aafcf34636b8444a91a29c858b297006",
+    "site_packages_file_count": 5470,
+    "hash_seed_probe": 1244036990071903237,
+    "site_bytecode_policy": "reject",
+    "startup_mode": "five-variable scrubbed environment plus python -B -S -s -P -X pycache_prefix=/dev/null through oracle/isolated_oracle.py",
+    "mlx": "0.32.0",
+    "mlx_metal": "0.32.0",
+    "mlx_lm": "0.31.3",
+    "mlx_lm_commit": "8239c72de5a0e42c539e30489021db73c7fe258c",
+    "mlx_tree_sha256": "bacebd4f46680155a129301ffefc516402142183584f2b47673bc91b561f0cd9",
+    "mlx_tree_file_count": 40,
+    "mlx_metal_tree_sha256": "628a99548b65855148fb03f71cac83ce46eae42140f119fa8d1b51285c2abefd",
+    "mlx_metal_tree_file_count": 406,
+    "mlx_lm_tree_sha256": "40dc49399a07cdf22e3516070cfe222e89ec2f0ff29cd6e257e1b069edc3472f",
+    "mlx_lm_tree_file_count": 176,
+    "mlx_lm_package_sha256": "f9ffa88772d26e537a98aa39ab16488a7a0d13cc1fac5d665376132c94b49608",
+    "mlx_lm_generate_sha256": "270778ad53eaca55a8533d82e6752660fe5d2605c4aa0879b48a50a91f69345f",
+    "mlx_lm_server_sha256": "cdfcb4ac848636f9927851a0ec7a951584526530cb7832ba58049e4a9144db8b",
+    "lock_sha256": "b3603b4ebbc7f5883afe3d8cc10fc1767239837f5256985bd591b777c993dbaf"
+  },
+  "worker_environment": {
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PYTHONHASHSEED": "0",
+    "TOKENIZERS_PARALLELISM": "false",
+    "TZ": "UTC"
+  },
+  "converted_model_payloads": {
+    "12b": {
+      "manifest_sha256": "9fa3c7f6c49305f621ed1f96edbb34c6402b6229701041db4e607df70e9b4144",
+      "payload_tree_sha256": "60386542c026e72aa7b8b4a3ffb3e2356fd3e80c3d54939ad75d932d59bff2d7",
+      "payload_file_count": 9
+    },
+    "e4b": {
+      "manifest_sha256": "9ba65423d3b2bab1e7c52ea88a1a2b0a33c1f51909b1df66330bf872b7a6c2b0",
+      "payload_tree_sha256": "99e6875ffb1bf4eae37242c7c0736a43b45b38dd0088ed671551283c0e268f16",
+      "payload_file_count": 8
+    }
+  },
+  "source_model_transport_caches": {
+    "12b": {
+      "tree_sha256": "8ee7b68d0ece0fd7a1d281f3c1e9c9d82ece65bcb1cacfbaa04c5864baba9be7",
+      "file_count": 21
+    },
+    "e4b": {
+      "tree_sha256": "2ee372adf9573c9e7037dd5c4a740d8dc14112b37eabe831b5a58a0e6f702eb7",
+      "file_count": 21
+    }
+  },
+  "core": {
+    "models": ["12b", "e4b"],
+    "contexts": [512, 1024, 4096, 8192, 16384, 32768],
+    "arm": "core-default",
+    "wired_limit": "default",
+    "generated_ids": 1025,
+    "warmups": 1,
+    "measured_trials": 5
+  },
+  "budget_discovery": {
+    "model": "12b",
+    "context": 4096,
+    "generated_ids": 1025,
+    "warmups": 1,
+    "measured_trials": 5,
+    "coarse_caps_bytes": [
+      4294967296,
+      5368709120,
+      6442450944,
+      7516192768,
+      8589934592,
+      9663676416,
+      10737418240,
+      11811160064
+    ],
+    "refinement": "best eligible coarse cap minus and plus 536870912 bytes; both must be in [4294967296,11811160064]",
+    "objective": "highest median decode_tok_s",
+    "plateau_rule": "median >= 99% of empirical best and trial ranges overlap",
+    "tie_breaker": "smallest eligible cap in the plateau"
+  },
+  "confirmation": {
+    "model": "12b",
+    "context": 4096,
+    "generated_ids": 1025,
+    "warmups_per_block": 1,
+    "measured_trials_per_block": 5,
+    "ordered_arms": ["acca-a1", "acca-c1", "acca-c2", "acca-a2"],
+    "a_cap": "each worker's max_recommended_working_set_size",
+    "c_cap": "selected_c_bytes from complete discovery",
+    "speedup_rule": "minimum of ten C trials exceeds maximum of ten A trials"
+  },
+  "server_smoke": {
+    "models": ["12b", "e4b"],
+    "fresh_server_repeats": 2,
+    "warmups_per_repeat": 1,
+    "thinking": false,
+    "temperature": 0.0,
+    "seed": 0,
+    "prompt_cache_size": 0,
+    "decode_concurrency": 1,
+    "prompt_concurrency": 1,
+    "prefill_step_size": 2048
+  },
+  "nightly": {
+    "models": ["12b", "e4b"],
+    "context": 512,
+    "generated_ids": 129,
+    "warmups": 1,
+    "measured_trials": 5,
+    "gate_eligible": false
+  },
+  "stretch": {
+    "models": ["12b", "e4b"],
+    "context": 131072,
+    "arm": "stretch-128k",
+    "runner": "scripts/run-m1-stretch.sh RUN_ID MODEL TRIALS",
+    "generated_ids": 129,
+    "warmups": 1,
+    "minimum_measured_trials": 1,
+    "maximum_measured_trials": 4,
+    "low_n": true,
+    "gate_eligible": false,
+    "scheduled_for_m1": false
+  },
+  "durable_archive": {
+    "kind": "github_release_asset",
+    "tag_prefix": "m1-evidence-",
+    "asset_name_prefix": "hyperion-m1-",
+    "retrieval_verification_required": true,
+    "actions_artifact_is_convenience_copy_only": true
+  }
+}

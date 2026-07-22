@@ -22,12 +22,25 @@ jobs:
       HOMEBREW_NO_AUTO_UPDATE: "1"
       MLX_ROOT: /opt/homebrew/opt/mlx
       HYPERION_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+      # The relocated uv base interpreter prefix is not byte-reproducible across
+      # machines (adhoc re-signature + residual per-machine structural drift).
+      # Relax the runtime-tree pin here; the self-hosted M5 release-gate enforces it.
+      HYPERION_RELAX_RUNTIME_TREE: "1"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Install exact Rust floor
         run: rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt
+      - name: Install exact uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.5"
+          python-version: "3.12.13"
+          enable-cache: false
+      - name: Install exact oracle Python
+        run: uv python install 3.12.13
       - name: Install native dependencies
         run: |
           brew install cmake jq mlx ripgrep
@@ -38,5 +51,7 @@ jobs:
             xcodebuild -downloadComponent MetalToolchain
           fi
           xcrun metal --version
+      - name: Recreate the locked model-free oracle
+        run: scripts/setup-oracle.sh
       - name: Run cumulative model-free tier 1
         run: scripts/ci-pr.sh

@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      milestone:
+        description: Cumulative milestone gate to run
+        required: true
+        default: m0
+        type: choice
+        options: [m0, m1]
 
 permissions:
   contents: read
@@ -15,18 +22,22 @@ concurrency:
 jobs:
   m5-full:
     name: full M5 milestone gate
+    if: github.event_name == 'push' || inputs.milestone == 'm0'
     runs-on: [self-hosted, macOS, ARM64, hyperion-m5]
     environment: hyperion-m5-release
-    timeout-minutes: 360
+    timeout-minutes: 1440
     env:
       MLX_ROOT: /opt/homebrew/opt/mlx
       HYPERION_BASE_REF: ${{ github.event_name == 'push' && github.event.before || 'HEAD^' }}
       HYPERION_M0_SOURCE_MODEL: ${{ vars.HYPERION_M0_SOURCE_MODEL }}
       HYPERION_M0_ORACLE_MODEL: ${{ vars.HYPERION_M0_ORACLE_MODEL }}
+      HYPERION_M1_E4B_SOURCE_MODEL: ${{ vars.HYPERION_M1_E4B_SOURCE_MODEL }}
+      HYPERION_M1_E4B_ORACLE_MODEL: ${{ vars.HYPERION_M1_E4B_ORACLE_MODEL }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Validate the external content-addressed model store
         run: |
           test -n "${HYPERION_M0_SOURCE_MODEL:-}"
@@ -37,3 +48,89 @@ jobs:
         run: scripts/setup-oracle.sh
       - name: Run cumulative release gate
         run: scripts/ci-release.sh
+
+  m1-measure:
+    name: protected M1 baseline measurement
+    if: github.event_name == 'workflow_dispatch' && inputs.milestone == 'm1'
+    runs-on: [self-hosted, macOS, ARM64, hyperion-m5]
+    environment: hyperion-m5-release
+    timeout-minutes: 1440
+    env:
+      MLX_ROOT: /opt/homebrew/opt/mlx
+      HYPERION_BASE_REF: HEAD^
+      HYPERION_M0_SOURCE_MODEL: ${{ vars.HYPERION_M0_SOURCE_MODEL }}
+      HYPERION_M0_ORACLE_MODEL: ${{ vars.HYPERION_M0_ORACLE_MODEL }}
+      HYPERION_M1_E4B_SOURCE_MODEL: ${{ vars.HYPERION_M1_E4B_SOURCE_MODEL }}
+      HYPERION_M1_E4B_ORACLE_MODEL: ${{ vars.HYPERION_M1_E4B_ORACLE_MODEL }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate the external content-addressed model stores
+        run: |
+          test -n "${HYPERION_M0_SOURCE_MODEL:-}"
+          test -n "${HYPERION_M0_ORACLE_MODEL:-}"
+          test -n "${HYPERION_M1_E4B_SOURCE_MODEL:-}"
+          test -n "${HYPERION_M1_E4B_ORACLE_MODEL:-}"
+          test -f "$HYPERION_M0_SOURCE_MODEL/SHA256SUMS"
+          test -f "$HYPERION_M0_ORACLE_MODEL/SHA256SUMS"
+          test -f "$HYPERION_M1_E4B_SOURCE_MODEL/SHA256SUMS"
+          test -f "$HYPERION_M1_E4B_ORACLE_MODEL/SHA256SUMS"
+      - name: Recreate the locked bench-only oracle
+        run: scripts/setup-oracle.sh
+      - name: Run cumulative release gate
+        run: scripts/ci-release.sh
+      - name: Run protected M1 stock baselines
+        run: scripts/run-m1-baselines.sh "m1-${GITHUB_SHA}" --defer-archive
+      - name: Transfer verified M1 evidence to the archive job
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hyperion-m1-${{ github.sha }}
+          path: benchmarks/raw/m1/m1-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 90
+
+  m1-archive:
+    name: publish immutable M1 evidence assets
+    needs: m1-measure
+    if: github.event_name == 'workflow_dispatch' && inputs.milestone == 'm1'
+    permissions:
+      contents: write
+    runs-on: [self-hosted, macOS, ARM64, hyperion-m5]
+    environment: hyperion-m5-release
+    timeout-minutes: 120
+    env:
+      MLX_ROOT: /opt/homebrew/opt/mlx
+      HYPERION_M0_SOURCE_MODEL: ${{ vars.HYPERION_M0_SOURCE_MODEL }}
+      HYPERION_M0_ORACLE_MODEL: ${{ vars.HYPERION_M0_ORACLE_MODEL }}
+      HYPERION_M1_E4B_SOURCE_MODEL: ${{ vars.HYPERION_M1_E4B_SOURCE_MODEL }}
+      HYPERION_M1_E4B_ORACLE_MODEL: ${{ vars.HYPERION_M1_E4B_ORACLE_MODEL }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Recreate the locked bench-only oracle
+        run: scripts/setup-oracle.sh
+      - name: Rebuild the run-bound verifier
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/m1-release
+        run: cargo build --locked --release -p hyperion-bench
+      - name: Restore verified M1 evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: hyperion-m1-${{ github.sha }}
+          path: benchmarks/raw/m1/m1-${{ github.sha }}
+      - name: Publish and retrieve immutable M1 evidence assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/archive-m1-evidence.sh "m1-${GITHUB_SHA}"
+      - name: Preserve the durable retrieval receipt as a convenience copy
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hyperion-m1-archive-receipt-${{ github.sha }}
+          path: benchmarks/raw/m1/m1-${{ github.sha }}/archive-receipt.json
+          if-no-files-found: error
+          retention-days: 90

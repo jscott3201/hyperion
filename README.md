@@ -32,3 +32,20 @@ The self-hosted `release-gate` keeps checkout cleanup enabled and recreates the 
 Its protected `hyperion-m5-release` environment must define `HYPERION_M0_SOURCE_MODEL` and
 `HYPERION_M0_ORACLE_MODEL` as paths outside the checkout. Each path must contain the reviewed
 `SHA256SUMS`; the release script verifies both manifests and every payload before execution.
+
+## M1 baseline harness
+
+Decision 0002 preregisters the stock `mlx-lm` measurement boundary, exact-token corpus,
+five-trial timing definitions, 25 ms OS-memory sampling, resident-budget discovery, and
+A-C-C-A confirmation. Fast CI validates the corpus and analysis math without loading a model.
+The complete M5 run is manual/protected and writes raw evidence only beneath the ignored
+`benchmarks/raw/m1/` tree:
+
+```sh
+scripts/m1-preflight.sh
+scripts/run-m1-baselines.sh RUN_ID
+```
+
+The protected `release-gate` M1 dispatch additionally requires external, checksum-manifested
+E4B source and converted-model paths in `HYPERION_M1_E4B_SOURCE_MODEL` and
+`HYPERION_M1_E4B_ORACLE_MODEL`.

@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 
-expected_lock_sha256=5e6e51756f1420e078f09badc0748e010eaaa7a5f1b81adfebbe9ca24a0e8883
+expected_lock_sha256=b3603b4ebbc7f5883afe3d8cc10fc1767239837f5256985bd591b777c993dbaf
 actual_lock_sha256=$(shasum -a 256 oracle/uv.lock | awk '{print $1}')
 if [[ "$actual_lock_sha256" != "$expected_lock_sha256" ]]; then
     echo "oracle lock digest differs from the reviewed M0 lock" >&2
@@ -15,31 +15,67 @@ if [[ ! -x oracle/.venv/bin/python ]]; then
     exit 2
 fi
 
-oracle/.venv/bin/python - <<'PY'
-from importlib.metadata import distribution
-import json
-import sys
+identity=$(scripts/run-isolated-oracle.sh script oracle/oracle_identity.py)
 
-expected_commit = "8239c72de5a0e42c539e30489021db73c7fe258c"
-expected_lock = "5e6e51756f1420e078f09badc0748e010eaaa7a5f1b81adfebbe9ca24a0e8883"
-mlx_lm = distribution("mlx-lm")
-if mlx_lm.version != "0.31.3":
-    raise SystemExit(f"expected mlx-lm 0.31.3, found {mlx_lm.version}")
-direct_url_text = mlx_lm.read_text("direct_url.json")
-if direct_url_text is None:
-    raise SystemExit("mlx-lm direct_url.json is missing")
-direct_url = json.loads(direct_url_text)
-commit = direct_url.get("vcs_info", {}).get("commit_id")
-if commit != expected_commit:
-    raise SystemExit(f"expected mlx-lm commit {expected_commit}, found {commit}")
-mlx_version = distribution("mlx").version
-if mlx_version != "0.32.0":
-    raise SystemExit(f"expected mlx 0.32.0, found {mlx_version}")
-if not ((3, 11) <= sys.version_info[:2] < (3, 15)):
-    raise SystemExit(f"unsupported oracle Python {sys.version.split()[0]}")
-print(
-    "oracle-verified: "
-    f"python={sys.version.split()[0]} mlx=0.32.0 "
-    f"mlx-lm=0.31.3@{expected_commit} lock={expected_lock}"
-)
-PY
+# The relocated uv base interpreter prefix is not byte-reproducible off the
+# self-hosted M5, so cross-machine runners (HYPERION_RELAX_RUNTIME_TREE=1) omit
+# the runtime-tree assertions. The launcher binary, site-packages tree, uv lock,
+# startup flags, hash probe, environment, and MLX trees stay pinned in both modes.
+runtime_pin='    .python_runtime_tree_sha256 == "84fdd9dcc811d7dab39be0d36dcb375526287b8b033b663864d3fd896a67efcb" and
+    .python_runtime_file_count == 1897 and'
+if [[ "${HYPERION_RELAX_RUNTIME_TREE:-0}" == "1" ]]; then
+    runtime_pin=""
+fi
+
+jq -e '
+    .schema == "hyperion.m1-oracle-identity.v1" and
+    .python == "3.12.13" and
+    .python_executable_sha256 == "01564940172b2811e1f39a4dc90e84c7a26a19cf071bbc5de67e456d82627bec" and
+'"$runtime_pin"'
+    .site_packages_tree_sha256 == "db258e22404a3937d46d72ff44083400aafcf34636b8444a91a29c858b297006" and
+    .site_packages_file_count == 5470 and
+    .startup_flags == {
+      "bytes_warning": 0,
+      "debug": 0,
+      "dev_mode": false,
+      "dont_write_bytecode": 1,
+      "hash_randomization": 0,
+      "ignore_environment": 0,
+      "inspect": 0,
+      "int_max_str_digits": 4300,
+      "interactive": 0,
+      "isolated": 0,
+      "no_site": 1,
+      "no_user_site": 1,
+      "optimize": 0,
+      "quiet": 0,
+      "safe_path": true,
+      "utf8_mode": 1,
+      "verbose": 0,
+      "warn_default_encoding": 0
+    } and
+    .pycache_prefix == "/dev/null" and
+    .hash_seed_probe == 1244036990071903237 and
+    .environment == {
+      "LANG": "C",
+      "LC_ALL": "C",
+      "PYTHONHASHSEED": "0",
+      "TOKENIZERS_PARALLELISM": "false",
+      "TZ": "UTC"
+    } and
+    .mlx_version == "0.32.0" and
+    .mlx_metal_version == "0.32.0" and
+    .mlx_lm_version == "0.31.3" and
+    .mlx_lm_commit == "8239c72de5a0e42c539e30489021db73c7fe258c" and
+    .mlx_tree_sha256 == "bacebd4f46680155a129301ffefc516402142183584f2b47673bc91b561f0cd9" and
+    .mlx_tree_file_count == 40 and
+    .mlx_metal_tree_sha256 == "628a99548b65855148fb03f71cac83ce46eae42140f119fa8d1b51285c2abefd" and
+    .mlx_metal_tree_file_count == 406 and
+    .mlx_lm_tree_sha256 == "40dc49399a07cdf22e3516070cfe222e89ec2f0ff29cd6e257e1b069edc3472f" and
+    .mlx_lm_tree_file_count == 176
+' <<<"$identity" >/dev/null
+mode=strict
+if [[ "${HYPERION_RELAX_RUNTIME_TREE:-0}" == "1" ]]; then
+    mode=relaxed
+fi
+printf 'oracle-verified: mode=%s lock=%s identity=%s\n' "$mode" "$expected_lock_sha256" "$identity"

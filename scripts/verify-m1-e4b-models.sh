@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source_dir=${HYPERION_M1_E4B_SOURCE_MODEL:-$repo_root/artifacts/models/gemma4-e4b-qat-source}
+converted_dir=${HYPERION_M1_E4B_ORACLE_MODEL:-$repo_root/artifacts/models/gemma4-e4b-qat-mlx-g64-b4}
+source_manifest_sha256=d86886b83233724bbfd0bbf6f033bcd7b2862c16206f62b6d7c01826fef44c95
+converted_manifest_sha256=9ba65423d3b2bab1e7c52ea88a1a2b0a33c1f51909b1df66330bf872b7a6c2b0
+
+verify_tree() {
+    local label=$1
+    local tree=$2
+    local expected_manifest_sha256=$3
+    local allow_cache=${4:-false}
+    local expected_cache_sha256=${5:-}
+    local arguments=(
+        script oracle/model_identity.py
+        --model "$tree"
+        --manifest-sha256 "$expected_manifest_sha256"
+    )
+    if [[ "$allow_cache" == true ]]; then
+        arguments+=(
+            --allow-huggingface-cache
+            --expected-transport-cache-sha256 "$expected_cache_sha256"
+        )
+    fi
+    local identity
+    identity=$(scripts/run-isolated-oracle.sh "${arguments[@]}")
+    jq -e --arg manifest "$expected_manifest_sha256" --arg cache "$expected_cache_sha256" '
+        .schema == "hyperion.model-tree-identity.v1" and
+        .manifest_sha256 == $manifest and
+        .exact_inventory == true and
+        .symlinks_rejected == true and
+        (if $cache == "" then
+            .transport_cache_excluded == false and
+            .transport_cache_separately_bound == false and
+            .transport_cache_tree_sha256 == null and
+            .transport_cache_file_count == 0
+        else
+            .transport_cache_excluded == true and
+            .transport_cache_separately_bound == true and
+            .transport_cache_tree_sha256 == $cache and
+            .transport_cache_file_count > 0
+        end) and
+        (.payload_file_count > 0)
+    ' <<<"$identity" >/dev/null
+    printf 'model-tree-verified: label=%s identity=%s\n' "$label" "$identity"
+}
+
+verify_e4b_geometry() {
+    local config=$1
+    jq -e '
+        .model_type == "gemma4" and
+        .text_config.hidden_size == 2560 and
+        .text_config.num_hidden_layers == 42 and
+        .text_config.vocab_size == 262144 and
+        .text_config.max_position_embeddings == 131072 and
+        .text_config.sliding_window == 512 and
+        .text_config.num_attention_heads == 8 and
+        .text_config.num_key_value_heads == 2 and
+        .text_config.head_dim == 256 and
+        .text_config.global_head_dim == 512 and
+        .text_config.attention_k_eq_v == false and
+        .text_config.hidden_size_per_layer_input == 256 and
+        .text_config.num_kv_shared_layers == 18 and
+        (.text_config.layer_types | length) == 42 and
+        ([.text_config.layer_types[] | select(. == "full_attention")] | length) == 7 and
+        ([.text_config.layer_types[] | select(. == "sliding_attention")] | length) == 35
+    ' "$config" >/dev/null
+}
+
+verify_tree \
+    "M1 E4B source" \
+    "$source_dir" \
+    "$source_manifest_sha256" \
+    true \
+    2ee372adf9573c9e7037dd5c4a740d8dc14112b37eabe831b5a58a0e6f702eb7
+verify_tree "M1 E4B converted model" "$converted_dir" "$converted_manifest_sha256"
+verify_e4b_geometry "$source_dir/config.json"
+verify_e4b_geometry "$converted_dir/config.json"
+jq -e '
+    .quantization.group_size == 64 and
+    .quantization.bits == 4 and
+    .quantization.mode == "affine" and
+    .quantization_config == .quantization
+' "$converted_dir/config.json" >/dev/null
+if ! rg -q '^license: apache-2\.0$' "$source_dir/README.md"; then
+    echo "M1 E4B source model card does not declare apache-2.0" >&2
+    exit 1
+fi
+
+printf 'm1-e4b-models-verified: source=%s converted=%s quant=affine-q4-g64\n' \
+    "$source_manifest_sha256" \
+    "$converted_manifest_sha256"
