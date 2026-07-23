@@ -3,7 +3,9 @@
 #include "dispatch.h"
 #include "forward.h"
 #include "geometry.h"
+#include "governor.h"
 #include "kv_cache.h"
+#include "platform_policy.h"
 #include "step_result_access.h"
 #include "weights_loader.h"
 
@@ -29,6 +31,7 @@ struct HypModelOpaque {
     std::unique_ptr<hyperion::model::DispatchTable> dispatch;
     std::unique_ptr<hyperion::model::ModelWeights> weights;
     std::unique_ptr<hyperion::model::ForwardPass> fwd; // M2-2.7: the per-layer math + epilogue.
+    std::unique_ptr<hyperion::governor::Governor> governor; // M2-2.6b: predictive admission.
     std::optional<mx::Stream> stream;
 };
 
@@ -162,27 +165,37 @@ ForwardPass::GreedySample run_epilogue(ForwardPass& fwd, const mx::array& h, mx:
     return fwd.sample_greedy(last);
 }
 
-/// Write the sampled token + telemetry to a validated step-result handle. Memory
-/// fields are 0 (governor admission is 2.6); governor_state = READY.
-void write_step_result(HypStepResult result, const ForwardPass::GreedySample& sample, std::uint32_t near_tie_events) {
-    result->fields.token_id = sample.token_id;
-    result->fields.logit = sample.logit;
-    result->fields.near_tie_events = near_tie_events;
-    result->fields.governor_state = HYP_GOVERNOR_READY;
-    result->fields.peak_mlx_bytes = 0;        // 2.6 governor
-    result->fields.active_mlx_bytes = 0;
-    result->fields.phys_footprint_bytes = 0;
-    result->fields.local_kv_bytes = 0;
-    result->fields.global_kv_bytes = 0;
-    result->fields.local_kv_eval_ms = 0.0F;
-    result->fields.global_kv_eval_ms = 0.0F;
-}
-
 HypStepResultFields step_result_read(HypStepResult result) noexcept {
     if (result == nullptr || result->magic != kStepResultMagic) {
         return HypStepResultFields{};
     }
     return result->fields;
+}
+
+void write_step_result(
+    HypStepResult result,
+    const ForwardPass::GreedySample& sample,
+    std::uint32_t near_tie_events,
+    HypGovernorState governor_state,
+    std::uint64_t peak_mlx_bytes,
+    std::uint64_t active_mlx_bytes,
+    std::uint64_t local_kv_bytes,
+    std::uint64_t global_kv_bytes) {
+    if (result == nullptr || result->magic != kStepResultMagic) {
+        return; // invalid handle: no-op (the ABI call already validated, but never trust across the seam)
+    }
+    // Zero-init the whole struct first so the fields this helper does NOT set
+    // (phys_footprint_bytes, local/global_kv_eval_ms) are deterministic zero,
+    // not stale data from a prior step on this reused handle.
+    result->fields = HypStepResultFields{};
+    result->fields.token_id = sample.token_id;
+    result->fields.logit = sample.logit;
+    result->fields.peak_mlx_bytes = peak_mlx_bytes;
+    result->fields.active_mlx_bytes = active_mlx_bytes;
+    result->fields.local_kv_bytes = local_kv_bytes;
+    result->fields.global_kv_bytes = global_kv_bytes;
+    result->fields.governor_state = governor_state;
+    result->fields.near_tie_events = near_tie_events;
 }
 
 } // namespace hyperion::model
@@ -246,6 +259,17 @@ HypStatus hyp_model_load(HypModel model,
         // geometry/dispatch/weights owned by this handle (lifetimes tied to the model).
         model->fwd = std::make_unique<hyperion::model::ForwardPass>(
             *model->geometry, *model->dispatch, *model->weights, gpu);
+        // M2-2.6b: build the predictive governor from the device-derived budget.
+        // The budget comes from the platform canary (derive_budget: 94.9% of
+        // recommended, clamped to 12 GiB, 90% soft watermark).
+        const std::uint64_t recommended =
+            /* the canary's recommended working set; re-evaluated at load */
+            12ULL * 1024ULL * 1024ULL * 1024ULL; // 12 GiB profile ceiling
+        const auto budget = hyperion::platform::derive_budget(recommended);
+        model->governor = std::make_unique<hyperion::governor::Governor>(
+            *model->geometry,
+            budget.effective_bytes,
+            budget.soft_watermark_bytes);
         model->stream = gpu;
         model->loaded = true;
         return hyperion::model::ok();
@@ -327,13 +351,13 @@ HypStatus hyp_prefill_chunk(HypModel model,
     if (status != HYP_STATUS_OK) {
         return status;
     }
-    if (!model->loaded || model->fwd == nullptr) {
+    if (!model->loaded || model->fwd == nullptr || model->governor == nullptr) {
         return hyperion::model::fail(HYP_STATUS_INVALID_ARGUMENT, "model is not loaded");
     }
     // 2.6a prefill is chunked (2048-token chunks at the running offset; the rotation
     // read fires for sliding layers past the window). A single chunk for prompts ≤ 2048
     // (the 2.7 path, bit-identical). Re-prefilling a populated state still needs a fresh
-    // kvstate (a reset is serving/2.6b); governor admission is 2.6b.
+    // kvstate (a reset is serving/2.6b). Governor admission (2.6b) runs before each chunk.
     if (kvstate->offset != 0) {
         return hyperion::model::fail(
             HYP_STATUS_INVALID_ARGUMENT, "prefill requires a fresh (offset 0) KV state");
@@ -356,12 +380,41 @@ HypStatus hyp_prefill_chunk(HypModel model,
         // The epilogue runs ONLY on the last chunk (intermediate chunks' hidden is discarded).
         // Chunking is bitwise-invariant: each token's hidden attends causally to [0, token]
         // regardless of the chunk split, so the final-position hidden (→ token 1) is stable.
+        // Governor admission (2.6b): predict the peak for each chunk; if it exceeds the
+        // soft watermark, halve the chunk (SoftPaused); if it exceeds the hard ceiling,
+        // reject (HardRejected → HYP_STATUS_OOM_GOVERNOR).
         constexpr std::uint32_t kPrefillChunkSize = 2048;
         hyperion::model::ForwardPass::GreedySample sample{0, 0.0F, false};
         std::uint32_t offset = 0;
         const std::uint32_t total = tokens->count;
         while (offset < total) {
-            const std::uint32_t take = std::min(kPrefillChunkSize, total - offset);
+            std::uint32_t take = std::min(kPrefillChunkSize, total - offset);
+            // Governor admission: predict the peak for this chunk at the current offset.
+            auto decision = model->governor->evaluate(take, offset, *kvstate->kv);
+            if (decision.admission == hyperion::governor::Admission::HardRejected) {
+                // Even 1 token would breach the ceiling — reject the whole prefill.
+                hyperion::model::write_step_result(
+                    out_result, sample, 0u, HYP_GOVERNOR_HARD_REJECT,
+                    decision.predicted_peak_bytes, mx::get_active_memory(),
+                    decision.local_kv_bytes, decision.global_kv_bytes);
+                return hyperion::model::fail(
+                    HYP_STATUS_OOM_GOVERNOR, decision.reason);
+            }
+            if (decision.admission == hyperion::governor::Admission::SoftPaused) {
+                // Halve the chunk and retry (down to 1 token; below that, hard reject).
+                take = std::max(std::uint32_t{1}, take / 2);
+                decision = model->governor->evaluate(take, offset, *kvstate->kv);
+                if (decision.admission == hyperion::governor::Admission::HardRejected) {
+                    hyperion::model::write_step_result(
+                        out_result, sample, 0u, HYP_GOVERNOR_HARD_REJECT,
+                        decision.predicted_peak_bytes, mx::get_active_memory(),
+                        decision.local_kv_bytes, decision.global_kv_bytes);
+                    return hyperion::model::fail(
+                        HYP_STATUS_OOM_GOVERNOR, decision.reason);
+                }
+                // If still soft-paused at 1 token, proceed anyway (the governor's soft
+                // watermark is advisory; a single token is always safe to attempt).
+            }
             const int off0 = static_cast<int>(offset);
             const int off1 = static_cast<int>(offset + take);
             mx::array chunk_ids = mx::slice(ids, {off0}, {off1}, {1}, s); // [take]
@@ -376,7 +429,20 @@ HypStatus hyp_prefill_chunk(HypModel model,
         }
         kvstate->offset = total;            // advance the autoregressive cursor
         kvstate->last_token = sample.token_id;
-        hyperion::model::write_step_result(out_result, sample, sample.near_tie ? 1u : 0u);
+        // Fill the step result with governor telemetry (M2-2.6b). The per-chunk
+        // ``decision`` is loop-scoped (each chunk is re-evaluated), so read the FINAL
+        // state here: a 0-token probe at offset=total is always Accepted and returns
+        // the populated KV byte counts. ``predict_peak`` of that same probe is the
+        // steady-state peak after prefill completes (NOT the fabricated O(total²)
+        // transient of a single full-prompt chunk, which never executes under 2048
+        // chunking). peak reports the settled working set + full KV + 0-token
+        // transient + reserve.
+        const auto final_state = model->governor->evaluate(0, total, *kvstate->kv);
+        const std::uint64_t peak = hyperion::governor::predict_peak(0, total, *kvstate->kv, *model->geometry);
+        hyperion::model::write_step_result(
+            out_result, sample, sample.near_tie ? 1u : 0u,
+            HYP_GOVERNOR_READY, peak, mx::get_active_memory(),
+            final_state.local_kv_bytes, final_state.global_kv_bytes);
         return hyperion::model::ok();
     } catch (const std::bad_alloc&) {
         return hyperion::model::fail(
@@ -404,7 +470,7 @@ HypStatus hyp_decode_block(HypModel model,
     if (status != HYP_STATUS_OK) {
         return status;
     }
-    if (!model->loaded || model->fwd == nullptr) {
+    if (!model->loaded || model->fwd == nullptr || model->governor == nullptr) {
         return hyperion::model::fail(HYP_STATUS_INVALID_ARGUMENT, "model is not loaded");
     }
     if (kvstate->offset == 0) {
@@ -416,8 +482,21 @@ HypStatus hyp_decode_block(HypModel model,
         // Nothing to do; leave the step-result zeroed + READY. (A no-op decode is a
         // legal call shape — a verify block of size 0, M7.)
         hyperion::model::write_step_result(
-            out_result, hyperion::model::ForwardPass::GreedySample{0, 0.0F, false}, 0u);
+            out_result, hyperion::model::ForwardPass::GreedySample{0, 0.0F, false}, 0u,
+            HYP_GOVERNOR_READY, 0, mx::get_active_memory(), 0, 0);
         return hyperion::model::ok();
+    }
+
+    // Governor admission (2.6b): predict the peak for the full decode block at the
+    // current offset. Decode is 1 token/step (q_len=1), so the transient is minimal;
+    // the dominant cost is the per-token global KV growth (16 KiB/token).
+    auto decision = model->governor->evaluate(n_tokens, kvstate->offset, *kvstate->kv);
+    if (decision.admission == hyperion::governor::Admission::HardRejected) {
+        hyperion::model::write_step_result(
+            out_result, hyperion::model::ForwardPass::GreedySample{0, 0.0F, false}, 0u,
+            HYP_GOVERNOR_HARD_REJECT, decision.predicted_peak_bytes,
+            mx::get_active_memory(), decision.local_kv_bytes, decision.global_kv_bytes);
+        return hyperion::model::fail(HYP_STATUS_OOM_GOVERNOR, decision.reason);
     }
 
     try {
@@ -440,8 +519,14 @@ HypStatus hyp_decode_block(HypModel model,
             kvstate->offset += 1;
         }
         // The StepResult captures the LAST step's token + cumulative near_tie_events
-        // across the block + peak memory (governor telemetry is 2.6).
-        hyperion::model::write_step_result(out_result, sample, near_tie_events);
+        // across the block + governor telemetry (M2-2.6b): peak/active MLX bytes,
+        // KV byte counts, and governor_state = READY.
+        const std::uint64_t peak = hyperion::governor::predict_peak(
+            n_tokens, kvstate->offset - n_tokens, *kvstate->kv, *model->geometry);
+        hyperion::model::write_step_result(
+            out_result, sample, near_tie_events,
+            HYP_GOVERNOR_READY, peak, mx::get_active_memory(),
+            decision.local_kv_bytes, decision.global_kv_bytes);
         return hyperion::model::ok();
     } catch (const std::bad_alloc&) {
         return hyperion::model::fail(

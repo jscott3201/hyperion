@@ -31,6 +31,7 @@ mlx_build_metallib(
 
 add_library(hyperion_mlx STATIC
     src/platform_policy.cc
+    src/governor.cc
     src/runtime.mm
     src/abi_error.cc
     src/geometry.cc
@@ -170,6 +171,15 @@ if(BUILD_TESTING)
     target_include_directories(hyperion_forward_12b_long_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_compile_options(hyperion_forward_12b_long_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME hyperion_forward_12b_long COMMAND hyperion_forward_12b_long_test)
+
+    # M5-gated: the M2-2.6b governor predictive admission (model-free tier: builds
+    # anywhere, runs only on the M5 with a live MLX memory counter). Self-skips
+    # (exit 0) when no GPU is available (CI).
+    add_executable(hyperion_governor_test tests/governor_test.cc)
+    target_link_libraries(hyperion_governor_test PRIVATE hyperion_mlx mlx)
+    target_include_directories(hyperion_governor_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_options(hyperion_governor_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME hyperion_governor COMMAND hyperion_governor_test)
 endif()
 
 install(TARGETS hyperion_mlx ARCHIVE DESTINATION lib)
