@@ -7,6 +7,7 @@
 #include "weights_loader.h"
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include <mlx/mlx.h>
@@ -47,6 +48,34 @@ class ForwardPass {
         const mlx::core::array& h,
         KvState& kvstate,
         std::uint32_t offset);
+
+    /// TEST-ONLY fault-injection forward pass for the G1 logit fault-boundary
+    /// calibration (08-correctness-and-verification.md §18-22). Identical to
+    /// ``forward`` EXCEPT at ``fault_layer``: that one layer's per-layer residual
+    /// scale (``layer_scalar``) is multiplied by ``layer_scalar_factor`` — a
+    /// single-layer structural perturbation (amplify/drop/negate the layer's
+    /// contribution to the residual stream). The attention pattern, RoPE, cache,
+    /// and every other layer are unchanged.
+    ///
+    /// WHY NOT RoPE-offset (the 08 "e.g." fault): a single-layer RoPE offset was
+    /// measured on the Gemma-4 12B and produces a logit delta AT OR BELOW the
+    /// engine noise floor (sig_rel ~0.019 vs clean ~0.021 — no separation; the
+    /// residual stream + QK-norm absorb a one-position rotation). 08:21 says
+    /// "Gemma numbers will differ; derive, don't port" — so the SEPARATING fault
+    /// is derived empirically. A ``layer_scalar × 5`` at layer 0 gives sig_rel
+    /// ~0.41 (~20× the noise floor, token-stable) — the derived fault this gate
+    /// calibrates against. This is a real single-layer structural fault, NOT a
+    /// quantization-noise proxy (08:23-25).
+    ///
+    /// ``forward`` (the production path) is UNCHANGED — this is a separate method the
+    /// fault-boundary test calls; the token-exact 2.3b/2.7 seal is untouched. NOT an
+    /// ABI function (no ``extern "C"``, not in the ratchet count).
+    [[nodiscard]] mlx::core::array forward_faulted(
+        const mlx::core::array& h,
+        KvState& kvstate,
+        std::uint32_t offset,
+        std::size_t fault_layer,
+        float layer_scalar_factor);
 
     /// Final RMSNorm (``model.norm``). Public so the 2.7 epilogue can reuse it.
     [[nodiscard]] mlx::core::array final_norm(const mlx::core::array& h) const;
@@ -143,12 +172,16 @@ class ForwardPass {
 
   private:
     /// One decoder layer (the 4-norm sandwich + attention + MLP + layer_scalar).
+    /// ``layer_scalar_factor`` (test-only, G1 fault-boundary): when set, multiplies
+    /// this layer's per-layer residual scale (``layer_scalar``) by ``*factor`` —
+    /// the single-layer structural fault. Unset → production path (bit-identical).
     [[nodiscard]] mlx::core::array decoder_layer(
         const mlx::core::array& x,
         std::size_t layer,
-        const mlx::core::array& mask,
+        const mx::array& mask,
         KvState& kvstate,
-        std::uint32_t offset);
+        std::uint32_t offset,
+        std::optional<float> layer_scalar_factor = std::nullopt);
 
     /// One attention block: Q/K/V proj → QK-norm (q/k scaled, v unscaled) → RoPE (q,k) →
     /// append to cache → SDPA(scale=1.0) → o_proj. Reads the chunk K/V (offset 0). Returns

@@ -313,7 +313,8 @@ mx::array ForwardPass::decoder_layer(
     std::size_t layer,
     const mx::array& mask,
     KvState& kvstate,
-    std::uint32_t offset) {
+    std::uint32_t offset,
+    std::optional<float> layer_scalar_factor) {
     const LayerWeights& lw = weights_.layers[layer];
 
     // Gemma 2 pre/post sandwich: norm the BRANCH OUTPUT before the residual add.
@@ -330,7 +331,14 @@ mx::array ForwardPass::decoder_layer(
     h = mx::add(residual, h, stream_);
 
     // Per-layer residual scale (04). layer_scalar is [] or [1]; broadcast over hidden.
-    h = mx::multiply(h, lw.layer_scalar, stream_);
+    // The G1 fault-boundary test (forward_faulted) multiplies this layer's scalar by
+    // ``layer_scalar_factor`` — the single-layer structural fault. The production path
+    // (factor == nullopt) is bit-identical (multiply by the raw layer_scalar).
+    mx::array scalar = lw.layer_scalar;
+    if (layer_scalar_factor.has_value()) {
+        scalar = mx::multiply(scalar, mx::array(*layer_scalar_factor, scalar.dtype()), stream_);
+    }
+    h = mx::multiply(h, scalar, stream_);
     return h;
 }
 
@@ -354,6 +362,41 @@ mx::array ForwardPass::forward(const mx::array& h, KvState& kvstate, std::uint32
             (offset > 0 && kind == LayerType::Sliding) ? std::min(win, committed) : committed;
         mx::array mask = build_mask(kind, q_len, kv_len, offset);
         state = decoder_layer(state, layer, mask, kvstate, offset);
+    }
+    return final_norm(state);
+}
+
+mx::array ForwardPass::forward_faulted(
+    const mx::array& h,
+    KvState& kvstate,
+    std::uint32_t offset,
+    std::size_t fault_layer,
+    float layer_scalar_factor) {
+    // Duplicate of forward()'s loop body (kept in sync by reading the same geometry
+    // + dispatch). The ONLY difference: at fault_layer, decoder_layer multiplies that
+    // layer's per-layer residual scale (layer_scalar) by layer_scalar_factor — the
+    // single-layer structural fault. The mask is built with the REAL offset at every
+    // layer (the attention pattern is unchanged), so the kv_len computation below is
+    // identical to forward().
+    const int L = static_cast<int>(h.shape(1));
+    const std::uint32_t q_len = static_cast<std::uint32_t>(L);
+    const std::uint32_t committed = offset + q_len;
+    const std::uint32_t win = geometry_.sliding_window;
+    mx::array state = h;
+    for (std::size_t layer = 0; layer < weights_.layers.size(); ++layer) {
+        const LayerType kind = dispatch_.per_layer[layer];
+        const std::uint32_t kv_len =
+            (offset > 0 && kind == LayerType::Sliding) ? std::min(win, committed) : committed;
+        mx::array mask = build_mask(kind, q_len, kv_len, offset);
+        // The faulted layer's per-layer residual scale is multiplied by
+        // layer_scalar_factor (the single-layer structural fault); every other layer
+        // passes nullopt → decoder_layer uses the raw layer_scalar (bit-identical to
+        // the production path).
+        const std::optional<float> factor =
+            (layer == fault_layer)
+                ? std::optional<float>(layer_scalar_factor)
+                : std::nullopt;
+        state = decoder_layer(state, layer, mask, kvstate, offset, factor);
     }
     return final_norm(state);
 }

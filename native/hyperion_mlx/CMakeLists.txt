@@ -172,6 +172,19 @@ if(BUILD_TESTING)
     target_compile_options(hyperion_forward_12b_long_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME hyperion_forward_12b_long COMMAND hyperion_forward_12b_long_test)
 
+    # M5-gated: the G1 logit fault-boundary gate (M2 completion — the "two-sided logit
+    # thresholds, derived" half of 10-milestones-and-gates.md:33). Loads the REAL 12B +
+    # BOTH the clean (12b_greedy_golden) + faulted (12b_faulted_greedy_golden) goldens,
+    # runs forward() (clean) + forward_faulted() (layer 0 layer_scalar × 5), and gates
+    # three sig_rel measurements against the derived threshold (sqrt(clean×fault)).
+    # Builds wherever MLX/Metal link; runs only on the self-hosted M5. Self-skips
+    # (exit 0) when HYPERION_12B_ARTIFACT is unset (CI) or a golden is absent.
+    add_executable(hyperion_forward_12b_fault_boundary_test tests/forward_12b_fault_boundary_test.cc)
+    target_link_libraries(hyperion_forward_12b_fault_boundary_test PRIVATE hyperion_mlx mlx)
+    target_include_directories(hyperion_forward_12b_fault_boundary_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_options(hyperion_forward_12b_fault_boundary_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME hyperion_forward_12b_fault_boundary COMMAND hyperion_forward_12b_fault_boundary_test)
+
     # M5-gated: the M2-2.6b governor predictive admission (model-free tier: builds
     # anywhere, runs only on the M5 with a live MLX memory counter). Self-skips
     # (exit 0) when no GPU is available (CI).
