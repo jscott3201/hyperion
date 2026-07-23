@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -49,6 +50,18 @@ void prefill_append_local(
     }
 }
 
+/// Read ``n`` cached tokens from a cache buffer ``[cap, h, d]`` (no batch dim) as
+/// ``[B=1, h, n, d]`` for the SDPA: slice ``[0:n]`` → reshape ``[1, n, h, d]`` →
+/// transpose ``{0,2,1,3}``. The reverse of the append path's squeeze. ``n`` must
+/// be ≤ capacity and, for a local ring, in the linear (un-rotated) region
+/// (``slot_for(pos) == pos`` for ``pos < capacity``) — the rotation read past the
+/// window is 2.6.
+mx::array read_kv_view(const mx::array& buf, std::uint32_t n, int h, int d, mx::Stream s) {
+    const auto nn = static_cast<int>(n);
+    mx::array sl = mx::slice(buf, {0, 0, 0}, {nn, h, d}, {1, 1, 1}, s); // [n, h, d]
+    mx::array r = mx::reshape(sl, {1, nn, h, d}, s);                      // [1, n, h, d]
+    return mx::transpose(r, {0, 2, 1, 3}, s);                             // [1, h, n, d]
+}
 
 } // namespace
 
@@ -96,6 +109,60 @@ mx::array ForwardPass::embed(const mx::array& ids) const {
 
 mx::array ForwardPass::final_norm(const mx::array& h) const {
     return rms_norm(h, std::optional<mx::array>(weights_.final_norm), eps_, stream_);
+}
+
+mx::array ForwardPass::lm_head(const mx::array& h) const {
+    // Tied lm_head: the quantized embed table IS the lm_head weight, stored
+    // [vocab, hidden] = [out, in] (the QuantizedLinear::w layout). transpose=true
+    // fuses dequant + the transposed matmul → [B, L, vocab] logits. No manual
+    // transpose, no full-table dequant (the q/k/v/o path, weights.h).
+    return mx::quantized_matmul(
+        h,
+        weights_.embed_weight,
+        weights_.embed_scales,
+        std::optional<mx::array>(weights_.embed_biases),
+        /*transpose=*/true,
+        std::optional<int>(weights_.embed_group_size),
+        std::optional<int>(weights_.embed_bits),
+        /*mode=*/"affine",
+        stream_);
+}
+
+mx::array ForwardPass::softcap(const mx::array& logits) const {
+    // mlx-lm logit_softcap: tanh(x / softcap) * softcap, no fp32 cast (operates
+    // in the lm_head output dtype). final_logit_softcapping = 30.0 for Gemma 4.
+    const float sc = geometry_.final_logit_softcapping;
+    mx::array scaled = mx::divide(logits, mx::array(sc, logits.dtype()), stream_);
+    return mx::multiply(mx::tanh(scaled, stream_), mx::array(sc, logits.dtype()), stream_);
+}
+
+ForwardPass::GreedySample ForwardPass::sample_greedy(const mx::array& logits_last) const {
+    // THE 2.3b LESSON: MLX lazy-graph mx::argmax/mx::max scalars go STALE across
+    // repeated evals in a decode loop (graph-cache aliasing). Read raw contiguous
+    // data<float>() pointers and host-scan for top-1 AND top-2 in one pass. This
+    // is the load-bearing choice in the slice (the seam): a GPU mx::argmax+topk
+    // port would risk the stale-scalar bug; the 262144-vocab CPU scan is a G2
+    // perf flag, not a block.
+    const mx::Stream cs = mx::default_stream(mx::Device::cpu);
+    mx::array lf = mx::astype(mx::contiguous(logits_last, false, cs), mx::float32, cs);
+    mx::eval(lf); // MLX lazy-graph materialization (NOT JS/Python eval): force-eval before data<float>().
+    const float* p = lf.data<float>();
+    const std::size_t n = lf.size();
+    float top1 = -std::numeric_limits<float>::infinity();
+    float top2 = -std::numeric_limits<float>::infinity();
+    std::uint32_t arg = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const float v = p[i];
+        if (v > top1) {
+            top2 = top1;
+            top1 = v;
+            arg = static_cast<std::uint32_t>(i);
+        } else if (v > top2) {
+            top2 = v;
+        }
+    }
+    // near_tie = top-2 logit gap < 0.5 (A1, 08:49 — the near_tie_events counter).
+    return GreedySample{arg, top1, (top1 - top2) < 0.5F};
 }
 
 mx::array ForwardPass::gelu_tanh(const mx::array& x) const {
@@ -202,8 +269,15 @@ ForwardPass::AttentionInternals ForwardPass::attention(
     // reshape-for-append, for parity debugging.
     mx::array k_post = k;
     mx::array v_post = v;
-    mx::array k_append = mx::reshape(k, {L, n_kv_heads, head_dim}, stream_);
-    mx::array v_append = mx::reshape(v, {L, n_kv_heads, head_dim}, stream_);
+    // k/v are [B=1, n_kv_heads, L, head_dim] (post-transpose). The cache slot layout is
+    // [n_kv_heads, head_dim] per position → append needs [L, n_kv_heads, head_dim].
+    // reshape([1,nkv,L,hd] → [L,nkv,hd]) would SCRAMBLE (reinterprets the flat buffer
+    // with nkv and L swapped); transpose to [1,L,nkv,hd] FIRST so the flat order matches
+    // [L,nkv,hd]. For nkv==1 (global) this is a no-op (size-1 axis) — which is why the
+    // 2.3b global path was fine and only the sliding (nkv>1) cache was scrambled. The
+    // offset==0 SDPA read chunk-local k (not the cache) so 2.3b never exercised this.
+    mx::array k_append = mx::reshape(mx::transpose(k, {0, 2, 1, 3}, stream_), {L, n_kv_heads, head_dim}, stream_);
+    mx::array v_append = mx::reshape(mx::transpose(v, {0, 2, 1, 3}, stream_), {L, n_kv_heads, head_dim}, stream_);
     if (ref.kind == LayerType::Sliding) {
         LocalKvCache& cache = kvstate.local[ref.per_kind_index];
         prefill_append_local(cache, k_append, v_append, L, n_kv_heads, head_dim, stream_);
@@ -212,12 +286,42 @@ ForwardPass::AttentionInternals ForwardPass::attention(
         cache.append(k_append, v_append, static_cast<std::uint32_t>(L));
     }
 
-    // 2.3a: attend over the chunk's own K/V (offset 0 prefill). The cached-prefix read
-    // (kv_len = offset+L) is 2.6; here kv_len == L. scale=1.0 — Gemma 4 drops the 1/sqrt(d)
-    // scaling (QK-norm compensates); follow the reference exactly.
+    // SDPA K/V: offset==0 attends over the chunk's own post-rope K/V (the 2.3b
+    // bit-exact path, UNCHANGED — do not risk the proven seal). offset>0 (decode)
+    // reads the full cached prefix INCL. this chunk's just-appended K/V from the
+    // cache buffers — the cached-prefix attention read (2.7). The sliding ring is
+    // in its linear region for pos < window (slot_for(pos) == pos); the rotation
+    // read past the window is 2.6. attn_len == committed == offset + L.
+    mx::array k_attn = k;
+    mx::array v_attn = v;
+    if (offset > 0) {
+        if (ref.kind == LayerType::Sliding) {
+            LocalKvCache& cache = kvstate.local[ref.per_kind_index];
+            // Linear region only: ``read_kv_view`` slices ``[0:attn]`` from the
+            // ``[cap, h, d]`` ring, which is correct only while ``attn <= cap``
+            // (no rotation; the mask zeroes out-of-window positions for
+            // ``window < attn <= cap``). Past ``cap`` the read is OOB and the ring
+            // has rotated — the rotation-aware read is M2-2.6. Fail LOUD here (a
+            // thrown error beats silent corruption) so a long context can't reach
+            // 2.6's machinery unguarded.
+            const std::uint32_t attn = cache.attention_len();
+            if (attn > cache.capacity()) {
+                throw std::runtime_error(
+                    "local KV ring capacity exceeded at the offset>0 attention read "
+                    "(long-context rotation read is M2-2.6)");
+            }
+            k_attn = read_kv_view(cache.keys(), attn, n_kv_heads, head_dim, stream_);
+            v_attn = read_kv_view(cache.values(), attn, n_kv_heads, head_dim, stream_);
+        } else {
+            GlobalKvCache& cache = kvstate.global[ref.per_kind_index];
+            k_attn = read_kv_view(cache.keys(), cache.committed_len(), n_kv_heads, head_dim, stream_);
+            v_attn = read_kv_view(cache.values(), cache.committed_len(), n_kv_heads, head_dim, stream_);
+        }
+    }
+    // scale=1.0 — Gemma 4 drops the 1/sqrt(d) scaling (QK-norm compensates).
     const std::string mask_mode = ""; // explicit boolean mask via mask_arr
     mx::array out = mx::fast::scaled_dot_product_attention(
-        q, k, v,
+        q, k_attn, v_attn,
         /*scale=*/1.0F,
         mask_mode,
         std::optional<mx::array>(mask),
@@ -255,14 +359,16 @@ mx::array ForwardPass::decoder_layer(
 }
 
 mx::array ForwardPass::forward(const mx::array& h, KvState& kvstate, std::uint32_t offset) {
-    // 2.3a: offset 0 prefill only (the cached-prefix attention read is 2.6).
-    assert(offset == 0 && "M2-2.3a forward supports offset 0 (cached-prefix read is 2.6)");
+    // offset 0 = fresh prefill (2.3b bit-exact path); offset>0 = decode/cached-prefix
+    // read (2.7). kv_len for the mask = the full attention read = offset + L (the
+    // cached prefix incl. this chunk). For offset==0 this collapses to L (unchanged).
     const int L = static_cast<int>(h.shape(1));
+    const std::uint32_t q_len = static_cast<std::uint32_t>(L);
+    const std::uint32_t kv_len = offset + q_len;
     mx::array state = h;
     for (std::size_t layer = 0; layer < weights_.layers.size(); ++layer) {
         const LayerType kind = dispatch_.per_layer[layer];
-        const std::uint32_t kv_len = static_cast<std::uint32_t>(L);
-        mx::array mask = build_mask(kind, static_cast<std::uint32_t>(L), kv_len, offset);
+        mx::array mask = build_mask(kind, q_len, kv_len, offset);
         state = decoder_layer(state, layer, mask, kvstate, offset);
     }
     return final_norm(state);
