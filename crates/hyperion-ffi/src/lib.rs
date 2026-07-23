@@ -192,6 +192,19 @@ mod raw {
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
+    pub struct HypSamplingConfig {
+        pub temperature: f32,
+        pub top_k: i32,
+        pub top_p: f32,
+        pub min_p: f32,
+        pub seed: u64,
+    }
+
+    /// M3 sampler: the number of top-k logprobs returned per step.
+    pub const HYP_TOP_K_LOGPROBS: usize = 8;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
     pub struct HypStepResultFields {
         pub token_id: u32,
         pub logit: f32,
@@ -204,6 +217,9 @@ mod raw {
         pub global_kv_eval_ms: f32,
         pub governor_state: c_int,
         pub near_tie_events: u32,
+        pub top_k_logprob_count: u32,
+        pub top_k_logprob_ids: [u32; HYP_TOP_K_LOGPROBS],
+        pub top_k_logprob_values: [f32; HYP_TOP_K_LOGPROBS],
     }
 
     unsafe extern "C" {
@@ -228,6 +244,20 @@ mod raw {
             n_tokens: u32,
             out_result: HypStepResult,
         ) -> c_int;
+        pub fn hyp_prefill_chunk_sampled(
+            model: HypModel,
+            kvstate: HypKvState,
+            tokens: *const HypTokenStream,
+            config: *const HypSamplingConfig,
+            out_result: HypStepResult,
+        ) -> c_int;
+        pub fn hyp_decode_block_sampled(
+            model: HypModel,
+            kvstate: HypKvState,
+            n_tokens: u32,
+            config: *const HypSamplingConfig,
+            out_result: HypStepResult,
+        ) -> c_int;
         pub fn hyp_step_result_create(out_result: *mut HypStepResult) -> c_int;
         pub fn hyp_step_result_free(result: *mut HypStepResult) -> c_int;
     }
@@ -237,8 +267,9 @@ mod raw {
 // and bench (G1 harness) build and pass; re-export them from the crate root.
 pub use raw::{
     HYP_GEMMA4_TEXT, HYP_GEMMA4_UNIFIED_TEXT, HYP_GOVERNOR_HARD_REJECT, HYP_GOVERNOR_READY,
-    HYP_GOVERNOR_SOFT_PAUSED, HYP_LAYER_FULL, HYP_LAYER_SLIDING, HypGeometryParams, HypMoeConfig,
-    HypRopeSpec, HypStepResultFields, HypTokenStream,
+    HYP_GOVERNOR_SOFT_PAUSED, HYP_LAYER_FULL, HYP_LAYER_SLIDING, HYP_TOP_K_LOGPROBS,
+    HypGeometryParams, HypMoeConfig, HypRopeSpec, HypSamplingConfig, HypStepResultFields,
+    HypTokenStream,
 };
 
 /// Stable native status taxonomy.
@@ -510,6 +541,44 @@ impl KvState {
         }
         Ok(())
     }
+
+    /// M3 sampler: prefill a prompt chunk with a sampling config (NULL = greedy, the
+    /// G1 token-exact default). `config` is None for the greedy path.
+    pub fn prefill_chunk_sampled(
+        &self,
+        model: &Model,
+        tokens: &HypTokenStream,
+        config: Option<&HypSamplingConfig>,
+        result: &StepResult,
+    ) -> Result<(), Error> {
+        let cfg = config.map_or(std::ptr::null(), |c| c as *const _);
+        // SAFETY: model/kvstate/result valid; `tokens` + `cfg` outlive the call.
+        let status =
+            unsafe { raw::hyp_prefill_chunk_sampled(model.0, self.0, tokens, cfg, result.0) };
+        if status != raw::HYP_STATUS_OK {
+            return Err(native_error(status));
+        }
+        Ok(())
+    }
+
+    /// M3 sampler: decode `n_tokens` with a sampling config (None = greedy). The per-
+    /// request `seed` (in `config`) yields a reproducible token stream.
+    pub fn decode_block_sampled(
+        &self,
+        model: &Model,
+        n_tokens: u32,
+        config: Option<&HypSamplingConfig>,
+        result: &StepResult,
+    ) -> Result<(), Error> {
+        let cfg = config.map_or(std::ptr::null(), |c| c as *const _);
+        // SAFETY: model/kvstate/result valid.
+        let status =
+            unsafe { raw::hyp_decode_block_sampled(model.0, self.0, n_tokens, cfg, result.0) };
+        if status != raw::HYP_STATUS_OK {
+            return Err(native_error(status));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for KvState {
@@ -587,10 +656,31 @@ mod tests {
         assert_eq!(std::mem::size_of::<raw::HypTokenStream>(), 16);
         assert_eq!(std::mem::offset_of!(raw::HypTokenStream, tokens), 0);
         assert_eq!(std::mem::offset_of!(raw::HypTokenStream, count), 8);
-        assert_eq!(std::mem::size_of::<raw::HypStepResultFields>(), 64);
+        // M3 sampler: HypSamplingConfig { f32, i32, f32, f32, u64 } — the u64 seed forces
+        // 8-byte alignment: 4+4+4+4 = 16, then u64 at 16 → 24. (temperature/top_k/top_p/
+        // min_p in the first 16 bytes, seed at 16.)
+        assert_eq!(std::mem::size_of::<raw::HypSamplingConfig>(), 24);
+        assert_eq!(std::mem::offset_of!(raw::HypSamplingConfig, seed), 16);
+        // HypStepResultFields grew by the M3 top-k logprob sidecar: top_k_logprob_count
+        // (u32) + ids[8] (u32×8) + values[8] (f32×8). The struct's 8-byte alignment (from
+        // the u64 telemetry fields) pads near_tie_events (offset 56, ends 60) to 64, so
+        // top_k_logprob_count lands at 64, ids at 68, values at 100, total 136.
+        assert_eq!(std::mem::size_of::<raw::HypStepResultFields>(), 136);
         assert_eq!(
             std::mem::offset_of!(raw::HypStepResultFields, peak_mlx_bytes),
             8
+        );
+        assert_eq!(
+            std::mem::offset_of!(raw::HypStepResultFields, top_k_logprob_count),
+            64
+        );
+        assert_eq!(
+            std::mem::offset_of!(raw::HypStepResultFields, top_k_logprob_ids),
+            68
+        );
+        assert_eq!(
+            std::mem::offset_of!(raw::HypStepResultFields, top_k_logprob_values),
+            100
         );
         assert_eq!(
             std::mem::offset_of!(raw::HypStepResultFields, governor_state),

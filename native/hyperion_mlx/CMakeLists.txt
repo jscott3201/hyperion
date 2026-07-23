@@ -185,6 +185,17 @@ if(BUILD_TESTING)
     target_compile_options(hyperion_forward_12b_fault_boundary_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME hyperion_forward_12b_fault_boundary COMMAND hyperion_forward_12b_fault_boundary_test)
 
+    # M5-gated: the M3 sampler-surface validation (sampled mode, 03 §Sampling). Validates
+    # the greedy default (byte-identical to the G1 seal), seeded reproducibility (host
+    # std::mt19937_64), statistical faithfulness (softmax within the 2.6c threshold), and
+    # filter behavior (top_k=1 → argmax). Builds wherever MLX/Metal link; runs only on the
+    # M5. Self-skips (exit 0) when HYPERION_12B_ARTIFACT is unset (CI) or the golden is absent.
+    add_executable(hyperion_sampler_test tests/sampler_test.cc)
+    target_link_libraries(hyperion_sampler_test PRIVATE hyperion_mlx mlx)
+    target_include_directories(hyperion_sampler_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_options(hyperion_sampler_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME hyperion_sampler COMMAND hyperion_sampler_test)
+
     # M5-gated LEAN decode bench for the M2-2.6d mx::compile slice (the "decode within
     # 0.9x of M1 stock" gate). NOT a ctest (not in --model-free nor --all — it's a bench,
     # not a pass/fail test); run manually. Records token_offsets_ns (mirrors the M1 worker)

@@ -6,6 +6,7 @@
 #include "rope.h"
 #include "weights_loader.h"
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <vector>
@@ -115,6 +116,34 @@ class ForwardPass {
     /// stale-scalar bug; the 262144-vocab CPU scan is a G2 perf flag, not a block.)
     /// This is the load-bearing choice in the slice — the seam.
     [[nodiscard]] GreedySample sample_greedy(const mlx::core::array& logits_last) const;
+
+    /// ── M3 sampler surface (sampled mode, 03 §Sampling) ────────────────────────
+    /// A sampled token + its top-k logprobs. ``logit`` is the WINNING post-softcap
+    /// logit (the sampled token's, for telemetry); ``top_k_logprobs`` is the
+    /// ≤``HYP_TOP_K_LOGPROBS`` highest-logit (ids, logprobs), sorted descending —
+    /// the small sidecar that crosses the ABI (03:105-106: NOT the full frame).
+    struct StochasticSample {
+        std::uint32_t token_id;
+        float logit;
+        std::uint32_t top_k_count;
+        std::array<std::uint32_t, HYP_TOP_K_LOGPROBS> top_k_ids;
+        std::array<float, HYP_TOP_K_LOGPROBS> top_k_logprobs;
+    };
+    /// ``logits_last`` is ``[vocab]`` (one position, post-softcap), same input as
+    /// ``sample_greedy``. ``cfg`` drives the sampled epilogue: temperature scaling,
+    /// then the mlx-lm filter order (top-p, min-p, top-k) as ``-inf`` masks, then a
+    /// host-side softmax + seeded categorical draw (``std::mt19937_64``).
+    ///
+    /// REUSES the 2.3b host-scan seam: ``astype(contiguous, float32, CPU)`` →
+    /// ``eval`` → ``data<float>()`` — NO ``mx::argmax``/``mx::random`` graph scalars
+    /// (the stale-scalar bug). The RNG is a per-request seeded host PRNG
+    /// (statistical-faithfulness bar per 08 §35-37 + the M2-2.6c fault-boundary
+    /// threshold; NOT bit-exact vs mlx-lm — C++/Metal vs MLX FP reduction order
+    /// differs, so seeded-token-exact draws against the oracle are out of scope).
+    [[nodiscard]] StochasticSample sample_stochastic(
+        const mlx::core::array& logits_last,
+        const HypSamplingConfig& cfg,
+        std::uint64_t rng_state) const;
     ///@}
 
     /// The attention mask for one kind, shape ``[q_len, kv_len]`` boolean (True = attend).

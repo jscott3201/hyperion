@@ -32,4 +32,17 @@ void write_step_result(
     std::uint64_t local_kv_bytes,
     std::uint64_t global_kv_bytes);
 
+/// M3 sampler: write the STOCHASTIC sample + governor telemetry + the top-k logprob
+/// sidecar. Same telemetry fields as write_step_result, plus the ≤HYP_TOP_K_LOGPROBS
+/// top-k ids/logprobs from the StochasticSample. near_tie_events is 0 for the sampled
+/// path (near-tie is a greedy-only metric). Defined in model.cc.
+void write_step_result_sampled(
+    HypStepResult result,
+    const ForwardPass::StochasticSample& sample,
+    HypGovernorState governor_state,
+    std::uint64_t peak_mlx_bytes,
+    std::uint64_t active_mlx_bytes,
+    std::uint64_t local_kv_bytes,
+    std::uint64_t global_kv_bytes);
+
 } // namespace hyperion::model

@@ -4,6 +4,8 @@
 #include <cassert>
 #include <cmath>
 #include <limits>
+#include <numeric>
+#include <random>
 #include <stdexcept>
 #include <utility>
 
@@ -133,6 +135,139 @@ ForwardPass::GreedySample ForwardPass::sample_greedy(const mx::array& logits_las
     }
     // near_tie = top-2 logit gap < 0.5 (A1, 08:49 — the near_tie_events counter).
     return GreedySample{arg, top1, (top1 - top2) < 0.5F};
+}
+
+ForwardPass::StochasticSample ForwardPass::sample_stochastic(
+    const mx::array& logits_last,
+    const HypSamplingConfig& cfg,
+    std::uint64_t rng_state) const {
+    // REUSES the 2.3b host-scan seam (sample_greedy): contiguous f32 on the CPU stream,
+    // eval, then raw data<float>(). NO mx::argmax/mx::random graph scalars (the stale-
+    // scalar bug). All filter/sort/softmax/draw work is over the host float* vector.
+    const mx::Stream cs = mx::default_stream(mx::Device::cpu);
+    mx::array lf = mx::astype(mx::contiguous(logits_last, false, cs), mx::float32, cs);
+    mx::eval(lf); // MLX lazy-graph materialization (NOT JS/Python eval).
+    const std::size_t n = lf.size();
+    const float* src = lf.data<float>();
+
+    // Greedy default: temperature == 0 → the argmax (byte-identical to sample_greedy's
+    // top-1). This also guards against a direct call with temp==0 (1/0 = inf would NaN
+    // the logits); run_epilogue_sampled routes temp==0 here too. Fill the top-k sidecar.
+    if (cfg.temperature == 0.0F) {
+        StochasticSample out{};
+        float top1 = -std::numeric_limits<float>::infinity();
+        for (std::size_t i = 0; i < n; ++i) if (src[i] > top1) { top1 = src[i]; out.token_id = static_cast<std::uint32_t>(i); }
+        out.logit = top1;
+        std::vector<std::uint32_t> idx(n);
+        std::iota(idx.begin(), idx.end(), 0);
+        std::partial_sort(idx.begin(), idx.begin() + HYP_TOP_K_LOGPROBS, idx.end(),
+                          [&](std::uint32_t a, std::uint32_t b) { return src[a] > src[b]; });
+        out.top_k_count = std::min<std::size_t>(HYP_TOP_K_LOGPROBS, n);
+        for (std::size_t i = 0; i < out.top_k_count; ++i) {
+            out.top_k_ids[i] = idx[i]; out.top_k_logprobs[i] = src[idx[i]];
+        }
+        return out;
+    }
+
+    std::vector<float> logits(src, src + n);
+
+    // Temperature: logits *= (1/temperature). temp > 0 is validated by the caller.
+    const float inv_temp = 1.0F / cfg.temperature;
+    for (float& v : logits) v *= inv_temp;
+
+    // ── mlx-lm filter order (sample_utils.py): top-p, min-p, top-k — each sets the
+    //    losers to -inf (a mask), NOT a removal. All over the host vector. ──
+    // First compute the softmax probabilities (post-temp, pre-filter) for the
+    // mass-based filters (top-p, min-p need probs).
+    float max_l = -std::numeric_limits<float>::infinity();
+    for (float v : logits) max_l = std::max(max_l, v);
+    std::vector<float> probs(n);
+    float z = 0.0F;
+    for (std::size_t i = 0; i < n; ++i) {
+        probs[i] = std::exp((logits[i] - max_l));
+        z += probs[i];
+    }
+    if (z > 0.0F) for (float& p : probs) p /= z;
+
+    // top-p (nucleus): sort ascending by prob, cumsum, keep the smallest set whose
+    // cumulative mass >= top_p (the nucleus). Set the rest to -inf. mlx-lm keeps the
+    // tokens where cumsum <= 1 - top_p removed; equivalently the nucleus is the top
+    // tokens summing to >= top_p. We mark non-nucleus logits -inf.
+    if (cfg.top_p > 0.0F && cfg.top_p <= 1.0F) {
+        // indices sorted by prob descending
+        std::vector<std::uint32_t> idx(n);
+        std::iota(idx.begin(), idx.end(), 0);
+        std::sort(idx.begin(), idx.end(), [&](std::uint32_t a, std::uint32_t b) { return probs[a] > probs[b]; });
+        float cum = 0.0F;
+        std::vector<char> in_nucleus(n, 0);
+        for (std::uint32_t i : idx) {
+            in_nucleus[i] = 1;
+            cum += probs[i];
+            if (cum >= cfg.top_p) break;
+        }
+        for (std::size_t i = 0; i < n; ++i) if (!in_nucleus[i]) logits[i] = -std::numeric_limits<float>::infinity();
+    }
+    // min-p: keep tokens with prob >= min_p * max_prob. Set the rest to -inf.
+    if (cfg.min_p > 0.0F && cfg.min_p < 1.0F) {
+        float max_prob = 0.0F;
+        for (float p : probs) max_prob = std::max(max_prob, p);
+        const float threshold = cfg.min_p * max_prob;
+        for (std::size_t i = 0; i < n; ++i) if (probs[i] < threshold) logits[i] = -std::numeric_limits<float>::infinity();
+    }
+    // top-k: keep the top-k logits; set the rest to -inf. partial_sort by logit desc.
+    if (cfg.top_k > 0 && static_cast<std::uint32_t>(cfg.top_k) < n) {
+        std::vector<std::uint32_t> idx(n);
+        std::iota(idx.begin(), idx.end(), 0);
+        std::partial_sort(idx.begin(), idx.begin() + cfg.top_k, idx.end(),
+                          [&](std::uint32_t a, std::uint32_t b) { return logits[a] > logits[b]; });
+        std::vector<char> keep(n, 0);
+        for (int32_t i = 0; i < cfg.top_k; ++i) keep[idx[i]] = 1;
+        for (std::size_t i = 0; i < n; ++i) if (!keep[i]) logits[i] = -std::numeric_limits<float>::infinity();
+    }
+
+    // ── Softmax over the (filtered, temp-scaled) logits, then a seeded categorical
+    //    draw via inverse-CDF on a host PRNG (std::mt19937_64). ──
+    float fmax = -std::numeric_limits<float>::infinity();
+    for (float v : logits) fmax = std::max(fmax, v);
+    std::vector<float> sp(n);
+    float sz = 0.0F;
+    for (std::size_t i = 0; i < n; ++i) {
+        sp[i] = (logits[i] == -std::numeric_limits<float>::infinity()) ? 0.0F : std::exp(logits[i] - fmax);
+        sz += sp[i];
+    }
+    // Draw a uniform in [0, sz) from the seeded PRNG. std::mt19937_64 — host-side,
+    // per-request reproducible (same seed → same stream).
+    std::mt19937_64 rng(rng_state);
+    std::uniform_real_distribution<float> uni(0.0F, sz);
+    const float u = uni(rng);
+    // Inverse-CDF search: the first index where the cumulative sum >= u.
+    float c = 0.0F;
+    std::uint32_t arg = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        c += sp[i];
+        if (u <= c) { arg = static_cast<std::uint32_t>(i); break; }
+        arg = static_cast<std::uint32_t>(i); // fallback (FP roundoff at the tail)
+    }
+
+    // ── Top-k logprob sidecar (the ≤HYP_TOP_K_LOGPROBS highest logits, sorted desc).
+    //    Computed from the PRE-filter logits (the raw post-softcap logprobs, not the
+    //    filtered -inf ones) — the caller asked for the top-k logprobs, not the
+    //    nucleus. Reuse the pre-filter `lf` (the original post-softcap vector).
+    StochasticSample out{};
+    out.token_id = arg;
+    out.logit = src[arg];
+    {
+        std::vector<std::uint32_t> idx(n);
+        std::iota(idx.begin(), idx.end(), 0);
+        std::partial_sort(idx.begin(), idx.begin() + HYP_TOP_K_LOGPROBS, idx.end(),
+                          [&](std::uint32_t a, std::uint32_t b) { return src[a] > src[b]; });
+        out.top_k_count = std::min<std::size_t>(HYP_TOP_K_LOGPROBS, n);
+        for (std::size_t i = 0; i < out.top_k_count; ++i) {
+            out.top_k_ids[i] = idx[i];
+            out.top_k_logprobs[i] = src[idx[i]];
+        }
+    }
+    return out;
 }
 
 mx::array ForwardPass::gelu_tanh(const mx::array& x) const {

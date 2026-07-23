@@ -9,11 +9,15 @@
 #include "step_result_access.h"
 #include "weights_loader.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <new>
+#include <numeric>
 #include <string>
+#include <vector>
 #include <utility>
 #include <vector>
 
@@ -165,6 +169,79 @@ ForwardPass::GreedySample run_epilogue(ForwardPass& fwd, const mx::array& h, mx:
     return fwd.sample_greedy(last);
 }
 
+/// M3 sampler: validate a HypSamplingConfig. Returns nullopt on OK, or a status message
+/// on the 400-malformed cases (06 §error taxonomy): negative temperature, top_k > vocab,
+/// top_p outside (0,1], min_p outside (0,1). NULL config OR temperature == 0 is VALID
+/// (routes to the greedy default).
+std::optional<std::string> validate_sampling_config(const HypSamplingConfig* config, std::uint32_t vocab_size) {
+    if (config == nullptr || config->temperature == 0.0F) {
+        return std::nullopt; // greedy default — always valid
+    }
+    if (config->temperature < 0.0F) {
+        return "sampling temperature must be >= 0 (0 = greedy)";
+    }
+    if (config->top_k < 0) {
+        return "sampling top_k must be >= 0 (0 = disabled)";
+    }
+    if (config->top_k > 0 && static_cast<std::uint64_t>(config->top_k) > vocab_size) {
+        return "sampling top_k exceeds the vocabulary size";
+    }
+    if (!std::isnan(config->top_p) && (config->top_p < 0.0F || config->top_p > 1.0F)) {
+        return "sampling top_p must be in [0, 1] (0 = disabled)";
+    }
+    if (config->min_p < 0.0F || config->min_p >= 1.0F) {
+        return "sampling min_p must be in [0, 1) (0 = disabled)";
+    }
+    return std::nullopt;
+}
+
+/// M3 sampler: the sampled epilogue. Same lm_head + softcap + last-position slice as
+/// run_epilogue, but routes to sample_stochastic when config != NULL and
+/// config->temperature > 0. config == NULL OR temperature == 0 → the greedy path
+/// (sample_greedy), byte-identical to run_epilogue — the G1 token-exact seal. The
+/// seed is advanced per-call by the caller (per-request RNG state threaded across
+/// the decode loop). Returns a StochasticSample (token + top-k logprob sidecar).
+ForwardPass::StochasticSample run_epilogue_sampled(
+    ForwardPass& fwd, const mx::array& h, mx::Stream s,
+    const HypSamplingConfig* config, std::uint64_t rng_state) {
+    const int L = static_cast<int>(h.shape(1));
+    mx::array logits = fwd.lm_head(h);                 // [B, L, vocab]
+    logits = fwd.softcap(logits);                      // [B, L, vocab]
+    mx::array last = mx::slice(
+        logits,
+        {0, L - 1, 0},
+        {1, L, static_cast<int>(logits.shape(2))},
+        {1, 1, 1},
+        s);
+    if (config == nullptr || config->temperature == 0.0F) {
+        // Greedy default — build a StochasticSample from the greedy argmax so the
+        // caller's plumbing is uniform. The greedy path itself is byte-identical.
+        auto g = fwd.sample_greedy(last);
+        ForwardPass::StochasticSample out{};
+        out.token_id = g.token_id;
+        out.logit = g.logit;
+        // top-k sidecar from the same last-position frame (the greedy top-1 is the
+        // first entry; the rest are the next-highest — a partial_sort, same as the
+        // sampled path).
+        const mx::Stream cs = mx::default_stream(mx::Device::cpu);
+        mx::array lf = mx::astype(mx::contiguous(last, false, cs), mx::float32, cs);
+        mx::eval(lf);
+        const float* p = lf.data<float>();
+        const std::size_t n = lf.size();
+        std::vector<std::uint32_t> idx(n);
+        std::iota(idx.begin(), idx.end(), 0);
+        std::partial_sort(idx.begin(), idx.begin() + HYP_TOP_K_LOGPROBS, idx.end(),
+                          [&](std::uint32_t a, std::uint32_t b) { return p[a] > p[b]; });
+        out.top_k_count = std::min<std::size_t>(HYP_TOP_K_LOGPROBS, n);
+        for (std::size_t i = 0; i < out.top_k_count; ++i) {
+            out.top_k_ids[i] = idx[i];
+            out.top_k_logprobs[i] = p[idx[i]];
+        }
+        return out;
+    }
+    return fwd.sample_stochastic(last, *config, rng_state);
+}
+
 HypStepResultFields step_result_read(HypStepResult result) noexcept {
     if (result == nullptr || result->magic != kStepResultMagic) {
         return HypStepResultFields{};
@@ -196,6 +273,33 @@ void write_step_result(
     result->fields.global_kv_bytes = global_kv_bytes;
     result->fields.governor_state = governor_state;
     result->fields.near_tie_events = near_tie_events;
+}
+
+void write_step_result_sampled(
+    HypStepResult result,
+    const ForwardPass::StochasticSample& sample,
+    HypGovernorState governor_state,
+    std::uint64_t peak_mlx_bytes,
+    std::uint64_t active_mlx_bytes,
+    std::uint64_t local_kv_bytes,
+    std::uint64_t global_kv_bytes) {
+    if (result == nullptr || result->magic != kStepResultMagic) {
+        return;
+    }
+    result->fields = HypStepResultFields{};
+    result->fields.token_id = sample.token_id;
+    result->fields.logit = sample.logit;
+    result->fields.peak_mlx_bytes = peak_mlx_bytes;
+    result->fields.active_mlx_bytes = active_mlx_bytes;
+    result->fields.local_kv_bytes = local_kv_bytes;
+    result->fields.global_kv_bytes = global_kv_bytes;
+    result->fields.governor_state = governor_state;
+    result->fields.near_tie_events = 0u; // near-tie is a greedy-only metric
+    result->fields.top_k_logprob_count = sample.top_k_count;
+    for (std::size_t i = 0; i < sample.top_k_count; ++i) {
+        result->fields.top_k_logprob_ids[i] = sample.top_k_ids[i];
+        result->fields.top_k_logprob_values[i] = sample.top_k_logprobs[i];
+    }
 }
 
 } // namespace hyperion::model
@@ -535,6 +639,177 @@ HypStatus hyp_decode_block(HypModel model,
         return hyperion::model::fail(HYP_STATUS_INTERNAL, error.what());
     } catch (...) {
         return hyperion::model::fail(HYP_STATUS_INTERNAL, "hyp_decode_block failed with a non-standard exception");
+    }
+}
+
+// ── M3 sampler surface: the sampled ABI pair (03 §Sampling). config == NULL OR ──
+// temperature == 0 routes to the greedy path byte-identically (the G1 token-exact
+// seal). Non-NULL with temperature > 0 routes to sample_stochastic. The greedy
+// hyp_prefill_chunk/hyp_decode_block above are UNCHANGED (the seal binds to them).
+HypStatus hyp_prefill_chunk_sampled(HypModel model,
+                                    HypKvState kvstate,
+                                    const HypTokenStream* tokens,
+                                    const HypSamplingConfig* config,
+                                    HypStepResult out_result) {
+    // Validate the model handle FIRST (validate_sampling_config reads
+    // model->geometry->vocab_size, so the model must be valid before the config check).
+    auto status = hyperion::model::validate_model(model, "hyp_prefill_chunk_sampled");
+    if (status != HYP_STATUS_OK) return status;
+    status = hyperion::model::validate_kvstate(kvstate);
+    if (status != HYP_STATUS_OK) return status;
+    status = hyperion::model::validate_step_result(out_result);
+    if (status != HYP_STATUS_OK) return status;
+    // Validate the sampling config (the 400-malformed bucket, 06 §error taxonomy).
+    if (auto err = hyperion::model::validate_sampling_config(config, model->geometry->vocab_size); err.has_value()) {
+        return hyperion::model::fail(HYP_STATUS_INVALID_ARGUMENT, err->c_str());
+    }
+    // Greedy default: delegate to hyp_prefill_chunk (byte-identical, G1 seal). The greedy
+    // path fills near_tie_events; the sampled path does not — delegating keeps the greedy
+    // semantics exact without re-running the epilogue.
+    if (config == nullptr || config->temperature == 0.0F) {
+        return hyp_prefill_chunk(model, kvstate, tokens, out_result);
+    }
+    if (tokens == nullptr) {
+        return hyperion::model::fail(HYP_STATUS_INVALID_ARGUMENT, "tokens is null");
+    }
+    if (!model->loaded || model->fwd == nullptr || model->governor == nullptr) {
+        return hyperion::model::fail(HYP_STATUS_INVALID_ARGUMENT, "model is not loaded");
+    }
+    if (kvstate->offset != 0) {
+        return hyperion::model::fail(HYP_STATUS_INVALID_ARGUMENT, "prefill requires a fresh (offset 0) KV state");
+    }
+    try {
+        const mx::Stream s = *model->stream;
+        std::vector<int32_t> host_ids;
+        host_ids.reserve(tokens->count);
+        for (std::uint32_t i = 0; i < tokens->count; ++i) {
+            host_ids.push_back(static_cast<int32_t>(tokens->tokens[i]));
+        }
+        mx::array ids = mx::array(host_ids.data(), mx::Shape{static_cast<int>(tokens->count)}, mx::int32);
+        constexpr std::uint32_t kPrefillChunkSize = 2048;
+        hyperion::model::ForwardPass::StochasticSample sample{};
+        std::uint32_t offset = 0;
+        const std::uint32_t total = tokens->count;
+        while (offset < total) {
+            std::uint32_t take = std::min(kPrefillChunkSize, total - offset);
+            auto decision = model->governor->evaluate(take, offset, *kvstate->kv);
+            if (decision.admission == hyperion::governor::Admission::HardRejected) {
+                hyperion::model::write_step_result_sampled(
+                    out_result, sample, HYP_GOVERNOR_HARD_REJECT,
+                    decision.predicted_peak_bytes, mx::get_active_memory(),
+                    decision.local_kv_bytes, decision.global_kv_bytes);
+                return hyperion::model::fail(HYP_STATUS_OOM_GOVERNOR, decision.reason);
+            }
+            if (decision.admission == hyperion::governor::Admission::SoftPaused) {
+                take = std::max(std::uint32_t{1}, take / 2);
+                decision = model->governor->evaluate(take, offset, *kvstate->kv);
+                if (decision.admission == hyperion::governor::Admission::HardRejected) {
+                    hyperion::model::write_step_result_sampled(
+                        out_result, sample, HYP_GOVERNOR_HARD_REJECT,
+                        decision.predicted_peak_bytes, mx::get_active_memory(),
+                        decision.local_kv_bytes, decision.global_kv_bytes);
+                    return hyperion::model::fail(HYP_STATUS_OOM_GOVERNOR, decision.reason);
+                }
+            }
+            const int off0 = static_cast<int>(offset);
+            const int off1 = static_cast<int>(offset + take);
+            mx::array chunk_ids = mx::slice(ids, {off0}, {off1}, {1}, s);
+            mx::array h = model->fwd->embed(chunk_ids);
+            h = model->fwd->forward(h, *kvstate->kv, offset);
+            if (offset + take == total) {
+                // last chunk → the sampled epilogue. Seed advances per prefill (the request seed).
+                sample = hyperion::model::run_epilogue_sampled(*model->fwd, h, s, config, config->seed);
+            } else {
+                mx::eval(h);
+            }
+            offset += take;
+        }
+        kvstate->offset = total;
+        kvstate->last_token = sample.token_id;
+        const auto final_state = model->governor->evaluate(0, total, *kvstate->kv);
+        const std::uint64_t peak = hyperion::governor::predict_peak(0, total, *kvstate->kv, *model->geometry);
+        hyperion::model::write_step_result_sampled(
+            out_result, sample, HYP_GOVERNOR_READY, peak, mx::get_active_memory(),
+            final_state.local_kv_bytes, final_state.global_kv_bytes);
+        return hyperion::model::ok();
+    } catch (const std::bad_alloc&) {
+        return hyperion::model::fail(HYP_STATUS_INTERNAL, "native allocation failed outside predictive governor admission");
+    } catch (const std::exception& error) {
+        return hyperion::model::fail(HYP_STATUS_INTERNAL, error.what());
+    } catch (...) {
+        return hyperion::model::fail(HYP_STATUS_INTERNAL, "hyp_prefill_chunk_sampled failed with a non-standard exception");
+    }
+}
+
+HypStatus hyp_decode_block_sampled(HypModel model,
+                                   HypKvState kvstate,
+                                   uint32_t n_tokens,
+                                   const HypSamplingConfig* config,
+                                   HypStepResult out_result) {
+    // Validate the model handle FIRST (validate_sampling_config reads
+    // model->geometry->vocab_size, so the model must be valid before the config check).
+    auto status = hyperion::model::validate_model(model, "hyp_decode_block_sampled");
+    if (status != HYP_STATUS_OK) return status;
+    status = hyperion::model::validate_kvstate(kvstate);
+    if (status != HYP_STATUS_OK) return status;
+    status = hyperion::model::validate_step_result(out_result);
+    if (status != HYP_STATUS_OK) return status;
+    if (auto err = hyperion::model::validate_sampling_config(config, model->geometry->vocab_size); err.has_value()) {
+        return hyperion::model::fail(HYP_STATUS_INVALID_ARGUMENT, err->c_str());
+    }
+    // Greedy default: delegate to hyp_decode_block (byte-identical, G1 seal).
+    if (config == nullptr || config->temperature == 0.0F) {
+        return hyp_decode_block(model, kvstate, n_tokens, out_result);
+    }
+    if (!model->loaded || model->fwd == nullptr || model->governor == nullptr) {
+        return hyperion::model::fail(HYP_STATUS_INVALID_ARGUMENT, "model is not loaded");
+    }
+    if (kvstate->offset == 0) {
+        return hyperion::model::fail(HYP_STATUS_INVALID_ARGUMENT, "decode requires a populated KV state (prefill first)");
+    }
+    if (n_tokens == 0) {
+        hyperion::model::ForwardPass::StochasticSample sample{};
+        hyperion::model::write_step_result_sampled(
+            out_result, sample, HYP_GOVERNOR_READY, 0, mx::get_active_memory(), 0, 0);
+        return hyperion::model::ok();
+    }
+    auto decision = model->governor->evaluate(n_tokens, kvstate->offset, *kvstate->kv);
+    if (decision.admission == hyperion::governor::Admission::HardRejected) {
+        hyperion::model::ForwardPass::StochasticSample sample{};
+        hyperion::model::write_step_result_sampled(
+            out_result, sample, HYP_GOVERNOR_HARD_REJECT, decision.predicted_peak_bytes,
+            mx::get_active_memory(), decision.local_kv_bytes, decision.global_kv_bytes);
+        return hyperion::model::fail(HYP_STATUS_OOM_GOVERNOR, decision.reason);
+    }
+    try {
+        const mx::Stream s = *model->stream;
+        hyperion::model::ForwardPass::StochasticSample sample{};
+        // Per-request RNG: seed advances each step so a single seed yields a reproducible
+        // stream (same seed → same tokens). std::mt19937_64 advanced by a per-step salt.
+        std::uint64_t rng_state = config->seed;
+        for (std::uint32_t step = 0; step < n_tokens; ++step) {
+            int32_t id = static_cast<int32_t>(kvstate->last_token);
+            mx::array ids = mx::array(&id, mx::Shape{1}, mx::int32);
+            mx::array h = model->fwd->embed(ids);
+            h = model->fwd->forward(h, *kvstate->kv, kvstate->offset);
+            sample = hyperion::model::run_epilogue_sampled(*model->fwd, h, s, config, rng_state);
+            // Advance the RNG state per step (a fixed salt — deterministic per-request).
+            rng_state = rng_state * 6364136223846793005ULL + 1442695040888963407ULL;
+            kvstate->last_token = sample.token_id;
+            kvstate->offset += 1;
+        }
+        const std::uint64_t peak = hyperion::governor::predict_peak(
+            n_tokens, kvstate->offset - n_tokens, *kvstate->kv, *model->geometry);
+        hyperion::model::write_step_result_sampled(
+            out_result, sample, HYP_GOVERNOR_READY, peak, mx::get_active_memory(),
+            decision.local_kv_bytes, decision.global_kv_bytes);
+        return hyperion::model::ok();
+    } catch (const std::bad_alloc&) {
+        return hyperion::model::fail(HYP_STATUS_INTERNAL, "native allocation failed outside predictive governor admission");
+    } catch (const std::exception& error) {
+        return hyperion::model::fail(HYP_STATUS_INTERNAL, error.what());
+    } catch (...) {
+        return hyperion::model::fail(HYP_STATUS_INTERNAL, "hyp_decode_block_sampled failed with a non-standard exception");
     }
 }
 

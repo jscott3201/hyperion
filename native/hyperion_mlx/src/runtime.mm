@@ -30,7 +30,7 @@ namespace mx = mlx::core;
 
 namespace {
 
-constexpr std::uint32_t kAbiVersion = 1;
+constexpr std::uint32_t kAbiVersion = 2;
 
 static_assert(MLX_VERSION_MAJOR == 0);
 static_assert(MLX_VERSION_MINOR == 32);
