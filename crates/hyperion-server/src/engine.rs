@@ -25,7 +25,11 @@ use hyperion_ffi::{
 };
 use hyperion_model::geometry::Geometry;
 
-/// The default prefill chunk size (02: "default chunk 2048").
+/// The native prefill chunk size (05 §Prefill chunking). `hyp_prefill_chunk`
+/// chunks internally at this boundary and expects the whole prompt in one
+/// call; it does NOT support continuation prefill (`offset != 0` is
+/// rejected). Exposed for PR B's `/control` stats / display, not for Rust-side
+/// slicing.
 pub const PREFILL_CHUNK: usize = 2048;
 
 /// A single-flight generation is busy — the second concurrent request is
@@ -250,33 +254,28 @@ impl Engine {
         Ok(generated)
     }
 
-    /// Prefill the prompt in `PREFILL_CHUNK`-sized chunks, yielding to the
-    /// cancel check between chunks (02: "yields between chunks: cancellation
-    /// checks, governor re-admission per chunk").
+    /// Prefill the entire prompt in a single native call. The native
+    /// `hyp_prefill_chunk` rejects `offset != 0`, so it does NOT support
+    /// continuation prefill across multiple calls — it chunks internally at
+    /// `kPrefillChunkSize` (2048) and expects the whole prompt in one call.
+    /// Inter-chunk cancellation (02 "yields between chunks") would need a
+    /// native continuation-prefill path that does not exist today, so the only
+    /// cancellation point during prefill is the upfront check in `drive`.
     fn prefill(
         &self,
         generation: &mut Generation,
         prompt: &[u32],
-        cancel: &CancelToken,
+        _cancel: &CancelToken,
     ) -> Result<(), EngineError> {
-        let mut start = 0;
-        while start < prompt.len() {
-            if cancel.is_cancelled() {
-                return Err(EngineError::Cancelled);
-            }
-            let end = (start + PREFILL_CHUNK).min(prompt.len());
-            // The native prefill consumes prompt[start..end]; is_prompt flags
-            // the prompt framing. Each chunk's final token is the next chunk's
-            // continuation seed (the KV accumulates across chunks).
-            let chunk = &prompt[start..end];
-            let stream = HypTokenStream::from_slice(chunk, true);
-            // Greedy prefill (the sampled variant is identical when config is
-            // None / temperature 0; PR B will route sampled prefill here too).
-            generation
-                .kvstate
-                .prefill_chunk(&self.model, &stream, &self.step)?;
-            start = end;
-        }
+        // `drive` already rejected the empty prompt and checked cancel up
+        // front; there is no mid-prefill yield point on the current native
+        // API. `is_prompt` flags the prompt framing for the whole stream.
+        let stream = HypTokenStream::from_slice(prompt, true);
+        // Greedy prefill (the sampled variant is identical when config is
+        // None / temperature 0; PR B will route sampled prefill here too).
+        generation
+            .kvstate
+            .prefill_chunk(&self.model, &stream, &self.step)?;
         Ok(())
     }
 
@@ -378,22 +377,22 @@ mod tests {
     }
 
     #[test]
-    fn prefill_chunks_at_2048_boundary() {
-        // The chunk boundary is a pure arithmetic contract (no native calls):
-        // a 5000-token prompt splits into [0..2048), [2048..4096), [4096..5000).
+    fn prefill_presents_the_whole_prompt_as_one_stream() {
+        // The native `hyp_prefill_chunk` rejects `offset != 0`, so it does NOT
+        // support continuation prefill: the whole prompt must reach the native
+        // side in a single call (it chunks internally at PREFILL_CHUNK). The
+        // earlier Rust-side slice loop broke any prompt > PREFILL_CHUNK: the
+        // first chunk set kvstate->offset, the second hit the offset!=0 guard
+        // and returned InvalidArgument. This guard proves the whole prompt is
+        // presented as one stream (count == prompt.len()), not sliced.
         let prompt: Vec<u32> = (0..5000).collect();
-        let mut chunks = Vec::new();
-        let mut start = 0;
-        while start < prompt.len() {
-            let end = (start + PREFILL_CHUNK).min(prompt.len());
-            chunks.push((start, end));
-            start = end;
-        }
+        let stream = HypTokenStream::from_slice(&prompt, true);
         assert_eq!(
-            chunks,
-            vec![(0, 2048), (2048, 4096), (4096, 5000)],
-            "prefill must chunk at the 2048 boundary"
+            stream.count as usize,
+            prompt.len(),
+            "prefill must present the whole prompt in one stream, not slice it"
         );
+        assert_eq!(stream.is_prompt, 1, "prompt framing must be flagged");
     }
 
     /// The tiny fixture's geometry, mirroring `make_tiny_geometry()` in the
