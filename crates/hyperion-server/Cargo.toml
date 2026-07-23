@@ -11,6 +11,36 @@ hyperion-core = { path = "../hyperion-core" }
 hyperion-ffi = { path = "../hyperion-ffi" }
 hyperion-model = { path = "../hyperion-model" }
 hyperion-tokenizer = { path = "../hyperion-tokenizer" }
+# B2: the M3 HTTP transport. tokio's `sync` carries the bounded mpsc the engine
+# streams StepEvents through; `rt-multi-thread`/`macros`/`net`/`signal` run the
+# axum server and the dedicated engine thread's mailbox.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+# B5: the axum router + dual-dialect SSE. axum 0.8 + tower 0.5 + tower-http's
+# `DefaultBodyLimit` (the 32 MiB → 413 gate, 06 §Surfaces). serde/serde_json for
+# the request/response + error-envelope bodies (matching hyperion-tokenizer's
+# style). subtle for the constant-time bearer compare (B3, the bonsai 401 rule
+# — never `==` on a secret).
+axum = "0.8"
+tower = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2"
+# B5: `async-stream` builds the SSE frame stream ergonomically from the
+# StepEvent receiver. (axum's built-in `DefaultBodyLimit` provides the 32 MiB
+# → 413 gate; no tower-http `limit` feature needed.)
+async-stream = "0.3"
+
+[dev-dependencies]
+# B1: the model-free stream tests need a tokio runtime to drive the async
+# receiver side of the StepEvent channel. `test-util` gives `tokio::test` the
+# runtime; `rt-multi-thread` lets the cancel-on-drop test spawn the engine on
+# a separate thread.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "test-util"] }
+# B5: the SSE/contract tests build requests + parse responses via axum's test
+# utilities (`oneshot` into the router).
+axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [lints]
 workspace = true
