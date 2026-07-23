@@ -157,6 +157,19 @@ if(BUILD_TESTING)
     target_include_directories(hyperion_forward_12b_decode_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_compile_options(hyperion_forward_12b_decode_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME hyperion_forward_12b_decode COMMAND hyperion_forward_12b_decode_test)
+
+    # M5-gated: real-12B long-context token-exact seal (M2-2.6a). Loads the REAL 12B, runs
+    # a 2436-token chat-templated prompt through chunked prefill (2048, crosses one chunk
+    # boundary) + the sliding-ring rotation read past the 1024 window + decode, asserts
+    # greedy tokens EXACT vs the committed mlx-lm oracle golden (gen_12b_long_golden.py).
+    # Reports peak MLX bytes (the 2.6b governor gate input; not gated here). Builds where
+    # MLX/Metal link; runs only on the self-hosted M5. Self-skips (exit 0) when
+    # HYPERION_12B_ARTIFACT is unset (CI) or the golden is absent.
+    add_executable(hyperion_forward_12b_long_test tests/forward_12b_long_test.cc)
+    target_link_libraries(hyperion_forward_12b_long_test PRIVATE hyperion_mlx mlx)
+    target_include_directories(hyperion_forward_12b_long_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_options(hyperion_forward_12b_long_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME hyperion_forward_12b_long COMMAND hyperion_forward_12b_long_test)
 endif()
 
 install(TARGETS hyperion_mlx ARCHIVE DESTINATION lib)

@@ -64,6 +64,16 @@ class LocalKvCache {
     /// Promote ``n`` speculative tokens to committed (A2: append-only, no trim).
     void commit(std::uint32_t n) { index_.commit(n); }
 
+    /// Direct committed append (the prefill/decode path) — bypasses the gamma speculative
+    /// slack. Writes ``n`` tokens at the committed position, chunked by ``capacity`` so each
+    /// ``write_ring`` writes ≤ cap tokens (no OOB; the ring rotates naturally — older
+    /// out-of-window tokens are overwritten). ``k_update``/``v_update`` shape
+    /// ``[n, num_kv_heads, head_dim]`` in the cache dtype. Replaces the gamma-chunked
+    /// ``append``+``commit`` prefill path (which looped ``n/gamma`` times — correct but
+    /// impractically slow/graph-heavy for a 2048-token chunk). The gamma-limited ``append``
+    /// stays for MTP speculative draft (M7).
+    void append_committed(const mlx::core::array& k_update, const mlx::core::array& v_update, std::uint32_t n);
+
     /// Discard all speculative tokens (MTP reject); committed is untouched (A2).
     void discard_speculative() { index_.discard_speculative(); }
 
@@ -71,6 +81,22 @@ class LocalKvCache {
     /// reads the committed prefix via ``attention_len`` and the slot map.
     [[nodiscard]] const mlx::core::array& keys() const { return k_; }
     [[nodiscard]] const mlx::core::array& values() const { return v_; }
+
+    /// Rotation-aware read of the last ``min(window, committed)`` tokens in LOGICAL
+    /// order from the (possibly rotated) ``[cap, h, d]`` buffer, as ``[B=1, h, n, d]``
+    /// for the SDPA (M2-2.6). Each logical ``pos ∈ [committed-n, committed)`` lives at
+    /// physical slot ``pos % cap``; ``mx::take`` with the index
+    /// ``arange(committed-n, committed) % cap`` gathers them in logical order —
+    /// handling any wrap uniformly. Reduces to a contiguous linear slice when
+    /// ``committed ≤ cap`` (no rotation). Mirrors mlx-lm ``RotatingKVCache._temporal_order``
+    /// (gemma4 ``keep=0`` → a 2-slice roll by the write cursor). ``buf`` is ``keys()``
+    /// or ``values()`` (call once each).
+    [[nodiscard]] mlx::core::array read_window(
+        const mlx::core::array& buf,
+        std::uint32_t window,
+        int h,
+        int d,
+        mlx::core::Stream s) const;
 
   private:
     static mlx::core::array allocate(

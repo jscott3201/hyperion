@@ -20,36 +20,6 @@ mx::array rms_norm(const mx::array& x, const std::optional<mx::array>& weight, f
     return mx::fast::rms_norm(x, weight, eps, s);
 }
 
-// Prefill append to a local ring: write L committed tokens, chunked by gamma_max (the
-// ring's speculative slack — append reserves speculative slots ≤ gamma_max; prefill
-// commits directly, so chunk). The ring rotates old out-of-window tokens. A single
-// commit-past-speculative append (no chunking) is a 2.6 refinement.
-void prefill_append_local(
-    LocalKvCache& cache,
-    const mx::array& k,
-    const mx::array& v,
-    int n,
-    int n_kv_heads,
-    int head_dim,
-    mx::Stream s) {
-    const auto h = static_cast<int>(n_kv_heads);
-    const auto d = static_cast<int>(head_dim);
-    const std::uint32_t gamma = kDefaultGammaMax;
-    for (std::uint32_t written = 0; written < static_cast<std::uint32_t>(n);) {
-        const std::uint32_t take = std::min(gamma, static_cast<std::uint32_t>(n) - written);
-        const int start = static_cast<int>(written);
-        const int stop = static_cast<int>(written + take);
-        auto slice = [&](const mx::array& buf) {
-            return mx::slice(buf, {start, 0, 0}, {stop, h, d}, {1, 1, 1}, s);
-        };
-        if (!cache.append(slice(k), slice(v), take)) {
-            throw std::runtime_error("local KV ring gamma slack overflow (prefill chunk)");
-        }
-        cache.commit(take);
-        written += take;
-    }
-}
-
 /// Read ``n`` cached tokens from a cache buffer ``[cap, h, d]`` (no batch dim) as
 /// ``[B=1, h, n, d]`` for the SDPA: slice ``[0:n]`` → reshape ``[1, n, h, d]`` →
 /// transpose ``{0,2,1,3}``. The reverse of the append path's squeeze. ``n`` must
@@ -280,7 +250,10 @@ ForwardPass::AttentionInternals ForwardPass::attention(
     mx::array v_append = mx::reshape(mx::transpose(v, {0, 2, 1, 3}, stream_), {L, n_kv_heads, head_dim}, stream_);
     if (ref.kind == LayerType::Sliding) {
         LocalKvCache& cache = kvstate.local[ref.per_kind_index];
-        prefill_append_local(cache, k_append, v_append, L, n_kv_heads, head_dim, stream_);
+        // Direct committed append (chunked by cap internally) — replaces the gamma-
+        // chunked prefill_append_local (which looped L/gamma times; impractical for a
+        // 2048-token prefill chunk). The gamma-limited speculative append stays for MTP.
+        cache.append_committed(k_append, v_append, static_cast<std::uint32_t>(L));
     } else {
         GlobalKvCache& cache = kvstate.global[ref.per_kind_index];
         cache.append(k_append, v_append, static_cast<std::uint32_t>(L));
@@ -297,23 +270,26 @@ ForwardPass::AttentionInternals ForwardPass::attention(
     if (offset > 0) {
         if (ref.kind == LayerType::Sliding) {
             LocalKvCache& cache = kvstate.local[ref.per_kind_index];
-            // Linear region only: ``read_kv_view`` slices ``[0:attn]`` from the
-            // ``[cap, h, d]`` ring, which is correct only while ``attn <= cap``
-            // (no rotation; the mask zeroes out-of-window positions for
-            // ``window < attn <= cap``). Past ``cap`` the read is OOB and the ring
-            // has rotated — the rotation-aware read is M2-2.6. Fail LOUD here (a
-            // thrown error beats silent corruption) so a long context can't reach
-            // 2.6's machinery unguarded.
-            const std::uint32_t attn = cache.attention_len();
-            if (attn > cache.capacity()) {
-                throw std::runtime_error(
-                    "local KV ring capacity exceeded at the offset>0 attention read "
-                    "(long-context rotation read is M2-2.6)");
+            const std::uint32_t attn = cache.attention_len(); // == committed
+            const std::uint32_t win = geometry_.sliding_window;
+            // Sliding attention reads only the last min(window, committed) tokens.
+            // For attn <= window all committed tokens are in-window → the linear slice
+            // [0:attn] is exactly the last attn tokens (the 2.7 decode fast-path, bit-
+            // identical to read_kv_rotated for this case — keeps the 2.7 seal on the same
+            // code path, zero risk). Past the window the ring has rotated (or will, once
+            // attn > cap) → read_kv_rotated gathers the last min(window, attn) in logical
+            // order via slot_for (the 2.6 rotation read). The mask (kv_len =
+            // min(window, offset+L)) matches the read length.
+            if (attn <= win) {
+                k_attn = read_kv_view(cache.keys(), attn, n_kv_heads, head_dim, stream_);
+                v_attn = read_kv_view(cache.values(), attn, n_kv_heads, head_dim, stream_);
+            } else {
+                k_attn = cache.read_window(cache.keys(), win, n_kv_heads, head_dim, stream_);
+                v_attn = cache.read_window(cache.values(), win, n_kv_heads, head_dim, stream_);
             }
-            k_attn = read_kv_view(cache.keys(), attn, n_kv_heads, head_dim, stream_);
-            v_attn = read_kv_view(cache.values(), attn, n_kv_heads, head_dim, stream_);
         } else {
             GlobalKvCache& cache = kvstate.global[ref.per_kind_index];
+            // Global cache never rotates (capacity grows with committed); linear read.
             k_attn = read_kv_view(cache.keys(), cache.committed_len(), n_kv_heads, head_dim, stream_);
             v_attn = read_kv_view(cache.values(), cache.committed_len(), n_kv_heads, head_dim, stream_);
         }
@@ -359,15 +335,23 @@ mx::array ForwardPass::decoder_layer(
 }
 
 mx::array ForwardPass::forward(const mx::array& h, KvState& kvstate, std::uint32_t offset) {
-    // offset 0 = fresh prefill (2.3b bit-exact path); offset>0 = decode/cached-prefix
-    // read (2.7). kv_len for the mask = the full attention read = offset + L (the
-    // cached prefix incl. this chunk). For offset==0 this collapses to L (unchanged).
+    // The mask's kv_len must match the SDPA's K/V read length:
+    //  - offset==0: the SDPA reads the chunk-local K/V (kv_len = committed = offset+L = L),
+    //    for BOTH kinds (the 2.3b bit-exact path; the cache is appended but not read).
+    //  - offset>0 sliding: the cache read returns only min(window, committed) tokens.
+    //  - offset>0 global: the cache read returns all committed (full causal, no window).
+    // For offset==0 with L > window (a 2048-token prefill chunk) the sliding mask is
+    // [L, L] with the trailing-window constraint (zeroes out-of-window) — matching the
+    // chunk-local K/V of length L (NOT a window-sized slice).
     const int L = static_cast<int>(h.shape(1));
     const std::uint32_t q_len = static_cast<std::uint32_t>(L);
-    const std::uint32_t kv_len = offset + q_len;
+    const std::uint32_t committed = offset + q_len;
+    const std::uint32_t win = geometry_.sliding_window;
     mx::array state = h;
     for (std::size_t layer = 0; layer < weights_.layers.size(); ++layer) {
         const LayerType kind = dispatch_.per_layer[layer];
+        const std::uint32_t kv_len =
+            (offset > 0 && kind == LayerType::Sliding) ? std::min(win, committed) : committed;
         mx::array mask = build_mask(kind, q_len, kv_len, offset);
         state = decoder_layer(state, layer, mask, kvstate, offset);
     }

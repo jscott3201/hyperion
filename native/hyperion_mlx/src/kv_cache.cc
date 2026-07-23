@@ -110,6 +110,49 @@ bool LocalKvCache::append(
     return true;
 }
 
+void LocalKvCache::append_committed(const mx::array& k_update, const mx::array& v_update, std::uint32_t n) {
+    if (n == 0) {
+        return;
+    }
+    const std::uint32_t cap = capacity();
+    const auto h = static_cast<int>(num_kv_heads_);
+    const auto d = static_cast<int>(head_dim_);
+    // Chunk by cap so each write_ring writes ≤ cap tokens (write_ring's 2-slice split
+    // assumes n ≤ cap). The ring rotates naturally: once committed > cap, older
+    // out-of-window tokens are overwritten (the rotation read reconstructs logical order).
+    // The gamma speculative slack is bypassed — prefill commits directly (commit(take)
+    // with speculative_len==0 promotes `take` as fresh committed).
+    for (std::uint32_t written = 0; written < n;) {
+        const std::uint32_t start_pos = index_.committed_len(); // logical start of this sub-chunk
+        const std::uint32_t take = std::min(cap, n - written);
+        index_.commit(take); // advance committed_len by `take` (speculative stays 0)
+        const auto w0 = static_cast<int>(written);
+        const auto w1 = static_cast<int>(written + take);
+        auto slice_update = [&](const mx::array& u) {
+            return mx::slice(u, {w0, 0, 0}, {w1, h, d}, {1, 1, 1}, stream_);
+        };
+        k_ = write_ring(k_, slice_update(k_update), index_.slot_for(start_pos), take, cap, num_kv_heads_, head_dim_, stream_);
+        v_ = write_ring(v_, slice_update(v_update), index_.slot_for(start_pos), take, cap, num_kv_heads_, head_dim_, stream_);
+        written += take;
+    }
+}
+
+mx::array LocalKvCache::read_window(const mx::array& buf, std::uint32_t window, int h, int d, mx::Stream s) const {
+    const std::uint32_t committed = index_.attention_len(); // == committed_len
+    const std::uint32_t cap = capacity();
+    const std::uint32_t n = std::min(window, committed);
+    // n ≥ 1 for offset>0 (committed ≥ 1); the general path handles any n.
+    const auto start = static_cast<double>(committed - n);
+    const auto stop = static_cast<double>(committed);
+    mx::array idx = mx::remainder(
+        mx::arange(start, stop, mx::int32, s),
+        mx::array(static_cast<int>(cap), mx::int32),
+        s); // [n] physical slots in logical order
+    mx::array gathered = mx::take(buf, idx, /*axis=*/0, s); // [n, h, d] logical order
+    mx::array r = mx::reshape(gathered, {1, static_cast<int>(n), h, d}, s);
+    return mx::transpose(r, {0, 2, 1, 3}, s); // [1, h, n, d]
+}
+
 // ---------------------------------------------------------------------------
 // GlobalKvCache
 // ---------------------------------------------------------------------------

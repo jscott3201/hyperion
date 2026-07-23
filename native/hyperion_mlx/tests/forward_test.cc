@@ -359,6 +359,53 @@ void test_abi_load(const std::filesystem::path& fixture, const mx::Stream& gpu) 
     require(hyp_model_free(&model) == HYP_STATUS_OK, "model free");
 }
 
+void test_abi_chunked_prefill(const std::filesystem::path& fixture, const mx::Stream& /*gpu*/) {
+    // M2-2.6a: the chunked hyp_prefill_chunk path + the rotation read on the tiny fixture
+    // (window=8, cap=16). A >2048-token prompt crosses the 2048 chunk boundary AND rotates
+    // the ring ~150× (committed/16), exercising append_committed's cap-chunking + read_window's
+    // rotation heavily on CI (model-free). Asserts no crash + a valid token (no inline ref —
+    // ref_forward is offset-0 only; the 12B forward_12b_long_test is the real seal).
+    const Geometry g = make_tiny_geometry();
+    std::vector<HypLayerType> layer_types_abi = {
+        HYP_LAYER_SLIDING, HYP_LAYER_SLIDING, HYP_LAYER_SLIDING,
+        HYP_LAYER_SLIDING, HYP_LAYER_SLIDING, HYP_LAYER_FULL,
+    };
+    HypGeometryParams abi = make_tiny_abi_geometry(layer_types_abi);
+
+    HypModel model = nullptr;
+    require(hyp_model_create(&model) == HYP_STATUS_OK, "chunked: model create");
+    require(hyp_model_load(model, &abi, fixture.string().c_str()) == HYP_STATUS_OK, "chunked: load");
+    HypKvState kv = nullptr;
+    require(hyp_kvstate_create(model, &kv) == HYP_STATUS_OK, "chunked: kvstate create");
+    HypStepResult result = nullptr;
+    require(hyp_step_result_create(&result) == HYP_STATUS_OK, "chunked: step result create");
+
+    // 2500 tokens (ids i%128) — 2 chunks ([0:2048) + [2048:2500)), rotation past window=8.
+    std::vector<std::uint32_t> prompt;
+    prompt.resize(2500);
+    for (std::uint32_t i = 0; i < prompt.size(); ++i) {
+        prompt[i] = i % g.vocab_size;
+    }
+    HypTokenStream tokens{prompt.data(), static_cast<std::uint32_t>(prompt.size()), 1};
+    require(
+        hyp_prefill_chunk(model, kv, &tokens, result) == HYP_STATUS_OK,
+        "chunked: hyp_prefill_chunk succeeds on a >2048-token prompt");
+    HypStepResultFields pf = hyperion::model::step_result_read(result);
+    require(pf.token_id < g.vocab_size, "chunked: prefill token within vocab");
+    require(
+        hyp_decode_block(model, kv, 1, result) == HYP_STATUS_OK,
+        "chunked: decode after a long prefill succeeds (rotation read past window)");
+    HypStepResultFields dc = hyperion::model::step_result_read(result);
+    require(dc.token_id < g.vocab_size, "chunked: decode token within vocab");
+
+    std::cerr << "forward_test: chunked prefill OK (2500 tokens → 2 chunks; rotation ~150×; "
+              << "prefill token " << pf.token_id << ", decode token " << dc.token_id << ")\n";
+
+    require(hyp_step_result_free(&result) == HYP_STATUS_OK, "chunked: step result free");
+    require(hyp_kvstate_free(&kv) == HYP_STATUS_OK, "chunked: kvstate free");
+    require(hyp_model_free(&model) == HYP_STATUS_OK, "chunked: model free");
+}
+
 void test_mask_by_kind(const Geometry& g, const mx::Stream& s) {
     const auto dispatch = build_dispatch(g);
     // A3: each mask is sourced from the FIRST layer of its kind — never layer 0
@@ -393,6 +440,7 @@ int main() {
             const mx::Stream gpu = mx::new_stream(mx::Device::gpu);
             test_forward_parity(fixture, gpu);
             test_abi_load(fixture, gpu);
+            test_abi_chunked_prefill(fixture, gpu);
             test_mask_by_kind(make_tiny_geometry(), gpu);
         } catch (const std::exception& e) {
             std::cerr << "forward_test: uncaught exception: " << e.what() << '\n';
@@ -405,6 +453,7 @@ int main() {
         const mx::Stream gpu = mx::new_stream(mx::Device::gpu);
         test_forward_parity(fixture, gpu);
         test_abi_load(fixture, gpu);
+        test_abi_chunked_prefill(fixture, gpu);
         test_mask_by_kind(make_tiny_geometry(), gpu);
     } catch (const std::exception& e) {
         std::cerr << "forward_test: uncaught exception: " << e.what() << '\n';
