@@ -11,5 +11,8 @@ hyperion-ffi = { path = "../hyperion-ffi" }
 hyperion-model = { path = "../hyperion-model" }
 hyperion-tokenizer = { path = "../hyperion-tokenizer" }
 
+[dev-dependencies]
+serde_json = "1"
+
 [lints]
 workspace = true

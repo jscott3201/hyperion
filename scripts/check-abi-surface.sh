@@ -11,9 +11,10 @@ if (( function_count > 25 )); then
 fi
 # Per-milestone ratchet: M0 = 2 (canary + last_error); M2-1.3 adds the 9 model/step
 # lifecycle + stub functions. M3 sampler adds hyp_prefill_chunk_sampled +
-# hyp_decode_block_sampled (11 → 13; abi_version 1 → 2). Bump this when an ADR
-# approves an ABI addition.
-expected_count=13
+# hyp_decode_block_sampled (11 → 13; abi_version 1 → 2). M3 serving adds
+# hyp_step_result_fields (13 → 14; abi_version 2 → 3; ADR 0003). Bump this when
+# an ADR approves an ABI addition.
+expected_count=14
 if (( function_count != expected_count )); then
     echo "M3 expects exactly $expected_count native ABI functions, found $function_count" >&2
     exit 1

@@ -260,6 +260,12 @@ mod raw {
         ) -> c_int;
         pub fn hyp_step_result_create(out_result: *mut HypStepResult) -> c_int;
         pub fn hyp_step_result_free(result: *mut HypStepResult) -> c_int;
+        /// M3 serving: copy a step result's fields out (abi_version 3, ADR 0003).
+        /// Does not consume the handle; caller still frees it.
+        pub fn hyp_step_result_fields(
+            result: HypStepResult,
+            out_fields: *mut HypStepResultFields,
+        ) -> c_int;
     }
 }
 
@@ -271,6 +277,26 @@ pub use raw::{
     HypGeometryParams, HypMoeConfig, HypRopeSpec, HypSamplingConfig, HypStepResultFields,
     HypTokenStream,
 };
+
+/// A borrowed view of a token slice for `hyp_prefill_chunk[_sampled]`.
+///
+/// `HypTokenStream` carries a raw `*const u32` + count + `is_prompt` flag. This
+/// constructor builds it from a `&[u32]` so the pointer is valid for the borrow
+/// and no `unsafe` leaks out of `hyperion-ffi`. Pass `is_prompt=true` for the
+/// prefill of the prompt (the native side keys mask/KV behavior off it).
+impl HypTokenStream {
+    /// Build a prompt stream borrowing `tokens`. The returned value borrows
+    /// the slice; it must not outlive it. `is_prompt` selects the prompt vs
+    /// continuation framing.
+    #[must_use]
+    pub fn from_slice(tokens: &[u32], is_prompt: bool) -> Self {
+        Self {
+            tokens: tokens.as_ptr(),
+            count: u32::try_from(tokens.len()).unwrap_or(u32::MAX),
+            is_prompt: c_int::from(is_prompt),
+        }
+    }
+}
 
 /// Stable native status taxonomy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -633,6 +659,24 @@ impl StepResult {
         }
         Ok(Self(handle))
     }
+
+    /// Copy this step result's fields out (M3 serving read accessor, ADR 0003).
+    ///
+    /// Returns a caller-owned `HypStepResultFields` snapshot — the handle stays
+    /// valid and is still freed on `Drop`. The native side validates the
+    /// magic tag; a null/freed handle surfaces as `Status::InvalidArgument`.
+    /// A freshly created (never-filled) handle returns a zeroed struct, which
+    /// is the honest prefill/decode-before-first-step state.
+    pub fn fields(&self) -> Result<raw::HypStepResultFields, Error> {
+        let mut out = raw::HypStepResultFields::default();
+        // SAFETY: `self.0` is a live handle (invariant of `StepResult`), and
+        // `out` is a writable out-pointer for a trivially-copyable POD struct.
+        let status = unsafe { raw::hyp_step_result_fields(self.0, &mut out) };
+        if status != raw::HYP_STATUS_OK {
+            return Err(native_error(status));
+        }
+        Ok(out)
+    }
 }
 
 impl Drop for StepResult {
@@ -757,6 +801,34 @@ mod tests {
         let result = StepResult::create().expect("step result create");
         drop(result);
         drop(model);
+    }
+
+    #[test]
+    fn step_result_fields_round_trips_and_rejects_bad_handles() {
+        // A freshly created (never-filled) handle reads back a zeroed struct —
+        // the honest pre-step state — and the handle stays valid for reuse.
+        let result = StepResult::create().expect("step result create");
+        let fields = result.fields().expect("fields read on a live handle");
+        assert_eq!(fields.token_id, 0);
+        assert_eq!(fields.logit, 0.0);
+        assert_eq!(fields.top_k_logprob_count, 0);
+        // The handle is unaffected by the read (copy, not consume): it still
+        // drops cleanly.
+        drop(result);
+
+        // A null handle surfaces as a typed InvalidArgument, never UB.
+        // SAFETY: passing null exercises the ABI's argument guard.
+        let mut out = raw::HypStepResultFields::default();
+        let status = unsafe { raw::hyp_step_result_fields(std::ptr::null_mut(), &mut out) };
+        assert_eq!(native_error(status).status, Status::InvalidArgument);
+
+        // A null out-pointer is also rejected (no write through null).
+        // SAFETY: a live handle with a null out-pointer exercises the out-param
+        // guard; the handle is created and freed here so it is never leaked.
+        let live = StepResult::create().expect("step result create");
+        let status = unsafe { raw::hyp_step_result_fields(live.0, std::ptr::null_mut()) };
+        assert_eq!(native_error(status).status, Status::InvalidArgument);
+        drop(live);
     }
 
     #[test]

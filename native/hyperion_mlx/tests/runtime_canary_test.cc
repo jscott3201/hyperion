@@ -36,7 +36,7 @@ int main() {
         std::fprintf(stderr, "%s\n", error.data());
         return 1;
     }
-    require(info.abi_version == 2, "the ABI version changed");
+    require(info.abi_version == 3, "the ABI version changed");
     require(info.gpu_family >= 1010, "the runtime did not prove Apple10 support");
     require(
         info.macos_major > 26 || (info.macos_major == 26 && info.macos_minor >= 2),

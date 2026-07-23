@@ -1,5 +1,7 @@
 //! Engine-policy spine shared by the server and evidence harness.
 
+pub mod geometry_abi;
+
 pub use hyperion_ffi::{CanaryInfo, Error as NativeError};
 use hyperion_model::ModelFamily;
 use hyperion_tokenizer::TokenizerContract;
