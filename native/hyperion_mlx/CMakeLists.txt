@@ -185,6 +185,15 @@ if(BUILD_TESTING)
     target_compile_options(hyperion_forward_12b_fault_boundary_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME hyperion_forward_12b_fault_boundary COMMAND hyperion_forward_12b_fault_boundary_test)
 
+    # M5-gated LEAN decode bench for the M2-2.6d mx::compile slice (the "decode within
+    # 0.9x of M1 stock" gate). NOT a ctest (not in --model-free nor --all — it's a bench,
+    # not a pass/fail test); run manually. Records token_offsets_ns (mirrors the M1 worker)
+    # + prefill/decode tok/s + ITL percentiles. Self-skips when HYPERION_12B_ARTIFACT unset.
+    add_executable(native_decode_bench tests/native_decode_bench.cc)
+    target_link_libraries(native_decode_bench PRIVATE hyperion_mlx mlx)
+    target_include_directories(native_decode_bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_options(native_decode_bench PRIVATE -Wall -Wextra -Wpedantic -Werror)
+
     # M5-gated: the M2-2.6b governor predictive admission (model-free tier: builds
     # anywhere, runs only on the M5 with a live MLX memory counter). Self-skips
     # (exit 0) when no GPU is available (CI).
