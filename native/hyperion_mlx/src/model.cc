@@ -330,9 +330,10 @@ HypStatus hyp_prefill_chunk(HypModel model,
     if (!model->loaded || model->fwd == nullptr) {
         return hyperion::model::fail(HYP_STATUS_INVALID_ARGUMENT, "model is not loaded");
     }
-    // 2.7 prefill is single-chunk (the whole prompt in one forward at offset 0).
-    // Re-prefilling a populated state is rejected (a kvstate reset + chunked 2048
-    // prefill + governor admission is 2.6).
+    // 2.6a prefill is chunked (2048-token chunks at the running offset; the rotation
+    // read fires for sliding layers past the window). A single chunk for prompts ≤ 2048
+    // (the 2.7 path, bit-identical). Re-prefilling a populated state still needs a fresh
+    // kvstate (a reset is serving/2.6b); governor admission is 2.6b.
     if (kvstate->offset != 0) {
         return hyperion::model::fail(
             HYP_STATUS_INVALID_ARGUMENT, "prefill requires a fresh (offset 0) KV state");
@@ -347,11 +348,33 @@ HypStatus hyp_prefill_chunk(HypModel model,
             host_ids.push_back(static_cast<int32_t>(tokens->tokens[i]));
         }
         mx::array ids = mx::array(host_ids.data(), mx::Shape{static_cast<int>(tokens->count)}, mx::int32);
-        mx::array h = model->fwd->embed(ids);       // [1, L, hidden]
-        h = model->fwd->forward(h, *kvstate->kv, 0); // final-norm'd; appends K/V at offset 0
-        const hyperion::model::ForwardPass::GreedySample sample =
-            hyperion::model::run_epilogue(*model->fwd, h, s);
-        kvstate->offset = tokens->count;            // advance the autoregressive cursor
+
+        // Chunked prefill (mlx-lm prefill_step_size=2048; 05 §Prefill chunking). Each chunk:
+        // embed → forward(offset) (appends K/V via append_committed; the rotation read
+        // fires for sliding past the window) → mx::eval(h) to materialize the chunk + the
+        // cache writes before the next chunk (per mlx-lm mx.eval([c.state for c in cache])).
+        // The epilogue runs ONLY on the last chunk (intermediate chunks' hidden is discarded).
+        // Chunking is bitwise-invariant: each token's hidden attends causally to [0, token]
+        // regardless of the chunk split, so the final-position hidden (→ token 1) is stable.
+        constexpr std::uint32_t kPrefillChunkSize = 2048;
+        hyperion::model::ForwardPass::GreedySample sample{0, 0.0F, false};
+        std::uint32_t offset = 0;
+        const std::uint32_t total = tokens->count;
+        while (offset < total) {
+            const std::uint32_t take = std::min(kPrefillChunkSize, total - offset);
+            const int off0 = static_cast<int>(offset);
+            const int off1 = static_cast<int>(offset + take);
+            mx::array chunk_ids = mx::slice(ids, {off0}, {off1}, {1}, s); // [take]
+            mx::array h = model->fwd->embed(chunk_ids);                   // [1, take, hidden]
+            h = model->fwd->forward(h, *kvstate->kv, offset);             // final-norm'd; appends K/V
+            if (offset + take == total) {
+                sample = hyperion::model::run_epilogue(*model->fwd, h, s); // last chunk → token 1
+            } else {
+                mx::eval(h); // MLX lazy-graph materialization (NOT JS/Python eval): force this chunk + the cache writes before the next chunk
+            }
+            offset += take;
+        }
+        kvstate->offset = total;            // advance the autoregressive cursor
         kvstate->last_token = sample.token_id;
         hyperion::model::write_step_result(out_result, sample, sample.near_tie ? 1u : 0u);
         return hyperion::model::ok();

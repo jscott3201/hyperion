@@ -284,6 +284,50 @@ void test_k_append_construction(const mx::Stream& s) {
     require(!scrambled_matches, "negative control: plain reshape scrambles (the bug)");
 }
 
+void test_local_append_committed_wrap(const mx::Stream& s) {
+    // Regression guard for LocalKvCache::append_committed (M2-2.6): writing > cap tokens
+    // chunks by cap internally (each write_ring ≤ cap, no OOB) and the ring rotates —
+    // the last `cap` committed tokens land in the correct (wrapped) physical slots.
+    // cap = kWin + kGamma = 4 + 4 = 8, window = 4. Write 12 tokens (> cap) with distinct
+    // K (base 0) and V (base 100); the buffer holds the last 8 committed (logical 4..11):
+    //   slots 0..3 = logical 8..11 (wrapped), slots 4..7 = logical 4..7.
+    LocalKvCache cache(kWin, kGamma, kH, kD, mx::float32, s);
+    const mx::array k_up = make_update(12, 0, s);    // [12, h, d] base 0
+    const mx::array v_up = make_update(12, 100, s);   // distinct V
+    cache.append_committed(k_up, v_up, 12);
+    require(cache.committed_len() == 12, "wrap: committed 12");
+    require(cache.attention_len() == 12, "wrap: attention 12");
+    require(cache.capacity() == 8, "wrap: cap 8");
+    require(region_matches(cache.keys(), 0, make_update(4, 8, s), 0, 4, s), "wrap: slots 0..3 == logical 8..11 (K)");
+    require(region_matches(cache.keys(), 4, make_update(4, 4, s), 0, 4, s), "wrap: slots 4..7 == logical 4..7 (K)");
+    require(region_matches(cache.values(), 0, make_update(4, 108, s), 0, 4, s), "wrap: slots 0..3 == logical 8..11 (V, not K)");
+    require(region_matches(cache.values(), 4, make_update(4, 104, s), 0, 4, s), "wrap: slots 4..7 == logical 4..7 (V)");
+}
+
+void test_local_rotation_read(const mx::Stream& s) {
+    // Regression guard for LocalKvCache::read_window (M2-2.6): after writing > cap tokens,
+    // the rotation read returns the last min(window, committed) tokens in LOGICAL order
+    // (the ring has rotated; the linear [0:n] slice would be wrong). Distinct K/V also
+    // catches any K/V confusion in the read.
+    LocalKvCache cache(kWin, kGamma, kH, kD, mx::float32, s); // cap=8, window=4
+    const mx::array k_up = make_update(12, 0, s);    // base 0
+    const mx::array v_up = make_update(12, 100, s);   // distinct V
+    cache.append_committed(k_up, v_up, 12);
+    const int h = static_cast<int>(kH);
+    const int d = static_cast<int>(kD);
+    const mx::array kr = cache.read_window(cache.keys(), kWin, h, d, s);   // [1, h, 4, d]
+    const mx::array vr = cache.read_window(cache.values(), kWin, h, d, s);
+    // Expected: the last 4 written (logical 8..11) in logical order.
+    const mx::array k_exp = make_update(4, 8, s);     // [4, h, d] = logical 8..11 of base-0
+    const mx::array v_exp = make_update(4, 108, s);   // logical 8..11 of base-100
+    // read_window returns [1, h, n, d]; transpose → [1, n, h, d] → reshape [n, h, d] for region_matches.
+    auto to_nhd = [&](const mx::array& r) {
+        return mx::reshape(mx::transpose(r, {0, 2, 1, 3}, s), {4, h, d}, s);
+    };
+    require(region_matches(to_nhd(kr), 0, k_exp, 0, 4, s), "rotation: keys read == last 4 written (logical order)");
+    require(region_matches(to_nhd(vr), 0, v_exp, 0, 4, s), "rotation: values read == last 4 written (logical order, not K)");
+}
+
 Geometry make_small_geometry() {
     // 6 layers in a 5:1 layout (5 sliding + 1 global), tiny dims.
     Geometry geometry{};
@@ -366,6 +410,8 @@ int main() {
         test_global_grow_and_preserve(stream);
         test_global_stores_distinct_v(stream);
         test_k_append_construction(stream);
+        test_local_append_committed_wrap(stream);
+        test_local_rotation_read(stream);
         test_build_kv_state(stream);
     } catch (const std::exception& error) {
         std::cerr << "kv_cache_test: uncaught exception: " << error.what() << '\n';
