@@ -30,6 +30,7 @@
 #include "dispatch.h"
 #include "forward.h"
 #include "geometry.h"
+#include "governor.h"
 #include "kv_cache.h"
 #include "weights_loader.h"
 
@@ -107,12 +108,14 @@ int main(int argc, char** argv) {
     std::uint32_t n_tokens = 24;
     std::uint32_t trials = 5;
     std::uint32_t warmups = 2;
+    bool calibrate_sentinels = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() { return (i + 1 < argc) ? std::string(argv[++i]) : std::string(); };
         if (a == "--tokens") n_tokens = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--trials") trials = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--warmups") warmups = static_cast<std::uint32_t>(std::stoul(next()));
+        else if (a == "--calibrate-sentinels") calibrate_sentinels = true;
     }
 
     const char* dir = std::getenv("HYPERION_12B_ARTIFACT");
@@ -152,6 +155,86 @@ int main(int argc, char** argv) {
 
         ModelWeights weights = load_model_weights(artifact, g, 64, 4, cpu);
         ForwardPass fwd(g, dispatch, weights, gpu);
+
+        // ── M3 governor calibration mode (--calibrate-sentinels, 10:45-46). Runs a full ──
+        // prefill at the 8K + 32K sentinels (offset 0), compares the governor's
+        // predict_peak() (the LIVE quantized-weights path — NOT peak_within_budget, which
+        // estimates dense bf16 and would false-negative on the g64/b4 12B) against the
+        // MEASURED mx::get_peak_memory(), and emits a per-sentinel predicted/measured/
+        // error-band JSON record. The gate verb is "recorded" — a loose non-gating guard
+        // (|predicted-measured|/measured < 20%) surfaces gross miscalibration without
+        // blocking. Synthetic ids (zeros) are defensible: peak MLX memory for dense matmuls
+        // is shape-driven, not value-driven.
+        if (calibrate_sentinels) {
+            // The governor admits prefill CHUNK-BY-CHUNK (2048-token chunks, the
+            // production path): each chunk is evaluated via predict_peak(chunk, offset)
+            // before it runs. The calibration compares the MAX predicted peak across all
+            // chunks (the governor's effective admission ceiling for the prefill) against
+            // the MEASURED mx::get_peak_memory() across the full chunked prefill. This is
+            // the apples-to-apples comparison of how the governor is actually used — NOT a
+            // single-chunk prefill of the whole context (which is infeasible at 32K: the
+            // global attention transient for a 32K single chunk is ~32 GiB > the device).
+            constexpr std::uint32_t kChunk = 2048;
+            const std::array<std::uint32_t, 2> sentinels = {
+                hyperion::governor::kSentinel8K, hyperion::governor::kSentinel32K};
+            std::cout << "{\n  \"schema\": \"hyperion.m3-governor-calibration.v1\",\n";
+            std::cout << "  \"model\": \"gemma4-12b-qat-mlx-g64-b4\",\n";
+            std::cout << "  \"prefill_chunk_size\": " << kChunk << ",\n";
+            std::cout << "  \"geometry\": {\"hidden_size\": " << g.hidden_size
+                      << ", \"num_hidden_layers\": " << g.num_hidden_layers
+                      << ", \"num_attention_heads\": " << g.num_attention_heads
+                      << ", \"sliding_window\": " << g.sliding_window << "},\n";
+            std::cout << "  \"governor\": {\"workspace_reserve_bytes\": "
+                      << hyperion::governor::kWorkspaceReserveBytes
+                      << ", \"transient_safety\": 1.25},\n";
+            std::cout << "  \"sentinels\": [\n";
+            for (std::size_t s = 0; s < sentinels.size(); ++s) {
+                const std::uint32_t ctx = sentinels[s];
+                std::vector<int32_t> host_ids(ctx, 0);
+                mx::array ids_ctx = mx::array(host_ids.data(), mx::Shape{static_cast<int>(ctx)}, mx::int32);
+                auto kvstate = build_kv_state(dispatch, hyperion::model::kDefaultGammaMax, mx::bfloat16, gpu);
+                // Run the chunked prefill (the production path); track the MAX predicted
+                // peak across chunks + the MEASURED peak across the whole prefill.
+                mx::reset_peak_memory();
+                std::uint64_t max_predicted = 0;
+                std::uint32_t offset = 0;
+                while (offset < ctx) {
+                    const std::uint32_t take = std::min(kChunk, ctx - offset);
+                    max_predicted = std::max(max_predicted,
+                        hyperion::governor::predict_peak(take, offset, kvstate, g));
+                    const int off0 = static_cast<int>(offset);
+                    const int off1 = static_cast<int>(offset + take);
+                    mx::array chunk_ids = mx::slice(ids_ctx, {off0}, {off1}, {1}, gpu);
+                    mx::array h = fwd.forward(fwd.embed(chunk_ids), kvstate, offset);
+                    mx::eval(h); // force each chunk + the cache writes before the next
+                    offset += take;
+                }
+                mx::synchronize(gpu);
+                const std::uint64_t measured = mx::get_peak_memory();
+                const std::int64_t error_band = static_cast<std::int64_t>(max_predicted) -
+                                                static_cast<std::int64_t>(measured);
+                const double rel_error = measured > 0
+                    ? static_cast<double>(error_band) / static_cast<double>(measured) : 0.0;
+                const bool within_guard = measured > 0 && std::fabs(rel_error) < 0.20;
+                std::cout << "    {\"context_len\": " << ctx
+                          << ", \"max_predicted_bytes\": " << max_predicted
+                          << ", \"measured_bytes\": " << measured
+                          << ", \"error_band_bytes\": " << error_band
+                          << ", \"relative_error\": " << rel_error
+                          << ", \"within_20pct_guard\": " << (within_guard ? "true" : "false")
+                          << "}";
+                if (s + 1 < sentinels.size()) std::cout << ",";
+                std::cout << "\n";
+                std::cerr << "  [sentinel " << (ctx / 1024) << "K] max_predicted="
+                          << (max_predicted / (1024 * 1024)) << " MiB  measured="
+                          << (measured / (1024 * 1024)) << " MiB  error_band="
+                          << (error_band / (1024 * 1024)) << " MiB  rel="
+                          << (rel_error * 100.0) << "%"
+                          << (within_guard ? "" : "  *** OUTSIDE 20% GUARD ***") << "\n";
+            }
+            std::cout << "  ]\n}\n";
+            return 0;
+        }
 
         // The epilogue (final-norm → tied lm_head → softcap → last-position → greedy).
         // Mirrors forward_12b_decode_test. sample_greedy host-scans (the 2.3b lesson).

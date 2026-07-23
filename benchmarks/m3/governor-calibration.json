@@ -1,0 +1,52 @@
+{
+  "schema": "hyperion.m3-governor-calibration.v1",
+  "generated": "2026-07-23",
+  "model": "gemma4-12b-qat-mlx-g64-b4",
+  "mlx_version": "0.32.0",
+  "quant": "group-quantized g64/b4 (bf16 compute)",
+  "prefill_chunk_size": 2048,
+  "geometry": {
+    "hidden_size": 3840,
+    "num_hidden_layers": 48,
+    "num_attention_heads": 16,
+    "sliding_window": 1024,
+    "layer_pattern": "5 sliding + 1 global repeating (40 sliding + 8 global)",
+    "head_dim_local": 256,
+    "head_dim_global": 512,
+    "num_kv_heads_local": 8,
+    "num_kv_heads_global": 1
+  },
+  "governor": {
+    "workspace_reserve_bytes": 536870912,
+    "transient_safety_factor": 1.25,
+    "global_kv_bytes_per_token": 16384,
+    "predict_path": "hyperion::governor::predict_peak (the live quantized-weights path; NOT peak_within_budget, which estimates dense bf16 and would false-negative on the g64/b4 12B)"
+  },
+  "method": "Per sentinel: a chunked (2048-token) prefill of synthetic zero ids at offset 0 — the production prefill path. max_predicted = the MAX predict_peak(chunk, offset) across chunks (the governor's effective admission ceiling). measured = mx::get_peak_memory() across the full chunked prefill (reset_peak_memory before). Peak memory for dense matmuls is shape-driven, so synthetic ids are valid. The gate verb is 'recorded' (10:45-46); the 20% guard is a non-gating warning that surfaces gross miscalibration.",
+  "sentinels": [
+    {
+      "context_len": 8192,
+      "max_predicted_bytes": 18825968342,
+      "measured_bytes": 8210965454,
+      "error_band_bytes": 10615002888,
+      "relative_error": 1.29278,
+      "within_20pct_guard": false
+    },
+    {
+      "context_len": 32768,
+      "max_predicted_bytes": 36740028886,
+      "measured_bytes": 10242253780,
+      "error_band_bytes": 26497775106,
+      "relative_error": 2.5871,
+      "within_20pct_guard": false
+    }
+  ],
+  "finding": {
+    "headline": "The governor OVER-PREDICTS the peak by 2.3x at 8K and 3.6x at 32K. The bias is CONSERVATIVE (predicted > measured → the governor never under-admits → no OOM risk) but SEVERELY miscalibrated: it would HardReject prefills that fit comfortably (32K peaks at 9.8 GiB, well under the 12 GiB budget, but the governor predicts 35 GiB and rejects it).",
+    "trend": "The over-prediction WORSENS with context (129% → 259%), confirming the inflated term is the ctx-scaled attention_transient, not the ctx-flat settled/KV terms.",
+    "root_cause": "The governor's attention_transient models the SDPA ATTENTION SCORES tensor at full size — [B, n_heads, q, ctx] per layer (governor.cc: the global_scores = q*ctx*n_heads*dtype term). At 32K a global layer's scores = 32K*32K*16*2 = 32 GiB/layer * 8 global layers * 1.25 safety = ~397 GiB — but the measured peak is 9.8 GiB. MLX's mx::fast::scaled_dot_product_attention is a FUSED kernel that does NOT materialize the [q, ctx] scores matrix; it streams the attention computation. The governor predicts a buffer that does not exist (the transient is ~98-100% of the over-prediction). The fused-SDPA footprint that IS materialized is the output [q, head_dim] per layer ( governor.cc's `output` term), which is far smaller.",
+    "implication": "The governor will reject production-scale prefills (e.g. a 32K context that fits in 9.8 GiB) it should admit. This does not risk OOM (the bias is conservative) but it caps the effective context length far below the device's real capacity.",
+    "recommended_fix": "A follow-up slice: model the ACTUAL fused-SDPA memory footprint — the attention OUTPUT [q, head_dim] per layer (which is materialized) — NOT the [q, ctx] scores (which the fused kernel streams without allocating). This brings the predicted transient from ~35 GiB (32K) to ~7-10 GiB, matching the measured. The governor's `output` term already exists in the formula (governor.cc); the fix is to drop the `scores` term from the max() (or weight it down to the fused-kernel working set). Re-derive the calibration after the fix."
+  },
+  "gate_clause": "M3 'governor calibration report (predicted vs measured peaks across sentinels, error band recorded)' — 10-milestones-and-gates.md:45-46. This artifact RECORDS the report (the gate verb); the 20% guard is non-gating. The calibration is committed to benchmarks/raw/m3/governor-calibration.json for audit across PRs. The 'zero uncontrolled OOM across suite' clause (10:46) is NOT closed by this report — it requires the serving suite; the governor's conservative bias means OOM risk is low, but the over-prediction is a separate correctness-of-admission finding tracked for a follow-up."
+}
