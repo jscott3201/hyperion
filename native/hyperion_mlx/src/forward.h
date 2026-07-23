@@ -68,6 +68,41 @@ class ForwardPass {
     };
     [[nodiscard]] const std::vector<LayerCacheRef>& cache_refs() const { return cache_refs_; }
 
+    /// Drive one decoder layer (the parity test calls this per-layer to localize the
+    /// first divergence vs the oracle). Equivalent to one iteration of ``forward``'s loop.
+    [[nodiscard]] mlx::core::array run_layer(
+        const mlx::core::array& x,
+        std::size_t layer,
+        const mlx::core::array& mask,
+        KvState& kvstate,
+        std::uint32_t offset) {
+        return decoder_layer(x, layer, mask, kvstate, offset);
+    }
+
+    /// Attention internals for parity debugging: the post-o_proj output, the post-rope K,
+    /// and the post-v_norm V (both ``[B, n_kv_heads, L, head_dim]``), before the cache
+    /// append. The 2.3b test compares these to the oracle per-layer to localize a divergence.
+    struct AttentionInternals {
+        mlx::core::array out;
+        mlx::core::array k;
+        mlx::core::array v;
+    };
+    [[nodiscard]] AttentionInternals inspect_attention(
+        const mlx::core::array& x,
+        std::size_t layer,
+        const mlx::core::array& mask,
+        KvState& kvstate,
+        std::uint32_t offset) {
+        return attention(x, layer, mask, kvstate, offset);
+    }
+
+    /// Raw (pre-norm) projections for parity debugging — isolates the quantized matmul
+    /// from the norms/RoPE. ``which`` ∈ {"q", "k"}.
+    [[nodiscard]] mlx::core::array raw_proj(const mlx::core::array& x, std::size_t layer, char which) const {
+        const auto& lw = weights_.layers[layer];
+        return (which == 'k') ? lw.k_proj.apply(x, stream_) : lw.q_proj.apply(x, stream_);
+    }
+
   private:
     /// One decoder layer (the 4-norm sandwich + attention + MLP + layer_scalar).
     [[nodiscard]] mlx::core::array decoder_layer(
@@ -78,8 +113,9 @@ class ForwardPass {
         std::uint32_t offset);
 
     /// One attention block: Q/K/V proj → QK-norm (q/k scaled, v unscaled) → RoPE (q,k) →
-    /// append to cache → SDPA(scale=1.0) → o_proj. Reads the chunk K/V (offset 0).
-    [[nodiscard]] mx::array attention(
+    /// append to cache → SDPA(scale=1.0) → o_proj. Reads the chunk K/V (offset 0). Returns
+    /// the post-o_proj output + post-rope K / post-v_norm V (for parity debugging).
+    [[nodiscard]] AttentionInternals attention(
         const mx::array& x,
         std::size_t layer,
         const mx::array& mask,

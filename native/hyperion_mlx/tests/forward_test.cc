@@ -188,13 +188,12 @@ mx::array ref_attention(const mx::array& x, const ModelWeights& w, std::size_t l
 
     mx::array q = mx::reshape(lw.q_proj.apply(x, s), {B, L, nh, hd2}, s);
     q = ref_rms(q, std::optional<mx::array>(lw.q_norm), g.rms_norm_eps, s);
-    mx::array k = mx::reshape(lw.k_proj.apply(x, s), {B, L, nkvh2, hd2}, s);
+    mx::array k_raw = lw.k_proj.apply(x, s);
+    mx::array k = mx::reshape(k_raw, {B, L, nkvh2, hd2}, s);
     k = ref_rms(k, std::optional<mx::array>(lw.k_norm), g.rms_norm_eps, s);
-    mx::array v = k;
-    if (!global) {
-        v = mx::reshape(lw.v_proj->apply(x, s), {B, L, nkvh2, hd2}, s);
-        v = ref_rms(v, std::nullopt, g.rms_norm_eps, s);
-    }
+    // V: k_eq_v (global) -> v_norm(same k_proj); sliding -> v_norm(v_proj). No rope on V.
+    mx::array v_raw = global ? k_raw : lw.v_proj->apply(x, s);
+    mx::array v = ref_rms(mx::reshape(v_raw, {B, L, nkvh2, hd2}, s), std::nullopt, g.rms_norm_eps, s);
     q = ref_rope(mx::transpose(q, {0, 2, 1, 3}, s), rs, hd, 0, s);
     k = ref_rope(mx::transpose(k, {0, 2, 1, 3}, s), rs, hd, 0, s);
     v = mx::transpose(v, {0, 2, 1, 3}, s);
