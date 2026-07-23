@@ -221,6 +221,16 @@ HypStatus hyp_step_result_create(HypStepResult* out_result);
 /** Free a step-result handle and set *result to NULL. A NULL handle is a no-op. */
 HypStatus hyp_step_result_free(HypStepResult* result);
 
+/** Copy a step result's fields into a caller-owned ``HypStepResultFields``.
+ *  The serving path reads the sampled ``token_id`` / ``logit`` / top-k logprobs
+ *  back across the ABI with this accessor (M3 serving: 13 -> 14, abi_version
+ *  2 -> 3; see ADR 0003). Does NOT consume the handle — the caller still owns
+ *  the handle and must free it with ``hyp_step_result_free``. The struct is
+ *  copied out, so there is no aliasing across the seam. Returns OK on a valid
+ *  handle, INVALID_ARGUMENT on a null handle, bad magic, or null out_fields. */
+HypStatus hyp_step_result_fields(HypStepResult result,
+                                 HypStepResultFields* out_fields);
+
 #ifdef __cplusplus
 }
 #endif

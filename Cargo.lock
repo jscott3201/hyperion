@@ -337,6 +337,7 @@ dependencies = [
  "hyperion-ffi",
  "hyperion-model",
  "hyperion-tokenizer",
+ "serde_json",
 ]
 
 [[package]]
@@ -356,6 +357,8 @@ name = "hyperion-server"
 version = "0.1.0"
 dependencies = [
  "hyperion-core",
+ "hyperion-ffi",
+ "hyperion-model",
  "hyperion-tokenizer",
 ]
 

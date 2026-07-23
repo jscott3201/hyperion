@@ -821,4 +821,22 @@ HypStatus hyp_step_result_free(HypStepResult* result) {
     return hyperion::model::free_handle(result, hyperion::model::kStepResultMagic);
 }
 
+// M3 serving: read a step result's fields back across the ABI (13 -> 14,
+// abi_version 2 -> 3; see ADR 0003). Copies the struct out — the caller still
+// owns the handle and must free it separately. Aliases the existing private
+// `step_result_read` helper's magic-tag check (no double-trust across the seam:
+// validate the handle here, the same way `step_result_read` does, rather than
+// calling it and trusting a default-constructed struct).
+HypStatus hyp_step_result_fields(HypStepResult result,
+                                 HypStepResultFields* out_fields) {
+    if (out_fields == nullptr) {
+        return HYP_STATUS_INVALID_ARGUMENT;
+    }
+    if (result == nullptr || result->magic != hyperion::model::kStepResultMagic) {
+        return HYP_STATUS_INVALID_ARGUMENT;
+    }
+    *out_fields = result->fields;
+    return HYP_STATUS_OK;
+}
+
 } // extern "C"

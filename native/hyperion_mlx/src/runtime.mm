@@ -30,7 +30,9 @@ namespace mx = mlx::core;
 
 namespace {
 
-constexpr std::uint32_t kAbiVersion = 2;
+// abi_version 3: M3 serving adds hyp_step_result_fields (13 -> 14 ABI
+// functions; ADR 0003). Bump in lockstep with scripts/check-abi-surface.sh.
+constexpr std::uint32_t kAbiVersion = 3;
 
 static_assert(MLX_VERSION_MAJOR == 0);
 static_assert(MLX_VERSION_MINOR == 32);

@@ -1,5 +1,7 @@
 //! M0 server entry boundary. HTTP serving intentionally arrives at M3.
 
+pub mod engine;
+
 use hyperion_core::EngineIdentity;
 
 /// Information used by the binary's honest M0 build report.
