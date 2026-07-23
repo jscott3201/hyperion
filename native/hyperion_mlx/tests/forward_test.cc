@@ -359,6 +359,141 @@ void test_abi_load(const std::filesystem::path& fixture, const mx::Stream& gpu) 
     require(hyp_model_free(&model) == HYP_STATUS_OK, "model free");
 }
 
+void test_abi_sampler_validation(const std::filesystem::path& fixture, const mx::Stream& /*gpu*/) {
+    // M3 sampler-surface error taxonomy (06 §21): the 400-malformed bucket for
+    // HypSamplingConfig. validate_sampling_config (model.cc) runs after the handle
+    // checks, so a loaded model + valid kvstate + valid step-result are needed to
+    // REACH the config validation — then each malformed config must return
+    // HYP_STATUS_INVALID_ARGUMENT. The greedy default (NULL config / temp==0) is OK.
+    const Geometry g = make_tiny_geometry();
+    std::vector<HypLayerType> layer_types_abi = {
+        HYP_LAYER_SLIDING, HYP_LAYER_SLIDING, HYP_LAYER_SLIDING,
+        HYP_LAYER_SLIDING, HYP_LAYER_SLIDING, HYP_LAYER_FULL,
+    };
+    HypGeometryParams abi = make_tiny_abi_geometry(layer_types_abi);
+
+    HypModel model = nullptr;
+    require(hyp_model_create(&model) == HYP_STATUS_OK, "sampler val: model create");
+    require(hyp_model_load(model, &abi, fixture.string().c_str()) == HYP_STATUS_OK,
+            "sampler val: hyp_model_load succeeds on the tiny fixture");
+    HypStepResult result = nullptr;
+    require(hyp_step_result_create(&result) == HYP_STATUS_OK, "sampler val: step result create");
+
+    std::vector<std::uint32_t> prompt = {7u, 3u, 40u, 100u};
+    HypTokenStream tokens{prompt.data(), static_cast<std::uint32_t>(prompt.size()), 1};
+
+    // A fresh KV state per prefill (prefill requires offset==0; reusing a populated
+    // state would 400 on the offset check, not the config check under test).
+    auto fresh_kv = [&]() -> HypKvState {
+        HypKvState kv = nullptr;
+        require(hyp_kvstate_create(model, &kv) == HYP_STATUS_OK, "sampler val: kvstate create");
+        return kv;
+    };
+
+    // Greedy default: NULL config → OK (the G1 token-exact default).
+    {
+        HypKvState kv = fresh_kv();
+        require(
+            hyp_prefill_chunk_sampled(model, kv, &tokens, nullptr, result) == HYP_STATUS_OK,
+            "sampler val: NULL config (greedy default) must be accepted");
+        require(hyp_kvstate_free(&kv) == HYP_STATUS_OK, "sampler val: kvstate free (null cfg)");
+    }
+    // temp==0 (explicit) → also OK (greedy).
+    {
+        HypKvState kv = fresh_kv();
+        HypSamplingConfig greedy{};
+        greedy.temperature = 0.0F;
+        require(
+            hyp_prefill_chunk_sampled(model, kv, &tokens, &greedy, result) == HYP_STATUS_OK,
+            "sampler val: temperature==0 (greedy) must be accepted");
+        require(hyp_kvstate_free(&kv) == HYP_STATUS_OK, "sampler val: kvstate free (temp==0)");
+    }
+
+    // ── The 400-malformed bucket (06:21). Each must return INVALID_ARGUMENT. ──
+    // These reach validate_sampling_config (after the handle checks) on a fresh kvstate
+    // + a prefill; the malformed config must 400 BEFORE any prefill side effect.
+    HypSamplingConfig bad{};
+    auto reset_bad = [&]() { bad = HypSamplingConfig{}; };
+    // Negative temperature.
+    {
+        HypKvState kv = fresh_kv();
+        reset_bad(); bad.temperature = -1.0F;
+        require(
+            hyp_prefill_chunk_sampled(model, kv, &tokens, &bad, result) == HYP_STATUS_INVALID_ARGUMENT,
+            "sampler val: negative temperature must 400");
+        require(hyp_kvstate_free(&kv) == HYP_STATUS_OK, "sampler val: kvstate free (neg temp)");
+    }
+    // For the decode-side 400s, prefill first (greedy) on a fresh kvstate, then a malformed
+    // decode config must 400 before any decode side effect.
+    auto prefilled_kv = [&]() -> HypKvState {
+        HypKvState kv = fresh_kv();
+        require(
+            hyp_prefill_chunk_sampled(model, kv, &tokens, nullptr, result) == HYP_STATUS_OK,
+            "sampler val: greedy prefill to populate the KV state");
+        return kv;
+    };
+    // top_k > vocab_size.
+    {
+        HypKvState kv = prefilled_kv();
+        reset_bad(); bad.temperature = 1.0F; bad.top_k = static_cast<int32_t>(g.vocab_size) + 1;
+        require(
+            hyp_decode_block_sampled(model, kv, 1, &bad, result) == HYP_STATUS_INVALID_ARGUMENT,
+            "sampler val: top_k > vocab must 400");
+        require(hyp_kvstate_free(&kv) == HYP_STATUS_OK, "sampler val: kvstate free (top_k>vocab)");
+    }
+    // top_p outside (0,1] (negative).
+    {
+        HypKvState kv = prefilled_kv();
+        reset_bad(); bad.temperature = 1.0F; bad.top_p = -0.1F;
+        require(
+            hyp_decode_block_sampled(model, kv, 1, &bad, result) == HYP_STATUS_INVALID_ARGUMENT,
+            "sampler val: negative top_p must 400");
+        require(hyp_kvstate_free(&kv) == HYP_STATUS_OK, "sampler val: kvstate free (neg top_p)");
+    }
+    // top_p > 1.0.
+    {
+        HypKvState kv = prefilled_kv();
+        reset_bad(); bad.temperature = 1.0F; bad.top_p = 1.5F;
+        require(
+            hyp_decode_block_sampled(model, kv, 1, &bad, result) == HYP_STATUS_INVALID_ARGUMENT,
+            "sampler val: top_p > 1.0 must 400");
+        require(hyp_kvstate_free(&kv) == HYP_STATUS_OK, "sampler val: kvstate free (top_p>1)");
+    }
+    // min_p outside (0,1) (>= 1.0).
+    {
+        HypKvState kv = prefilled_kv();
+        reset_bad(); bad.temperature = 1.0F; bad.min_p = 1.0F;
+        require(
+            hyp_decode_block_sampled(model, kv, 1, &bad, result) == HYP_STATUS_INVALID_ARGUMENT,
+            "sampler val: min_p >= 1.0 must 400");
+        require(hyp_kvstate_free(&kv) == HYP_STATUS_OK, "sampler val: kvstate free (min_p>=1)");
+    }
+    // min_p negative.
+    {
+        HypKvState kv = prefilled_kv();
+        reset_bad(); bad.temperature = 1.0F; bad.min_p = -0.1F;
+        require(
+            hyp_decode_block_sampled(model, kv, 1, &bad, result) == HYP_STATUS_INVALID_ARGUMENT,
+            "sampler val: negative min_p must 400");
+        require(hyp_kvstate_free(&kv) == HYP_STATUS_OK, "sampler val: kvstate free (neg min_p)");
+    }
+
+    // A valid sampled config → OK (the happy path through the sampled ABI).
+    {
+        HypKvState kv = prefilled_kv();
+        reset_bad(); bad.temperature = 1.0F; bad.top_k = 8; bad.top_p = 0.9F; bad.min_p = 0.0F; bad.seed = 42;
+        require(
+            hyp_decode_block_sampled(model, kv, 1, &bad, result) == HYP_STATUS_OK,
+            "sampler val: a valid sampled config must be accepted");
+        require(hyp_kvstate_free(&kv) == HYP_STATUS_OK, "sampler val: kvstate free (valid sampled)");
+    }
+
+    std::cerr << "forward_test: ABI sampler validation OK (NULL/temp==0 greedy + 6x400 + valid sampled)\n";
+
+    require(hyp_step_result_free(&result) == HYP_STATUS_OK, "sampler val: step result free");
+    require(hyp_model_free(&model) == HYP_STATUS_OK, "sampler val: model free");
+}
+
 void test_abi_chunked_prefill(const std::filesystem::path& fixture, const mx::Stream& /*gpu*/) {
     // M2-2.6a: the chunked hyp_prefill_chunk path + the rotation read on the tiny fixture
     // (window=8, cap=16). A >2048-token prompt crosses the 2048 chunk boundary AND rotates
@@ -440,6 +575,7 @@ int main() {
             const mx::Stream gpu = mx::new_stream(mx::Device::gpu);
             test_forward_parity(fixture, gpu);
             test_abi_load(fixture, gpu);
+            test_abi_sampler_validation(fixture, gpu);
             test_abi_chunked_prefill(fixture, gpu);
             test_mask_by_kind(make_tiny_geometry(), gpu);
         } catch (const std::exception& e) {
@@ -453,6 +589,7 @@ int main() {
         const mx::Stream gpu = mx::new_stream(mx::Device::gpu);
         test_forward_parity(fixture, gpu);
         test_abi_load(fixture, gpu);
+        test_abi_sampler_validation(fixture, gpu);
         test_abi_chunked_prefill(fixture, gpu);
         test_mask_by_kind(make_tiny_geometry(), gpu);
     } catch (const std::exception& e) {

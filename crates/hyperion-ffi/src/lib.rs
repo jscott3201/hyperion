@@ -311,6 +311,34 @@ impl From<c_int> for Status {
     }
 }
 
+impl Status {
+    /// The HTTP status code this native status maps to (the M3 error taxonomy,
+    /// 06-serving-and-agentic-api.md §21-24). The server (M3 axum layer) presents
+    /// every native error as the matching HTTP code; this mapping is the contract
+    /// between the native engine and the serving layer.
+    ///
+    ///   Ok             → 200 (success)
+    ///   InvalidArgument→ 400 (malformed / bad tool schema / unsupported tool_choice)
+    ///   NotFound       → 404
+    ///   OomGovernor    → 529 (governor rejection — pre-stream or mid-stream SSE error)
+    ///   Unsupported    → 400 (the spec lumps unsupported-tool_choice under 400; a
+    ///                    capability-unsupported 501 is a future refinement)
+    ///   Io | Internal  → 500 (opaque — 06:24 "internal, opaque")
+    ///   Cancelled      → 499 (client-closed, the standard non-RFC code)
+    ///   Unknown        → 500 (an unrecognized native status is presented as internal)
+    #[must_use]
+    pub const fn http_status_code(self) -> u16 {
+        match self {
+            Self::Ok => 200,
+            Self::InvalidArgument | Self::Unsupported => 400,
+            Self::NotFound => 404,
+            Self::OomGovernor => 529,
+            Self::Io | Self::Internal | Self::Unknown(_) => 500,
+            Self::Cancelled => 499,
+        }
+    }
+}
+
 /// Error reported by the native runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Error {
@@ -864,5 +892,38 @@ mod tests {
         assert_eq!(info.mlx_runtime_version, "0.32.0");
         assert_eq!(info.mlx_probe_value, 4.0);
         assert_eq!(info.metallib_probe_value, 42.0);
+    }
+
+    /// The M3 error-taxonomy contract: every native Status maps to the HTTP code the
+    /// serving layer will present (06 §21-24). This is the native half of the M3 gate
+    /// "contract tests green (all error codes)"; the server-only codes (401 auth, 409
+    /// reload conflict, 413 body-limit, 429 single-flight busy) land with the axum layer.
+    #[test]
+    fn m3_error_taxonomy_status_to_http() {
+        // Success.
+        assert_eq!(Status::Ok.http_status_code(), 200);
+        // 400 — malformed / bad tool schema / unsupported tool_choice (06:21).
+        assert_eq!(Status::InvalidArgument.http_status_code(), 400);
+        assert_eq!(Status::Unsupported.http_status_code(), 400);
+        // 404 — not found.
+        assert_eq!(Status::NotFound.http_status_code(), 404);
+        // 529 — governor rejection, pre-stream or mid-stream SSE error (06:23-24).
+        assert_eq!(Status::OomGovernor.http_status_code(), 529);
+        // 500 — internal, opaque (06:24). IO failures are presented as internal.
+        assert_eq!(Status::Internal.http_status_code(), 500);
+        assert_eq!(Status::Io.http_status_code(), 500);
+        // 499 — client-closed (cancel-on-drop).
+        assert_eq!(Status::Cancelled.http_status_code(), 499);
+        // An unrecognized native status is presented as internal (500), never leaked.
+        assert_eq!(Status::Unknown(999).http_status_code(), 500);
+        // The c_int → Status mapping is stable (the HypStatus enum order is the contract).
+        assert_eq!(Status::from(0), Status::Ok);
+        assert_eq!(Status::from(1), Status::InvalidArgument);
+        assert_eq!(Status::from(2), Status::NotFound);
+        assert_eq!(Status::from(3), Status::Io);
+        assert_eq!(Status::from(4), Status::OomGovernor);
+        assert_eq!(Status::from(5), Status::Unsupported);
+        assert_eq!(Status::from(6), Status::Internal);
+        assert_eq!(Status::from(7), Status::Cancelled);
     }
 }
