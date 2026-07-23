@@ -4,6 +4,7 @@
 #include "forward.h"
 #include "geometry.h"
 #include "kv_cache.h"
+#include "step_result_access.h"
 #include "weights_loader.h"
 
 #include <cstdint>
@@ -12,6 +13,7 @@
 #include <new>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <mlx/mlx.h>
 
@@ -26,6 +28,7 @@ struct HypModelOpaque {
     std::unique_ptr<hyperion::model::Geometry> geometry;
     std::unique_ptr<hyperion::model::DispatchTable> dispatch;
     std::unique_ptr<hyperion::model::ModelWeights> weights;
+    std::unique_ptr<hyperion::model::ForwardPass> fwd; // M2-2.7: the per-layer math + epilogue.
     std::optional<mx::Stream> stream;
 };
 
@@ -33,6 +36,11 @@ struct HypKvStateOpaque {
     std::uint32_t magic;
     std::unique_ptr<hyperion::model::KvState> kv;
     std::optional<mx::Stream> stream;
+    // M2-2.7 autoregressive cursor: the offset = committed prefix length (passed
+    // to forward() as the attention offset), and last_token = the id to embed for
+    // the next decode step (set by prefill/decode from the sampler). Per-kvstate.
+    std::uint32_t offset = 0;
+    std::uint32_t last_token = 0;
 };
 
 struct HypStepResultOpaque {
@@ -133,6 +141,50 @@ HypStatus free_handle(Handle** handle, std::uint32_t magic) noexcept {
     return ok();
 }
 
+// ── M2-2.7 generation epilogue + step-result plumbing ───────────────────────
+// prefill_chunk/decode_block share: final-norm hidden (forward already applied
+// final_norm) → tied lm_head → softcap → last-position slice → greedy argmax.
+
+/// Run the lm_head + softcap + greedy sampler on the final-norm hidden state's
+/// LAST position. ``h`` is ``[B, L, hidden]`` (already final-norm'd by forward()).
+ForwardPass::GreedySample run_epilogue(ForwardPass& fwd, const mx::array& h, mx::Stream s) {
+    const int L = static_cast<int>(h.shape(1));
+    mx::array logits = fwd.lm_head(h);                 // [B, L, vocab]
+    logits = fwd.softcap(logits);                      // [B, L, vocab]
+    // last position → [1, 1, vocab] (a contiguous slice of the final row → sample_greedy
+    // reads vocab contiguous floats; no reshape needed).
+    mx::array last = mx::slice(
+        logits,
+        {0, L - 1, 0},
+        {1, L, static_cast<int>(logits.shape(2))},
+        {1, 1, 1},
+        s);
+    return fwd.sample_greedy(last);
+}
+
+/// Write the sampled token + telemetry to a validated step-result handle. Memory
+/// fields are 0 (governor admission is 2.6); governor_state = READY.
+void write_step_result(HypStepResult result, const ForwardPass::GreedySample& sample, std::uint32_t near_tie_events) {
+    result->fields.token_id = sample.token_id;
+    result->fields.logit = sample.logit;
+    result->fields.near_tie_events = near_tie_events;
+    result->fields.governor_state = HYP_GOVERNOR_READY;
+    result->fields.peak_mlx_bytes = 0;        // 2.6 governor
+    result->fields.active_mlx_bytes = 0;
+    result->fields.phys_footprint_bytes = 0;
+    result->fields.local_kv_bytes = 0;
+    result->fields.global_kv_bytes = 0;
+    result->fields.local_kv_eval_ms = 0.0F;
+    result->fields.global_kv_eval_ms = 0.0F;
+}
+
+HypStepResultFields step_result_read(HypStepResult result) noexcept {
+    if (result == nullptr || result->magic != kStepResultMagic) {
+        return HypStepResultFields{};
+    }
+    return result->fields;
+}
+
 } // namespace hyperion::model
 
 extern "C" {
@@ -189,6 +241,11 @@ HypStatus hyp_model_load(HypModel model,
         model->geometry = std::make_unique<hyperion::model::Geometry>(std::move(geo));
         model->dispatch = std::move(dispatch);
         model->weights = std::move(weights);
+        // M2-2.7: the ForwardPass owns the per-layer math + the generation epilogue
+        // (lm_head + softcap + greedy sampler). Built once at load; holds refs into the
+        // geometry/dispatch/weights owned by this handle (lifetimes tied to the model).
+        model->fwd = std::make_unique<hyperion::model::ForwardPass>(
+            *model->geometry, *model->dispatch, *model->weights, gpu);
         model->stream = gpu;
         model->loaded = true;
         return hyperion::model::ok();
@@ -260,18 +317,57 @@ HypStatus hyp_prefill_chunk(HypModel model,
     if (tokens == nullptr) {
         return hyperion::model::fail(HYP_STATUS_INVALID_ARGUMENT, "tokens is null");
     }
+    if (tokens->count == 0) {
+        return hyperion::model::fail(HYP_STATUS_INVALID_ARGUMENT, "prefill token count is 0");
+    }
+    if (tokens->tokens == nullptr) {
+        return hyperion::model::fail(HYP_STATUS_INVALID_ARGUMENT, "tokens->tokens is null");
+    }
     status = hyperion::model::validate_step_result(out_result);
     if (status != HYP_STATUS_OK) {
         return status;
     }
-    return hyperion::model::fail(
-        HYP_STATUS_UNSUPPORTED,
-        "hyp_prefill_chunk is not implemented until M2-2.6 (chunked prefill)");
+    if (!model->loaded || model->fwd == nullptr) {
+        return hyperion::model::fail(HYP_STATUS_INVALID_ARGUMENT, "model is not loaded");
+    }
+    // 2.7 prefill is single-chunk (the whole prompt in one forward at offset 0).
+    // Re-prefilling a populated state is rejected (a kvstate reset + chunked 2048
+    // prefill + governor admission is 2.6).
+    if (kvstate->offset != 0) {
+        return hyperion::model::fail(
+            HYP_STATUS_INVALID_ARGUMENT, "prefill requires a fresh (offset 0) KV state");
+    }
+
+    try {
+        const mx::Stream s = *model->stream;
+        // Copy uint32 ids → int32 (MLX int32; ids < vocab < 2^31 so the cast is exact).
+        std::vector<int32_t> host_ids;
+        host_ids.reserve(tokens->count);
+        for (std::uint32_t i = 0; i < tokens->count; ++i) {
+            host_ids.push_back(static_cast<int32_t>(tokens->tokens[i]));
+        }
+        mx::array ids = mx::array(host_ids.data(), mx::Shape{static_cast<int>(tokens->count)}, mx::int32);
+        mx::array h = model->fwd->embed(ids);       // [1, L, hidden]
+        h = model->fwd->forward(h, *kvstate->kv, 0); // final-norm'd; appends K/V at offset 0
+        const hyperion::model::ForwardPass::GreedySample sample =
+            hyperion::model::run_epilogue(*model->fwd, h, s);
+        kvstate->offset = tokens->count;            // advance the autoregressive cursor
+        kvstate->last_token = sample.token_id;
+        hyperion::model::write_step_result(out_result, sample, sample.near_tie ? 1u : 0u);
+        return hyperion::model::ok();
+    } catch (const std::bad_alloc&) {
+        return hyperion::model::fail(
+            HYP_STATUS_INTERNAL, "native allocation failed outside predictive governor admission");
+    } catch (const std::exception& error) {
+        return hyperion::model::fail(HYP_STATUS_INTERNAL, error.what());
+    } catch (...) {
+        return hyperion::model::fail(HYP_STATUS_INTERNAL, "hyp_prefill_chunk failed with a non-standard exception");
+    }
 }
 
 HypStatus hyp_decode_block(HypModel model,
                             HypKvState kvstate,
-                            uint32_t /*n_tokens*/,
+                            uint32_t n_tokens,
                             HypStepResult out_result) {
     auto status = hyperion::model::validate_model(model, "hyp_decode_block");
     if (status != HYP_STATUS_OK) {
@@ -285,9 +381,53 @@ HypStatus hyp_decode_block(HypModel model,
     if (status != HYP_STATUS_OK) {
         return status;
     }
-    return hyperion::model::fail(
-        HYP_STATUS_UNSUPPORTED,
-        "hyp_decode_block is not implemented until M2-2.7 (decode + greedy sampler)");
+    if (!model->loaded || model->fwd == nullptr) {
+        return hyperion::model::fail(HYP_STATUS_INVALID_ARGUMENT, "model is not loaded");
+    }
+    if (kvstate->offset == 0) {
+        // decode needs a populated prefix — prefill first (or 2.6 chunked prefill).
+        return hyperion::model::fail(
+            HYP_STATUS_INVALID_ARGUMENT, "decode requires a populated KV state (prefill first)");
+    }
+    if (n_tokens == 0) {
+        // Nothing to do; leave the step-result zeroed + READY. (A no-op decode is a
+        // legal call shape — a verify block of size 0, M7.)
+        hyperion::model::write_step_result(
+            out_result, hyperion::model::ForwardPass::GreedySample{0, 0.0F, false}, 0u);
+        return hyperion::model::ok();
+    }
+
+    try {
+        const mx::Stream s = *model->stream;
+        std::uint32_t near_tie_events = 0;
+        hyperion::model::ForwardPass::GreedySample sample{0, 0.0F, false};
+        // Autoregressive loop: embed last_token → forward at the current offset (q_len=1,
+        // cached-prefix read) → epilogue → advance cursor. For greedy M2 the caller uses
+        // n_tokens=1 per call; n_tokens>1 is the speculative-verify block shape (M7).
+        for (std::uint32_t step = 0; step < n_tokens; ++step) {
+            int32_t id = static_cast<int32_t>(kvstate->last_token);
+            mx::array ids = mx::array(&id, mx::Shape{1}, mx::int32);
+            mx::array h = model->fwd->embed(ids);             // [1, 1, hidden]
+            h = model->fwd->forward(h, *kvstate->kv, kvstate->offset); // final-norm'd; appends 1 K/V
+            sample = hyperion::model::run_epilogue(*model->fwd, h, s);
+            if (sample.near_tie) {
+                ++near_tie_events;
+            }
+            kvstate->last_token = sample.token_id;
+            kvstate->offset += 1;
+        }
+        // The StepResult captures the LAST step's token + cumulative near_tie_events
+        // across the block + peak memory (governor telemetry is 2.6).
+        hyperion::model::write_step_result(out_result, sample, near_tie_events);
+        return hyperion::model::ok();
+    } catch (const std::bad_alloc&) {
+        return hyperion::model::fail(
+            HYP_STATUS_INTERNAL, "native allocation failed outside predictive governor admission");
+    } catch (const std::exception& error) {
+        return hyperion::model::fail(HYP_STATUS_INTERNAL, error.what());
+    } catch (...) {
+        return hyperion::model::fail(HYP_STATUS_INTERNAL, "hyp_decode_block failed with a non-standard exception");
+    }
 }
 
 HypStatus hyp_step_result_create(HypStepResult* out_result) {

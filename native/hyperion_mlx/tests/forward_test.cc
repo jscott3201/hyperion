@@ -20,6 +20,7 @@
 #include "forward.h"
 #include "geometry.h"
 #include "kv_cache.h"
+#include "step_result_access.h"
 #include "weights_loader.h"
 
 #include "hyperion_mlx.h"
@@ -227,6 +228,40 @@ mx::array ref_forward(const mx::array& ids, const ModelWeights& w, const Geometr
     return ref_rms(h, std::optional<mx::array>(w.final_norm), g.rms_norm_eps, s);
 }
 
+// Inline reference for the greedy epilogue: tied lm_head + softcap + last-position
+// argmax (host-side, per the 2.3b stale-scalar lesson). Mirrors
+// ForwardPass::lm_head/softcap/sample_greedy so the ABI prefill token can be checked
+// against an independent assembly. Transcription parity — weak vs the 12B oracle in
+// forward_12b_decode_test, but exercises the full epilogue path on CI.
+std::uint32_t ref_greedy(const mx::array& ids, const ModelWeights& w, const Geometry& g, const mx::Stream& s) {
+    mx::array h = ref_forward(ids, w, g, s); // [1, L, hidden] final-norm'd
+    mx::array logits = mx::quantized_matmul(
+        h, w.embed_weight, w.embed_scales, std::optional<mx::array>(w.embed_biases),
+        /*transpose=*/true, std::optional<int>(w.embed_group_size), std::optional<int>(w.embed_bits),
+        /*mode=*/"affine", s); // [1, L, vocab]
+    const float sc = g.final_logit_softcapping;
+    logits = mx::multiply(
+        mx::tanh(mx::divide(logits, mx::array(sc, logits.dtype()), s), s),
+        mx::array(sc, logits.dtype()), s);
+    const int L = static_cast<int>(h.shape(1));
+    const int vocab = static_cast<int>(logits.shape(2));
+    const mx::Stream cs = mx::default_stream(mx::Device::cpu);
+    mx::array last = mx::astype(
+        mx::contiguous(mx::slice(logits, {0, L - 1, 0}, {1, L, vocab}, {1, 1, 1}, s), false, cs),
+        mx::float32, cs);
+    mx::eval(last);
+    const float* p = last.data<float>();
+    float top1 = -std::numeric_limits<float>::infinity();
+    std::uint32_t arg = 0;
+    for (int i = 0; i < vocab; ++i) {
+        if (p[i] > top1) {
+            top1 = p[i];
+            arg = static_cast<std::uint32_t>(i);
+        }
+    }
+    return arg;
+}
+
 // ---------------------------------------------------------------------------
 
 void test_forward_parity(const std::filesystem::path& fixture, const mx::Stream& gpu) {
@@ -264,8 +299,13 @@ void test_forward_parity(const std::filesystem::path& fixture, const mx::Stream&
     require(g_mask.shape(0) == 4 && g_mask.shape(1) == 16, "global mask shape [q,kv]");
 }
 
-void test_abi_load(const std::filesystem::path& fixture, const mx::Stream& /*gpu*/) {
-    // The real hyp_model_load path: build the ABI geometry, load, allocate KV.
+void test_abi_load(const std::filesystem::path& fixture, const mx::Stream& gpu) {
+    // The real hyp_model_load + hyp_prefill_chunk + hyp_decode_block path on the tiny
+    // fixture (M2-2.7): single-chunk prefill → first token; decode 1 → next token. The
+    // prefill token is checked against the inline reference argmax (ref_greedy) —
+    // transcription parity on the epilogue (the 12B oracle in forward_12b_decode_test
+    // is the real seal). Chunked 2048 prefill + governor admission is 2.6.
+    const Geometry g = make_tiny_geometry();
     std::vector<HypLayerType> layer_types_abi = {
         HYP_LAYER_SLIDING, HYP_LAYER_SLIDING, HYP_LAYER_SLIDING,
         HYP_LAYER_SLIDING, HYP_LAYER_SLIDING, HYP_LAYER_FULL,
@@ -280,16 +320,39 @@ void test_abi_load(const std::filesystem::path& fixture, const mx::Stream& /*gpu
     HypKvState kv = nullptr;
     require(hyp_kvstate_create(model, &kv) == HYP_STATUS_OK, "kvstate create on loaded model");
 
-    // prefill/decode are still stubs (2.6/2.7).
     HypStepResult result = nullptr;
     require(hyp_step_result_create(&result) == HYP_STATUS_OK, "step result create");
-    HypTokenStream tokens{nullptr, 0, 1};
+
+    // Prefill a short prompt (L=4 <= window=8) → first generated token.
+    std::vector<std::uint32_t> prompt = {7u, 3u, 40u, 100u};
+    HypTokenStream tokens{prompt.data(), static_cast<std::uint32_t>(prompt.size()), 1};
     require(
-        hyp_prefill_chunk(model, kv, &tokens, result) == HYP_STATUS_UNSUPPORTED,
-        "prefill stub returns UNSUPPORTED until 2.6");
+        hyp_prefill_chunk(model, kv, &tokens, result) == HYP_STATUS_OK,
+        "hyp_prefill_chunk succeeds (single-chunk prefill)");
+    HypStepResultFields pf = hyperion::model::step_result_read(result);
+    require(pf.token_id < g.vocab_size, "prefill token within vocab");
+    require(pf.governor_state == HYP_GOVERNOR_READY, "governor READY (governor is 2.6)");
+
+    // Cross-check the prefill token vs the inline reference argmax (same weights, same prompt).
+    const mx::Stream cpu = mx::default_stream(mx::Device::cpu);
+    ModelWeights weights = load_model_weights(fixture, g, 64, 4, cpu);
+    mx::array ids = mx::array({7, 3, 40, 100}, mx::Shape{4}, mx::int32);
+    const std::uint32_t ref_tok = ref_greedy(ids, weights, g, gpu);
     require(
-        hyp_decode_block(model, kv, 1, result) == HYP_STATUS_UNSUPPORTED,
-        "decode stub returns UNSUPPORTED until 2.7");
+        pf.token_id == ref_tok,
+        "prefill token == inline reference argmax (transcription parity on the epilogue)");
+
+    // Decode 1 token (offset>0, cached-prefix read) → next token.
+    require(
+        hyp_decode_block(model, kv, 1, result) == HYP_STATUS_OK,
+        "hyp_decode_block succeeds (offset>0 cached-prefix read)");
+    HypStepResultFields dc = hyperion::model::step_result_read(result);
+    require(dc.token_id < g.vocab_size, "decode token within vocab");
+
+    std::cerr << "forward_test: ABI prefill+decode OK on the tiny fixture "
+              << "(prefill token " << pf.token_id << " == ref " << ref_tok
+              << "; decode token " << dc.token_id
+              << "; near_tie_events=" << dc.near_tie_events << ")\n";
 
     require(hyp_step_result_free(&result) == HYP_STATUS_OK, "step result free");
     require(hyp_kvstate_free(&kv) == HYP_STATUS_OK, "kvstate free");

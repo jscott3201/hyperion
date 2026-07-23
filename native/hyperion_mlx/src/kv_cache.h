@@ -138,7 +138,11 @@ class GlobalKvCache {
     void append(const mlx::core::array& k_update, const mlx::core::array& v_update, std::uint32_t n);
 
     [[nodiscard]] const mlx::core::array& keys() const { return k_; }
-    [[nodiscard]] const mlx::core::array& values() const { return k_eq_v_ ? k_ : v_; }
+    /// V is stored separately from K (M2-2.7 fix: gemma4's k_eq_v means V comes from
+    /// the same k_proj as K, but V = v_norm(k_proj) ≠ K = rope(k_norm(k_proj));
+    /// aliasing V=K served K as V at the offset>0 read). ``k_eq_v_`` is now a
+    /// forward-computation fact (no v_proj weight), not a cache-storage flag.
+    [[nodiscard]] const mlx::core::array& values() const { return v_; }
 
   private:
     GlobalCacheIndex index_;

@@ -217,6 +217,73 @@ void test_global_grow_and_preserve(const mx::Stream& s) {
     require(region_matches(cache.keys(), 8, u2, 0, 2, s, 1, 2), "tail tokens in place");
 }
 
+void test_global_stores_distinct_v(const mx::Stream& s) {
+    // Regression guard for the V=K aliasing bug (M2-2.7): the GlobalKvCache MUST store V
+    // separately from K even when k_eq_v — gemma4's V = v_norm(k_proj) is DISTINCT from
+    // K = rope(k_norm(k_proj)). test_global_grow_and_preserve feeds IDENTICAL K and V, so
+    // it cannot catch the aliasing. Feed DISTINCT K (base 0) and V (base 100) and verify
+    // values() holds V, not K.
+    GlobalKvCache cache(4, 1, 2, true, mx::float32, s);
+    const mx::array k_up = make_update(4, 0, s, 1, 2);   // [4,1,2] values 0..7
+    const mx::array v_up = make_update(4, 100, s, 1, 2); // [4,1,2] values 200..207 (distinct)
+    cache.append(k_up, v_up, 4);
+    require(cache.committed_len() == 4, "distinct-v: committed 4");
+    require(region_matches(cache.keys(), 0, k_up, 0, 4, s, 1, 2), "distinct-v: keys == K (base 0)");
+    require(region_matches(cache.values(), 0, v_up, 0, 4, s, 1, 2), "distinct-v: values == V (base 100, NOT K)");
+}
+
+void test_k_append_construction(const mx::Stream& s) {
+    // Regression guard for the k_append reshape-scramble bug (M2-2.7): forward.cc builds
+    //   k_append = reshape(transpose(k, {0,2,1,3}), {L, nkv, hd})
+    // from k = [1, nkv, L, hd] (post-transpose) to write into the cache's [cap, nkv, hd]
+    // slots. The transpose is LOAD-BEARING: a plain reshape(k, {L, nkv, hd}) reinterprets
+    // the flat buffer and swaps the nkv/L axes (the bug). Verify k_append[i, j, k] == k's
+    // value at [0, j, i, k] (position i, head j, dim k) — and that the plain reshape
+    // scrambles (negative control proving the transpose is necessary).
+    constexpr int B = 1, Nkv = 3, L = 4, Hd = 2;
+    auto val = [](int j, int i, int k) { return static_cast<float>(j * 100 + i * 10 + k); };
+    std::vector<float> host(static_cast<std::size_t>(B * Nkv * L * Hd));
+    for (int j = 0; j < Nkv; ++j) {
+        for (int i = 0; i < L; ++i) {
+            for (int k = 0; k < Hd; ++k) {
+                host[static_cast<std::size_t>((j * L + i) * Hd + k)] = val(j, i, k); // [1, nkv, L, hd]
+            }
+        }
+    }
+    const mx::array k = mx::array(host.data(), mx::Shape{B, Nkv, L, Hd}, mx::float32);
+    const mx::array k_append = mx::reshape(mx::transpose(k, {0, 2, 1, 3}, s), {L, Nkv, Hd}, s);
+    mx::eval(k_append);
+    const float* p = k_append.data<float>();
+    bool ok = true;
+    for (int i = 0; i < L && ok; ++i) {
+        for (int j = 0; j < Nkv && ok; ++j) {
+            for (int k = 0; k < Hd && ok; ++k) {
+                if (p[static_cast<std::size_t>((i * Nkv + j) * Hd + k)] != val(j, i, k)) {
+                    ok = false; // [L, nkv, hd] row-major
+                }
+            }
+        }
+    }
+    require(ok, "k_append construction: [i,j,k] == k[0,j,i,k] (transpose prevents scramble)");
+
+    // Negative control: the BUGGY plain reshape DOES scramble (proves the transpose is
+    // load-bearing, not decorative).
+    const mx::array scrambled = mx::reshape(k, {L, Nkv, Hd}, s);
+    mx::eval(scrambled);
+    const float* sp = scrambled.data<float>();
+    bool scrambled_matches = true;
+    for (int i = 0; i < L && scrambled_matches; ++i) {
+        for (int j = 0; j < Nkv && scrambled_matches; ++j) {
+            for (int k = 0; k < Hd && scrambled_matches; ++k) {
+                if (sp[static_cast<std::size_t>((i * Nkv + j) * Hd + k)] != val(j, i, k)) {
+                    scrambled_matches = false;
+                }
+            }
+        }
+    }
+    require(!scrambled_matches, "negative control: plain reshape scrambles (the bug)");
+}
+
 Geometry make_small_geometry() {
     // 6 layers in a 5:1 layout (5 sliding + 1 global), tiny dims.
     Geometry geometry{};
@@ -297,6 +364,8 @@ int main() {
         test_local_speculative_exclusion(stream);
         test_local_partial_commit(stream);
         test_global_grow_and_preserve(stream);
+        test_global_stores_distinct_v(stream);
+        test_k_append_construction(stream);
         test_build_kv_state(stream);
     } catch (const std::exception& error) {
         std::cerr << "kv_cache_test: uncaught exception: " << error.what() << '\n';

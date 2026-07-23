@@ -39,9 +39,10 @@ class ForwardPass {
     [[nodiscard]] mlx::core::array embed(const mlx::core::array& ids) const;
 
     /// Run all decoder layers over ``h`` ``[B, L, hidden]`` at ``offset`` (current committed
-    /// KV length; 0 for a fresh prefill). Appends each layer's K/V to ``kvstate``. Returns
-    /// the final-RMSNorm hidden state ``[B, L, hidden]``. Asserts ``offset == 0`` for 2.3a
-    /// (cached-prefix attention read is 2.6).
+    /// KV length; 0 for a fresh prefill, =prompt_len for decode). Appends each layer's K/V
+    /// to ``kvstate``. Returns the final-RMSNorm hidden state ``[B, L, hidden]``. The
+    /// offset>0 cached-prefix attention read (``attention()``) is M2-2.7; the offset==0
+    /// prefill path is the 2.3b bit-exact path (unchanged).
     [[nodiscard]] mlx::core::array forward(
         const mlx::core::array& h,
         KvState& kvstate,
@@ -49,6 +50,43 @@ class ForwardPass {
 
     /// Final RMSNorm (``model.norm``). Public so the 2.7 epilogue can reuse it.
     [[nodiscard]] mlx::core::array final_norm(const mlx::core::array& h) const;
+
+    /// ── Generation epilogue (M2-2.7) ──────────────────────────────────────────
+    /// The lm_head + softcap + greedy-sampler path that turns the final-norm hidden
+    /// state into a sampled token. ``lm_head`` is TIED to the quantized embedding
+    /// table (``ModelWeights::embed_*``); ``geometry.tie_word_embeddings`` is
+    /// validated true at load (``geometry.cc`` rejects false), so there is no
+    /// untied path. ``softcap`` follows the mlx-lm ``logit_softcap`` exactly:
+    /// ``softcap * tanh(logits / softcap)`` with NO fp32 cast (operates in the
+    /// lm_head output dtype). Greedy argmax is host-side (see ``sample_greedy``).
+    ///@{
+
+    /// Tied lm_head: ``[B, L, hidden] @ embed_weightᵀ → [B, L, vocab]``. The embed
+    /// table is stored ``[vocab, hidden] = [out, in]`` — the same layout
+    /// ``QuantizedLinear::w`` uses — so ``quantized_matmul`` with ``transpose=true``
+    /// fuses dequant + the transposed matmul (the q/k/v/o path, ``weights.h``).
+    [[nodiscard]] mlx::core::array lm_head(const mlx::core::array& h) const;
+
+    /// ``final_logit_softcapping * tanh(logits / final_logit_softcapping)``.
+    [[nodiscard]] mlx::core::array softcap(const mlx::core::array& logits) const;
+
+    /// A greedy argmax + top-2 near-tie over one position's logits.
+    struct GreedySample {
+        std::uint32_t token_id; ///< argmax token.
+        float logit;            ///< the winning post-softcap logit.
+        bool near_tie;          ///< top-2 gap < 0.5 (A1, the near_tie_events counter).
+    };
+    /// ``logits_last`` is ``[vocab]`` (one position, post-softcap). Returns the
+    /// argmax token + its logit + whether the top-2 gap is < 0.5.
+    ///
+    /// THE 2.3b LESSON: MLX lazy-graph ``mx::argmax``/``mx::max`` scalars go STALE
+    /// across repeated evals in a decode loop (graph-cache aliasing) — so this
+    /// reads raw contiguous ``data<float>()`` pointers and host-scans for top-1
+    /// AND top-2 in one pass. (A GPU ``mx::argmax``+``topk`` port would risk the
+    /// stale-scalar bug; the 262144-vocab CPU scan is a G2 perf flag, not a block.)
+    /// This is the load-bearing choice in the slice — the seam.
+    [[nodiscard]] GreedySample sample_greedy(const mlx::core::array& logits_last) const;
+    ///@}
 
     /// The attention mask for one kind, shape ``[q_len, kv_len]`` boolean (True = attend).
     /// ``offset`` is the committed prefix length; ``kv_len`` the attention read length.

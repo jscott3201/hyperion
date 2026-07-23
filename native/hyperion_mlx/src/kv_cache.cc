@@ -148,36 +148,32 @@ void GlobalKvCache::append(
 
     const std::uint32_t new_capacity = index_.capacity();
     if (new_capacity > allocated_capacity_) {
-        // The only allocation event: cross a bucket boundary. Allocate the grown
-        // buffer and copy the committed prefix so existing KV survives the grow.
-        mx::array grown = mx::zeros(kv_shape(new_capacity, num_kv_heads_, head_dim_), dtype_, stream_);
-        if (allocated_capacity_ > 0) {
-            const auto h = static_cast<int>(num_kv_heads_);
-            const auto d = static_cast<int>(head_dim_);
-            grown = mx::slice_update(
-                grown,
-                k_,
-                {0, 0, 0},
-                {static_cast<int>(allocated_capacity_), h, d},
-                {1, 1, 1},
-                stream_);
-            if (!k_eq_v_) {
-                v_ = mx::slice_update(
-                    mx::zeros(kv_shape(new_capacity, num_kv_heads_, head_dim_), dtype_, stream_),
-                    v_,
-                    {0, 0, 0},
-                    {static_cast<int>(allocated_capacity_), h, d},
-                    {1, 1, 1},
-                    stream_);
+        // The only allocation event: cross a bucket boundary (or the first append).
+        // Allocate the grown buffer and copy the committed prefix so existing KV
+        // survives the grow. BOTH K and V are grown + written — V is NOT aliased to
+        // K even when ``k_eq_v_`` (M2-2.7 fix): gemma4's k_eq_v means V comes from
+        // the SAME k_proj as K (no separate v_proj weight), but V = v_norm(k_proj)
+        // is a DISTINCT tensor from K = rope(k_norm(k_proj)). Aliasing V=K (as the
+        // 2.1 design did) served K as V at the offset>0 read → wrong logits. The
+        // forward computes the correct distinct V; the cache must store it.
+        const auto h = static_cast<int>(num_kv_heads_);
+        const auto d = static_cast<int>(head_dim_);
+        auto grow_buf = [&](const mx::array& old) {
+            mx::array g = mx::zeros(kv_shape(new_capacity, num_kv_heads_, head_dim_), dtype_, stream_);
+            if (allocated_capacity_ > 0) {
+                g = mx::slice_update(
+                    g, old, {0, 0, 0},
+                    {static_cast<int>(allocated_capacity_), h, d}, {1, 1, 1}, stream_);
             }
-        }
-        k_ = std::move(grown);
+            return g;
+        };
+        k_ = grow_buf(k_);
+        v_ = grow_buf(v_);
         allocated_capacity_ = new_capacity;
     }
 
     // Write the appended tokens contiguously at [start : start+n) (full causal —
-    // no ring, no straddle). The region beyond committed_len is never read by
-    // attention, so no zeroing of the freshly grown tail is needed.
+    // no ring, no straddle). Both K and V are written (see the aliasing note above).
     const auto h = static_cast<int>(num_kv_heads_);
     const auto d = static_cast<int>(head_dim_);
     k_ = mx::slice_update(
@@ -187,15 +183,13 @@ void GlobalKvCache::append(
         {static_cast<int>(start + n), h, d},
         {1, 1, 1},
         stream_);
-    if (!k_eq_v_) {
-        v_ = mx::slice_update(
-            v_,
-            v_update,
-            {static_cast<int>(start), 0, 0},
-            {static_cast<int>(start + n), h, d},
-            {1, 1, 1},
-            stream_);
-    }
+    v_ = mx::slice_update(
+        v_,
+        v_update,
+        {static_cast<int>(start), 0, 0},
+        {static_cast<int>(start + n), h, d},
+        {1, 1, 1},
+        stream_);
 }
 
 // ---------------------------------------------------------------------------
