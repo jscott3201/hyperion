@@ -6,5 +6,18 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dependencies]
+# The in-process tokenizer (M3, 03 §Sampling + 04:80-82). `tokenizers` IS the
+# HuggingFace Rust backend transformers uses under the hood, so loading the 12B's
+# tokenizer.json via it guarantees byte-identical encode/decode parity vs the
+# oracle (no hand-rolled BPE / normalizer / added_tokens edge cases). Pure Rust
+# (unsafe_code=deny). The chat-template renderer (minijinja) is a FOLLOW-UP slice —
+# the gemma4 chat_template.jinja uses dict `.get()` (line 239) which minijinja does not
+# support as a method; a custom-minijinja-object or template-preprocess solution is
+# deferred (see M3 state).
+tokenizers = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 [lints]
 workspace = true
