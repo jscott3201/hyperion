@@ -189,9 +189,9 @@ async fn auth_200_correct_token() {
         4096,
         &control,
     );
-    // count_tokens: a 200 path that doesn't need the engine. (The body carries
-    // max_tokens because count_tokens reuses the prepare path, which validates
-    // it; the count itself ignores max_tokens.)
+    // count_tokens: a 200 path that doesn't need the engine AND must NOT require
+    // max_tokens (Anthropic's count_tokens only counts input tokens — the
+    // adversarial review caught a spurious 400 here). No max_tokens in the body.
     let (status, body) = send(
         srv.router(),
         Method::POST,
@@ -200,10 +200,14 @@ async fn auth_200_correct_token() {
             ("authorization", "Bearer secret"),
             ("content-type", "application/json"),
         ],
-        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4}"#,
+        r#"{"messages":[{"role":"user","content":"hi"}]}"#,
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "count_tokens without max_tokens: {body}"
+    );
     assert!(
         body.contains("input_tokens"),
         "count_tokens response: {body}"
@@ -526,6 +530,184 @@ async fn single_flight_429_when_busy() {
     assert!(control.stats().single_flight_rejections >= 1);
     // Let the first finish (cleanup).
     first.abort();
+}
+
+// ── Adversarial-review regression guards ─────────────────────────────────
+//
+// These pin the fixes for the PR-B adversarial findings: the raw-SSE byte
+// stream (not axum-Event-repacked, which corrupted the event:/data: framing),
+// the in_flight flag cleared on client disconnect (the Guard's Drop), and
+// count_tokens not requiring max_tokens (covered by auth_200_correct_token
+// above).
+
+/// The streaming response body must be raw, well-formed SSE: the framer's
+/// `event: <type>\ndata: {...}\n\n` chunks emitted verbatim (NOT repacked
+/// through axum's `Event::data`, which would produce `data: event: ...` —
+/// garbage). Drives an Anthropic stream through the router + asserts the body
+/// contains the canonical event sequence with the right framing prefixes.
+#[tokio::test]
+async fn streaming_emits_raw_sse_bytes_anthropic() {
+    let control = fresh_control();
+    let srv = test_server(
+        StubEngine {
+            tokens: vec![2, 3],
+            block_after: None,
+        },
+        None,
+        4096,
+        &control,
+    );
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":true}"#,
+        ))
+        .unwrap();
+    let response = srv.router().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+    // The canonical Anthropic sequence — each event has its own `event:` line +
+    // `data:` line (NOT `data: event: message_start`).
+    assert!(
+        body.contains("event: message_start\n"),
+        "message_start frame: {body}"
+    );
+    assert!(
+        body.contains("event: content_block_start\n"),
+        "content_block_start: {body}"
+    );
+    assert!(
+        body.contains("event: content_block_delta\n"),
+        "content_block_delta: {body}"
+    );
+    assert!(
+        body.contains("\"text_delta\""),
+        "text_delta payload: {body}"
+    );
+    assert!(
+        body.contains("event: content_block_stop\n"),
+        "content_block_stop: {body}"
+    );
+    assert!(
+        body.contains("event: message_delta\n"),
+        "message_delta: {body}"
+    );
+    assert!(
+        body.contains("event: message_stop\n"),
+        "message_stop: {body}"
+    );
+    // The corruption signature: `data: event:` must NOT appear (that's the
+    // axum-Event repacking bug the review caught).
+    assert!(
+        !body.contains("data: event:"),
+        "the SSE framing is raw (no `data: event:` repacking): {body}"
+    );
+    // Each frame ends with the SSE separator `\n\n`.
+    assert!(body.contains("\n\n"), "frames are \\n\\n-separated");
+}
+
+/// The OpenAI stream ends with a distinct `data: [DONE]\n\n` event (NOT merged
+/// into the final chunk's data field — the repacking bug the review caught).
+#[tokio::test]
+async fn streaming_emits_raw_sse_bytes_openai_done() {
+    let control = fresh_control();
+    let srv = test_server(
+        StubEngine {
+            tokens: vec![2],
+            block_after: None,
+        },
+        None,
+        4096,
+        &control,
+    );
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        ))
+        .unwrap();
+    let response = srv.router().oneshot(request).await.unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+    // [DONE] is its own `data:` line (a distinct SSE event), not merged.
+    assert!(
+        body.contains("data: [DONE]\n\n"),
+        "OpenAI [DONE] terminator: {body}"
+    );
+    assert!(
+        body.contains("\"delta\":{\"content\""),
+        "OpenAI delta chunk: {body}"
+    );
+}
+
+/// The in_flight flag clears when a stream is dropped (client disconnect).
+/// The Guard's Drop flips in_flight(false) — the fix for the review's finding
+/// that set_in_flight(false) lived inside the stream generator (never reached
+/// on a dropped future). We start a stream, drop the response (mid-stream),
+/// and assert in_flight is false afterward.
+#[tokio::test]
+async fn in_flight_clears_on_stream_drop() {
+    let control = fresh_control();
+    // A stub that blocks before the first token so the stream is mid-flight
+    // when we drop it.
+    let srv = Arc::new(test_server(
+        StubEngine {
+            tokens: vec![2, 3],
+            block_after: Some(0),
+        },
+        None,
+        4096,
+        &control,
+    ));
+    let srv_clone = srv.clone();
+    // Start the stream; don't await the body.
+    let handle = tokio::spawn(async move {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":true}"#,
+            ))
+            .unwrap();
+        srv_clone.router().oneshot(request).await
+    });
+    // Let it acquire the permit + enter the engine (set in_flight true).
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    assert!(control.is_in_flight(), "in_flight is true mid-stream");
+    // Simulate client disconnect: abort the task + drop the JoinHandle (which
+    // holds the Response → the SSE body → the stream → the Guard). The Guard's
+    // Drop flips in_flight(false). `abort()` drops a pending future; awaiting
+    // the handle (completed or aborted) drops the stored Response. Both paths
+    // release the guard.
+    handle.abort();
+    let _ = handle.await; // drops the Response (lazy SSE body + the Guard)
+    // Give the runtime a tick to run any pending Drop.
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    assert!(
+        !control.is_in_flight(),
+        "in_flight cleared after the stream dropped (Guard::drop)"
+    );
+    // And a subsequent reload is now 501 (not stuck 409).
+    let (status, _) = send(srv.router(), Method::POST, "/control/reload", &[], "").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_IMPLEMENTED,
+        "reload works after disconnect (not stuck 409)"
+    );
 }
 
 // ── The self-hosted M5 real-model gate (#[ignore]) ──────────────────────

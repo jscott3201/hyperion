@@ -14,12 +14,13 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use bytes::Bytes;
 use tokio::sync::Semaphore;
 
 use hyperion_tokenizer::TokenizerHandle;
@@ -28,8 +29,10 @@ use hyperion_tokenizer::renderer::ChatTemplate;
 use crate::auth::{AuthError, verify_bearer};
 use crate::control::{ControlState, ReloadVerdict};
 use crate::dialect::{Dialect, ErrorEnvelope};
-use crate::engine::{EngineDriver, EngineError, EngineRequest, StepEvent, Usage};
-use crate::prepare::{ContextWindow, PrepareError, prepare_anthropic, prepare_openai};
+use crate::engine::{CancelToken, EngineDriver, EngineError, EngineRequest, StepEvent, Usage};
+use crate::prepare::{
+    ContextWindow, PrepareError, count_anthropic_tokens, prepare_anthropic, prepare_openai,
+};
 use crate::sse::{Framer, StopReason};
 
 /// The shared server state, cheaply cloned (all `Arc`) into each handler.
@@ -54,6 +57,31 @@ pub struct Server {
 /// The 32 MiB body limit (06 §Surfaces) → 413 on overflow. Distinct from the
 /// context-overflow 413 (prepare).
 const BODY_LIMIT: usize = 32 * 1024 * 1024;
+
+/// The single-flight + in-flight guard: holds the permit + a control clone +
+/// the cancel token for the lifetime of a generation's **stream** (not the
+/// `run` call). Released on Drop — which happens when the SSE body is fully
+/// consumed OR the response future is dropped (client disconnect). This is
+/// the fix for the adversarial findings that the permit was released when
+/// `run` returned (streaming is lazy) and that `set_in_flight(false)` lived
+/// inside the stream generator (never reached on a dropped future).
+struct Guard {
+    /// The single-flight permit — dropped releases the Semaphore(1).
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    /// The control state to flip in_flight(false) on Drop.
+    control: ControlState,
+    /// The cancel token — fired on Drop so a client disconnect cancels the
+    /// engine promptly (the dropped-receiver path also cancels; this covers
+    /// the prefill window + any path that doesn't hit a `blocking_send`).
+    cancel: CancelToken,
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        self.control.set_in_flight(false);
+        self.cancel.cancel();
+    }
+}
 
 /// The configured server inputs, grouped so [`Server::new`] stays under the
 /// argument limit + callers build this explicitly. The caller loads the model +
@@ -276,12 +304,17 @@ async fn handle_count_tokens(
     if !srv.control.is_ready() {
         return not_ready(dialect);
     }
-    let prepared = match prepare_anthropic(&body, &srv.template, &srv.tokenizer, srv.context) {
-        Ok(p) => p,
+    if body.len() > BODY_LIMIT {
+        return body_too_large(dialect);
+    }
+    // count_tokens does NOT require max_tokens (it only counts input tokens);
+    // use the dedicated path, not prepare_anthropic (which requires max_tokens
+    // for a generation).
+    let input_tokens = match count_anthropic_tokens(&body, &srv.template, &srv.tokenizer) {
+        Ok(n) => n,
         Err(e) => return prepare_error_response(e, dialect),
     };
-    // The count_tokens response (Anthropic shape).
-    let resp = serde_json::json!({"input_tokens": prepared.prompt_tokens_len});
+    let resp = serde_json::json!({"input_tokens": input_tokens});
     Json(resp).into_response()
 }
 
@@ -369,52 +402,64 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
     let stream = prepared.stream;
     let prompt_tokens = prepared.prompt_tokens_len;
 
-    let _permit = match acquire_permit(&srv.permit, &srv.control, dialect) {
+    // Acquire the single-flight permit + arm the guard. The guard owns the
+    // permit + the control clone + the cancel token, and releases them on
+    // Drop — which happens when the SSE body is fully consumed OR the response
+    // future is dropped (client disconnect). This is the fix for the
+    // adversarial findings that the permit was released when `run` returned
+    // (streaming is lazy) and `set_in_flight(false)` lived inside the stream
+    // generator (never reached on a dropped future).
+    let permit = match acquire_permit(&srv.permit, &srv.control, dialect) {
         Ok(p) => p,
         Err(r) => return *r,
     };
     srv.control.set_in_flight(true);
+    let cancel = CancelToken::new();
+    let guard = Guard {
+        _permit: permit,
+        control: srv.control.clone(),
+        cancel: cancel.clone(),
+    };
 
     let (tx, rx) = tokio::sync::mpsc::channel::<StepEvent>(8);
-    let cancel = crate::engine::CancelToken::new();
 
-    // The engine task: drive the engine's stream on a background task so the
-    // response future can concurrently drain the receiver. The permit +
-    // in-flight flag are released when this completes (via the guard below).
+    // The engine task: drive the engine's stream on a blocking thread (the
+    // engine's `blocking_send` is sync) so the async runtime stays responsive.
     let engine = srv.engine.clone();
     let request_clone = request.clone();
     let cancel_clone = cancel.clone();
-    let engine_task = tokio::spawn(async move {
-        // The engine's `stream` uses `blocking_send`, so run it on a blocking
-        // thread (the engine mailbox / stub blocks the calling thread). This
-        // keeps the async runtime responsive while the engine decodes.
-        tokio::task::spawn_blocking(move || engine.stream(&request_clone, &cancel_clone, tx))
-            .await
-            .expect("engine task panicked")
-    });
+    let engine_task =
+        tokio::task::spawn_blocking(move || engine.stream(&request_clone, &cancel_clone, tx));
 
     if stream {
-        // SSE: emit the start frame, drain the receiver (one frame per token),
-        // then await the engine result to emit the terminal `done` or a
-        // mid-stream `error` event. Dropping the response future (client
-        // disconnect) drops `rx` → the engine's next `blocking_send` fails →
-        // Cancelled (the stream ends; no terminal frame).
+        // SSE: emit the raw framer bytes directly as the body (NOT via axum's
+        // `Sse`/`Event` — the framer produces exact, well-formed SSE byte
+        // strings, verified by the `sse.rs` unit tests; repacking them through
+        // axum's `Event::data` corrupts the `event:`/`data:` framing). Each
+        // `Framer` method returns a complete `event: ...\ndata: ...\n\n` (or
+        // `data: ...\n\n`) chunk; we yield the bytes verbatim.
         let mut framer = Framer::new(dialect, &srv.model_id, prompt_tokens);
-        let start = framer.start();
-        let srv2 = srv.clone();
+        let tokenizer = srv.tokenizer.clone();
+        let control = srv.control.clone();
         let request_for_stream = request.clone();
+        // The guard moves into the stream so it lives as long as the stream
+        // does (consumed lazily by axum). Dropping the stream (client
+        // disconnect, or full consumption) drops the guard → releases the
+        // permit + flips in_flight(false) + cancels.
+        let guard = guard;
         let stream = async_stream::stream! {
+            let _guard = guard; // held for the stream's lifetime
             // The opening frames (Anthropic message_start + content_block_start;
-            // empty for OpenAI).
-            yield Ok::<Event, Infallible>(Event::default().data(start));
+            // empty for OpenAI). `start` is a complete SSE chunk.
+            yield Ok::<Bytes, Infallible>(Bytes::from(framer.start()));
             let mut usage = Usage { prompt_tokens, completion_tokens: 0 };
             let mut rx = rx;
             while let Some(event) = rx.recv().await {
                 match event {
                     StepEvent::Token(t) => {
-                        let piece = srv2.tokenizer.decode(&[t.id]);
+                        let piece = tokenizer.decode(&[t.id]);
                         let frame = framer.token(t, &piece);
-                        yield Ok(sse_event_from_frame(&frame));
+                        yield Ok(Bytes::from(frame));
                     }
                     StepEvent::Done(u) => usage = u,
                 }
@@ -426,19 +471,18 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
                     message: "engine task failed".into(),
                 },
             )));
-            srv2.control.set_in_flight(false);
             match result {
                 Ok(_) => {
                     let stop = stop_reason(&usage, &request_for_stream, false);
                     let frame = framer.done(usage, stop);
-                    yield Ok(sse_event_from_frame(&frame));
+                    yield Ok(Bytes::from(frame));
                 }
                 Err(EngineError::Native(n)) if n.status.http_status_code() == 529 => {
                     // 529 mid-stream: an SSE error event, NOT an HTTP change
                     // (headers already flushed). Bump the governor counter.
-                    srv2.control.inc_governor_rejections();
+                    control.inc_governor_rejections();
                     let frame = framer.error(529, &n.message);
-                    yield Ok(sse_event_from_frame(&frame));
+                    yield Ok(Bytes::from(frame));
                 }
                 Err(e) => {
                     let (status, message) = match &e {
@@ -447,17 +491,24 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
                         EngineError::Native(n) => (n.status.http_status_code(), n.message.clone()),
                     };
                     let frame = framer.error(status, &message);
-                    yield Ok(sse_event_from_frame(&frame));
+                    yield Ok(Bytes::from(frame));
                 }
             }
         };
-        Sse::new(stream)
-            .keep_alive(KeepAlive::default())
-            .into_response()
+        // Build the raw-SSE response. The `Content-Type: text/event-stream`
+        // + `Cache-Control: no-cache` (the SSE contract) + the byte stream.
+        let body = Body::from_stream(stream);
+        let mut resp = Response::new(body);
+        *resp.status_mut() = StatusCode::OK;
+        resp.headers_mut().insert(
+            "content-type",
+            HeaderValue::from_static("text/event-stream"),
+        );
+        resp.headers_mut()
+            .insert("cache-control", HeaderValue::from_static("no-cache"));
+        resp
     } else {
         // Non-streaming: collect all tokens, then build a single JSON response.
-        // (The framer isn't needed here — `non_streaming_json` builds the body
-        // from the collected text + the terminal `Usage`.)
         let mut text = String::new();
         let mut usage = Usage::default();
         let mut rx = rx;
@@ -470,10 +521,12 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
                 StepEvent::Done(u) => usage = u,
             }
         }
-        // Await the engine task to get its final result. A mid-stream native
-        // error (e.g. 529 governor) would have ended the stream early; surface
-        // it as the matching HTTP status. For a clean completion, build the
-        // dialect's non-streaming JSON from the collected text + usage.
+        // The guard (held here) releases the permit + flips in_flight(false) on
+        // drop at the end of this scope — for the non-streaming path, the
+        // generation is complete by the time we reach here, so dropping is
+        // correct. (On a client disconnect during the await above, axum drops
+        // the handler future → this scope drops → the guard releases.)
+        let _ = guard;
         let engine_result =
             engine_task
                 .await
@@ -481,7 +534,6 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
                     status: hyperion_ffi::Status::Internal,
                     message: "engine task failed".into(),
                 })));
-        srv.control.set_in_flight(false);
         match engine_result {
             Ok(_) => {
                 let stop = stop_reason(&usage, &request, false);
@@ -490,28 +542,6 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
             Err(e) => engine_error_response(e, dialect),
         }
     }
-}
-
-/// Convert a raw `event: T\ndata: {...}\n\n` string into an axum `Event`. Splits
-/// on the `event:`/`data:` lines. A frame with no `event:` (OpenAI chunks) maps
-/// to a data-only event.
-fn sse_event_from_frame(frame: &str) -> Event {
-    // A frame is `event: <type>\ndata: <json>\n\n` or `data: <json>\n\n`.
-    let mut event_type = None;
-    let mut data_parts = Vec::new();
-    for line in frame.lines() {
-        if let Some(rest) = line.strip_prefix("event: ") {
-            event_type = Some(rest.to_string());
-        } else if let Some(rest) = line.strip_prefix("data: ") {
-            data_parts.push(rest.to_string());
-        }
-    }
-    let data = data_parts.join("\n");
-    let mut event = Event::default().data(data);
-    if let Some(t) = event_type {
-        event = event.event(t);
-    }
-    event
 }
 
 /// Build the non-streaming JSON response for a completed generation.

@@ -298,6 +298,36 @@ pub fn prepare_anthropic(
     )
 }
 
+/// Render + tokenize an Anthropic `/v1/messages/count_tokens` body and return
+/// the prompt token count. `count_tokens` does NOT require `max_tokens` (it
+/// only counts input tokens), so this is a separate path from
+/// [`prepare_anthropic`] — that one requires `max_tokens` for a generation.
+///
+/// # Errors
+/// `PrepareError::MalformedBody` on bad JSON; `PrepareError::ToolsUnsupported`
+/// if the body carries tools; `PrepareError::Render` on a template failure.
+pub fn count_anthropic_tokens(
+    body: &str,
+    template: &ChatTemplate,
+    tokenizer: &TokenizerHandle,
+) -> Result<u32, PrepareError> {
+    let parsed: AnthropicBody =
+        serde_json::from_str(body).map_err(|e| PrepareError::MalformedBody(e.to_string()))?;
+    check_tools(&parsed.tools, &parsed.tool_choice)?;
+    let messages = to_chat_messages(&parsed.messages, parsed.system.as_ref())?;
+    let options = RenderOptions {
+        add_generation_prompt: true,
+        enable_thinking: None,
+        preserve_thinking: None,
+        tools: Vec::new(),
+    };
+    let rendered = template
+        .render(&messages, &options)
+        .map_err(PrepareError::Render)?;
+    let prompt_tokens = tokenizer.encode(&rendered, false);
+    Ok(u32::try_from(prompt_tokens.len()).unwrap_or(u32::MAX))
+}
+
 /// Prepare an OpenAI `/v1/chat/completions` body into a `PreparedPrompt`.
 /// `max_tokens` defaults to a server default if unset (OpenAI makes it
 /// optional). `seed` is honored and echoed.

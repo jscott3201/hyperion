@@ -552,6 +552,7 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "axum",
+ "bytes",
  "http-body-util",
  "hyperion-core",
  "hyperion-ffi",
