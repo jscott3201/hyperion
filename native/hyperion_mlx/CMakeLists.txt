@@ -135,6 +135,16 @@ if(BUILD_TESTING)
     target_include_directories(hyperion_forward_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_compile_options(hyperion_forward_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME hyperion_forward COMMAND hyperion_forward_test)
+
+    # M5-gated: real-12B oracle parity (M2-2.3b). Loads the REAL 6.7 GB 12B via the
+    # native ForwardPass and compares the post-final-norm hidden state to the committed
+    # mlx-lm golden (gen_12b_hidden_golden.py). Builds wherever MLX/Metal link; runs only
+    # on the self-hosted M5. Self-skips (exit 0) when HYPERION_12B_ARTIFACT is unset (CI).
+    add_executable(hyperion_forward_12b_test tests/forward_12b_test.cc)
+    target_link_libraries(hyperion_forward_12b_test PRIVATE hyperion_mlx mlx)
+    target_include_directories(hyperion_forward_12b_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_options(hyperion_forward_12b_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME hyperion_forward_12b COMMAND hyperion_forward_12b_test)
 endif()
 
 install(TARGETS hyperion_mlx ARCHIVE DESTINATION lib)

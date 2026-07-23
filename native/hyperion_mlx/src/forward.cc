@@ -1,5 +1,6 @@
 #include "forward.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <stdexcept>
@@ -17,6 +18,37 @@ namespace {
 mx::array rms_norm(const mx::array& x, const std::optional<mx::array>& weight, float eps, mx::Stream s) {
     return mx::fast::rms_norm(x, weight, eps, s);
 }
+
+// Prefill append to a local ring: write L committed tokens, chunked by gamma_max (the
+// ring's speculative slack — append reserves speculative slots ≤ gamma_max; prefill
+// commits directly, so chunk). The ring rotates old out-of-window tokens. A single
+// commit-past-speculative append (no chunking) is a 2.6 refinement.
+void prefill_append_local(
+    LocalKvCache& cache,
+    const mx::array& k,
+    const mx::array& v,
+    int n,
+    int n_kv_heads,
+    int head_dim,
+    mx::Stream s) {
+    const auto h = static_cast<int>(n_kv_heads);
+    const auto d = static_cast<int>(head_dim);
+    const std::uint32_t gamma = kDefaultGammaMax;
+    for (std::uint32_t written = 0; written < static_cast<std::uint32_t>(n);) {
+        const std::uint32_t take = std::min(gamma, static_cast<std::uint32_t>(n) - written);
+        const int start = static_cast<int>(written);
+        const int stop = static_cast<int>(written + take);
+        auto slice = [&](const mx::array& buf) {
+            return mx::slice(buf, {start, 0, 0}, {stop, h, d}, {1, 1, 1}, s);
+        };
+        if (!cache.append(slice(k), slice(v), take)) {
+            throw std::runtime_error("local KV ring gamma slack overflow (prefill chunk)");
+        }
+        cache.commit(take);
+        written += take;
+    }
+}
+
 
 } // namespace
 
@@ -118,7 +150,7 @@ mx::array ForwardPass::build_mask(
     return mask; // [q_len, kv_len] bool
 }
 
-mx::array ForwardPass::attention(
+ForwardPass::AttentionInternals ForwardPass::attention(
     const mx::array& x,
     std::size_t layer,
     const mx::array& mask,
@@ -141,16 +173,17 @@ mx::array ForwardPass::attention(
     q = mx::reshape(q, {B, L, n_heads, head_dim}, stream_);
     q = rms_norm(q, std::optional<mx::array>(lw.q_norm), eps_, stream_);
 
-    mx::array k = lw.k_proj.apply(x, stream_);                 // [B, L, n_kv_heads*head_dim]
-    k = mx::reshape(k, {B, L, n_kv_heads, head_dim}, stream_);
-    k = rms_norm(k, std::optional<mx::array>(lw.k_norm), eps_, stream_);
+    mx::array k_raw = lw.k_proj.apply(x, stream_);             // [B, L, n_kv_heads*head_dim]
+    mx::array k = mx::reshape(k_raw, {B, L, n_kv_heads, head_dim}, stream_);
+    k = rms_norm(k, std::optional<mx::array>(lw.k_norm), eps_, stream_); // k_norm (scaled)
 
-    // v_norm is parameterless (RMSNormNoScale — no weight tensor); q/k norms are scaled.
+    // V: for k_eq_v (global) the value comes from the SAME k_proj but a DIFFERENT norm —
+    // v_norm (parameterless RMSNorm, no weight tensor), NOT k_norm, and NO RoPE. So
+    // K = rope(k_norm(raw)) and V = v_norm(raw) are distinct tensors even though no
+    // v_proj weight exists (the gemma4_text.Attention applies v_norm unconditionally).
+    // For sliding, V = v_norm(v_proj(x)). (Gemma 4: v_norm is RMSNormNoScale.)
     mx::array v = [&] {
-        if (k_eq_v) {
-            return k; // K IS V (global, attention_k_eq_v) — no v_proj weight exists.
-        }
-        mx::array vv = lw.v_proj->apply(x, stream_);
+        mx::array vv = k_eq_v ? k_raw : lw.v_proj->apply(x, stream_);
         vv = mx::reshape(vv, {B, L, n_kv_heads, head_dim}, stream_);
         return rms_norm(vv, std::nullopt, eps_, stream_);
     }();
@@ -165,14 +198,15 @@ mx::array ForwardPass::attention(
     // Append this chunk's post-rope K/V to the layer's cache (advances state for 2.6's
     // cached-prefix read). The cache is [cap, n_kv_heads, head_dim] (no batch): squeeze B.
     const LayerCacheRef ref = cache_refs_[layer];
+    // Capture the post-rope K / post-v_norm V ([B, n_kv_heads, L, head_dim]) before the
+    // reshape-for-append, for parity debugging.
+    mx::array k_post = k;
+    mx::array v_post = v;
     mx::array k_append = mx::reshape(k, {L, n_kv_heads, head_dim}, stream_);
     mx::array v_append = mx::reshape(v, {L, n_kv_heads, head_dim}, stream_);
     if (ref.kind == LayerType::Sliding) {
         LocalKvCache& cache = kvstate.local[ref.per_kind_index];
-        if (!cache.append(k_append, v_append, static_cast<std::uint32_t>(L))) {
-            throw std::runtime_error("local KV ring gamma slack overflow at layer " + std::to_string(layer));
-        }
-        cache.commit(static_cast<std::uint32_t>(L));
+        prefill_append_local(cache, k_append, v_append, L, n_kv_heads, head_dim, stream_);
     } else {
         GlobalKvCache& cache = kvstate.global[ref.per_kind_index];
         cache.append(k_append, v_append, static_cast<std::uint32_t>(L));
@@ -191,7 +225,7 @@ mx::array ForwardPass::attention(
         stream_); // [B, n_heads, L, head_dim]
     out = mx::transpose(out, {0, 2, 1, 3}, stream_);                       // [B, L, n_heads, head_dim]
     out = mx::reshape(out, {B, L, n_heads * head_dim}, stream_);
-    return lw.o_proj.apply(out, stream_);
+    return AttentionInternals{lw.o_proj.apply(out, stream_), k_post, v_post};
 }
 
 mx::array ForwardPass::decoder_layer(
@@ -205,7 +239,7 @@ mx::array ForwardPass::decoder_layer(
     // Gemma 2 pre/post sandwich: norm the BRANCH OUTPUT before the residual add.
     mx::array residual = x;
     mx::array h = rms_norm(x, std::optional<mx::array>(lw.input_layernorm), eps_, stream_);
-    h = attention(h, layer, mask, kvstate, offset);
+    h = attention(h, layer, mask, kvstate, offset).out;
     h = rms_norm(h, std::optional<mx::array>(lw.post_attention_layernorm), eps_, stream_);
     h = mx::add(residual, h, stream_);
 
