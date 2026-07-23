@@ -63,7 +63,7 @@ fn run() -> Result<(), String> {
     // B3: the bind-gate. Non-loopback without a token → refuse to start.
     let _gate = bind_gate(addr, token.as_deref())?;
     // (BindGate::Loopback ⇒ no auth; Authenticated ⇒ bearer enforced. Both OK
-    // to proceed; bind_gate already refused the unsafe case.)
+    // to proceed; bind_gate already refused the fail-closed case.)
 
     // Load the geometry from the artifact's config.json.
     let config_path = std::path::Path::new(&model_dir).join("config.json");
