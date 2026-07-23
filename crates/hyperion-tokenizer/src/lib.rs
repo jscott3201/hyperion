@@ -1,4 +1,4 @@
-//! In-process tokenization boundary (M3).
+//! In-process tokenization + chat-template rendering boundary (M3).
 //!
 //! The serving layer (axum/SSE, M3) tokenizes requests before producing the
 //! `EngineRequest` that crosses the C ABI. This crate is the in-process boundary: the
@@ -6,10 +6,13 @@
 //! encode/decode is byte-identical to the oracle. No Python anywhere on the request
 //! path (01:49).
 //!
-//! M0 exposed only the static boundary contract; M3 adds the real handle behind it.
-//! The chat-template RENDERER (minijinja) is a follow-up slice — the gemma4
-//! `chat_template.jinja` uses dict `.get()` which minijinja does not support as a method;
-//! a custom-object or template-preprocess solution is deferred (see the M3 state).
+//! M0 exposed only the static boundary contract; M3 adds the real handle behind it
+//! (PR #20) and the chat-template RENDERER (this slice) — a real Jinja2 evaluation
+//! via minijinja that renders the gemma4 `chat_template.jinja` in-process. The
+//! gemma4 template calls dict `.get()`, which minijinja's built-in map does not expose
+//! as a method; `renderer.rs` wraps every JSON map in a custom `Object` to dispatch it.
+
+pub mod renderer;
 
 use std::path::Path;
 use std::sync::Arc;

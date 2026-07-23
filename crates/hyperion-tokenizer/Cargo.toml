@@ -11,13 +11,19 @@ repository.workspace = true
 # HuggingFace Rust backend transformers uses under the hood, so loading the 12B's
 # tokenizer.json via it guarantees byte-identical encode/decode parity vs the
 # oracle (no hand-rolled BPE / normalizer / added_tokens edge cases). Pure Rust
-# (unsafe_code=deny). The chat-template renderer (minijinja) is a FOLLOW-UP slice —
-# the gemma4 chat_template.jinja uses dict `.get()` (line 239) which minijinja does not
-# support as a method; a custom-minijinja-object or template-preprocess solution is
-# deferred (see M3 state).
+# (unsafe_code=deny).
 tokenizers = "0.23"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The chat-template renderer (M3). minijinja evaluates the gemma4
+# `chat_template.jinja` in-process (no Python on the request path, 01:49). The
+# gemma4 template calls dict `.get()` (line 239+) which minijinja's built-in
+# map does NOT expose as a method; the renderer wraps every JSON map in a
+# custom `Object` that dispatches `.get()`/`items()`/`keys()`/`values()` via
+# `call_method` (see `renderer.rs`). Default features give us builtins (tests
+# like `is mapping`, filters like `dictsort`, the `range`/`dict` functions),
+# serde, and macros — all the gemma4 template relies on.
+minijinja = "2.21"
 
 [lints]
 workspace = true
