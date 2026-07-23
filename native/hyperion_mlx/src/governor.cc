@@ -60,38 +60,32 @@ std::uint64_t Governor::global_kv_bytes(const KvState& kvstate) const {
 std::uint64_t Governor::attention_transient(
     std::uint32_t n_tokens,
     std::uint32_t offset) const {
+    (void)offset; // the fused-SDPA output [q, head_dim] does not depend on the KV read
+                  // length (ctx); kept in the signature for the prefill/decode step shape.
     // The attention transient is the peak SDPA buffer allocation during the step.
-    // SDPA scores are [B, n_heads, q, ctx] and the output is [B, n_heads, q, head_dim]
-    // — both scale with the QUERY head count (num_attention_heads), NOT the KV head
-    // count. The KV heads (num_kv_heads_*) only govern the K/V cache shape, which is
-    // counted separately in local_kv_bytes/global_kv_bytes. Using num_kv_heads here
-    // would undercount the 12B's global scores by 16x (1 global KV head vs 16 query
-    // heads) — the precise OOM the governor exists to prevent.
-    //   scores = q * ctx * n_heads * dtype
+    // MLX's mx::fast::scaled_dot_product_attention is a FUSED kernel that does NOT
+    // materialize the [B, n_heads, q, ctx] attention-SCORES matrix — it streams the
+    // computation in tiles. The buffer that IS materialized is the attention OUTPUT
+    // [B, n_heads, q, head_dim] per layer. Modeling the full [q, ctx] scores (as the
+    // M2-2.6b governor did) over-predicts by the scores-vs-output ratio, worsening with
+    // context — the M3 calibration (benchmarks/m3/governor-calibration.json) measured
+    // +129% at 8K and +259% at 32K (the governor rejected prefills that fit). So the
+    // transient is the OUTPUT term:
     //   output = q * head_dim * n_heads * dtype
-    // For sliding layers: the window is min(sliding_window, ctx), bounded at 1024
-    // by the rotation read. For global layers: the full ctx (no window).
-    const std::uint32_t ctx = offset + n_tokens;
-    const std::uint32_t window_local = std::min(geometry_.sliding_window, ctx);
-    const std::uint32_t bounded_local = std::min(window_local, 1024u);
-
+    // scaled by the per-layer head_dim (local for sliding, global for full). n_heads is
+    // the QUERY head count (num_attention_heads), uniform across layer kinds. The 1.25
+    // safety factor (kTransientSafety) covers the fused-kernel's tile working set.
     const std::uint64_t q = static_cast<std::uint64_t>(n_tokens);
     const std::uint64_t n_heads = static_cast<std::uint64_t>(geometry_.num_attention_heads);
     const std::uint64_t head_dim_local = static_cast<std::uint64_t>(geometry_.head_dim_local);
     const std::uint64_t head_dim_global = static_cast<std::uint64_t>(geometry_.head_dim_global);
 
-    // Per-layer transient: max(attention scores, attention output) * safety.
-    // Sliding layers use the bounded local window + local head_dim; global layers
-    // use the full ctx + global head_dim. n_heads is uniform across layer kinds.
-    const std::uint64_t local_scores = q * bounded_local * n_heads * kBf16Bytes;
-    const std::uint64_t local_output = q * head_dim_local * n_heads * kBf16Bytes;
-    const std::uint64_t local_transient = std::max(local_scores, local_output);
+    // Per-layer transient = the attention OUTPUT [q, head_dim] * n_heads * dtype.
+    // Sliding layers use head_dim_local; global layers use head_dim_global.
+    const std::uint64_t local_transient = q * head_dim_local * n_heads * kBf16Bytes;
+    const std::uint64_t global_transient = q * head_dim_global * n_heads * kBf16Bytes;
 
-    const std::uint64_t global_scores = q * ctx * n_heads * kBf16Bytes;
-    const std::uint64_t global_output = q * head_dim_global * n_heads * kBf16Bytes;
-    const std::uint64_t global_transient = std::max(global_scores, global_output);
-
-    // Sum across all layers (each layer has its own attention buffer).
+    // Sum across all layers (each layer has its own attention output buffer).
     std::uint64_t total = 0;
     for (const auto& kind : geometry_.layer_types) {
         if (kind == LayerType::Sliding) {
@@ -100,7 +94,7 @@ std::uint64_t Governor::attention_transient(
             total += global_transient;
         }
     }
-    // Apply the safety factor for graph buffering.
+    // Apply the safety factor for the fused-kernel tile working set + graph buffering.
     return static_cast<std::uint64_t>(
         static_cast<double>(total) * kTransientSafety);
 }
@@ -161,6 +155,7 @@ std::uint64_t predict_peak(
     std::uint32_t offset,
     const KvState& /*kvstate*/,
     const Geometry& geometry) {
+    (void)offset; // the fused-SDPA output transient does not depend on ctx.
     // This is the standalone prediction for telemetry fill (no admission).
     // Uses the same formula as Governor::evaluate but without the budget check.
     const std::uint64_t active = mx::get_active_memory();
@@ -170,9 +165,9 @@ std::uint64_t predict_peak(
     const std::uint64_t kv_append =
         static_cast<std::uint64_t>(n_tokens) * kGlobalKvBytesPerToken;
 
-    // Recompute the attention transient inline (mirrors Governor::attention_transient).
-    const std::uint32_t ctx = offset + n_tokens;
-    const std::uint32_t bounded_local = std::min(std::min(geometry.sliding_window, ctx), 1024u);
+    // Recompute the attention transient inline (mirrors Governor::attention_transient):
+    // the fused-SDPA OUTPUT [q, head_dim] per layer (the [q, ctx] scores are NOT
+    // materialized by the fused kernel — see the M3 calibration report).
     const std::uint64_t q = static_cast<std::uint64_t>(n_tokens);
     const std::uint64_t n_heads = static_cast<std::uint64_t>(geometry.num_attention_heads);
     const std::uint64_t head_dim_local = static_cast<std::uint64_t>(geometry.head_dim_local);
@@ -181,13 +176,9 @@ std::uint64_t predict_peak(
     std::uint64_t total_transient = 0;
     for (const auto& kind : geometry.layer_types) {
         if (kind == LayerType::Sliding) {
-            const std::uint64_t scores = q * bounded_local * n_heads * kBf16Bytes;
-            const std::uint64_t output = q * head_dim_local * n_heads * kBf16Bytes;
-            total_transient += std::max(scores, output);
+            total_transient += q * head_dim_local * n_heads * kBf16Bytes;
         } else {
-            const std::uint64_t scores = q * ctx * n_heads * kBf16Bytes;
-            const std::uint64_t output = q * head_dim_global * n_heads * kBf16Bytes;
-            total_transient += std::max(scores, output);
+            total_transient += q * head_dim_global * n_heads * kBf16Bytes;
         }
     }
     total_transient = static_cast<std::uint64_t>(
@@ -238,8 +229,9 @@ bool peak_within_budget(
         static_cast<std::uint64_t>(context_len) * kGlobalKvBytesPerToken;
 
     // The transient for a full prefill of ``context_len`` tokens at offset 0:
-    // q = context_len, ctx = context_len, bounded_local = min(window, 1024).
-    const std::uint32_t bounded_local = std::min(std::min(geometry.sliding_window, context_len), 1024u);
+    // q = context_len. The fused-SDPA OUTPUT [q, head_dim] per layer (the [q, ctx]
+    // scores are NOT materialized — see Governor::attention_transient + the M3
+    // calibration report).
     const std::uint64_t q = static_cast<std::uint64_t>(context_len);
     const std::uint64_t n_heads = static_cast<std::uint64_t>(geometry.num_attention_heads);
     const std::uint64_t head_dim_local = static_cast<std::uint64_t>(geometry.head_dim_local);
@@ -248,13 +240,9 @@ bool peak_within_budget(
     std::uint64_t total_transient = 0;
     for (const auto& kind : geometry.layer_types) {
         if (kind == LayerType::Sliding) {
-            const std::uint64_t scores = q * bounded_local * n_heads * kBf16Bytes;
-            const std::uint64_t output = q * head_dim_local * n_heads * kBf16Bytes;
-            total_transient += std::max(scores, output);
+            total_transient += q * head_dim_local * n_heads * kBf16Bytes;
         } else {
-            const std::uint64_t scores = q * context_len * n_heads * kBf16Bytes;
-            const std::uint64_t output = q * head_dim_global * n_heads * kBf16Bytes;
-            total_transient += std::max(scores, output);
+            total_transient += q * head_dim_global * n_heads * kBf16Bytes;
         }
     }
     total_transient = static_cast<std::uint64_t>(
