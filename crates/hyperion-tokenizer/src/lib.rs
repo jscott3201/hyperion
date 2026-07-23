@@ -80,6 +80,19 @@ impl TokenizerHandle {
         })
     }
 
+    /// Load a HuggingFace `tokenizer.json` from inline bytes (the
+    /// `tokenizers` crate's `Tokenizer::from_bytes`). Used by the M3 server
+    /// contract tests so they don't need a fixture file.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, TokenizerError> {
+        let inner =
+            Tokenizer::from_bytes(bytes).map_err(|e| TokenizerError::Load(e.to_string()))?;
+        let vocab_size = inner.get_vocab_size(true);
+        Ok(Self {
+            inner: Arc::new(inner),
+            vocab_size,
+        })
+    }
+
     /// Encode text to token ids. `add_special_tokens=false` because the chat template
     /// already emits the special tokens (bos etc.); the post-processor's empty
     /// special_tokens map means this is a no-op either way, but explicit is safer.
@@ -110,6 +123,14 @@ impl TokenizerHandle {
     #[must_use]
     pub fn has_token(&self, token: &str) -> bool {
         self.inner.token_to_id(token).is_some()
+    }
+
+    /// The token id for a vocab string, if present (M3 serving: the
+    /// `EngineRequest::eos_token_id` is resolved from the model's `eos_token`
+    /// string via this). `None` if the token isn't in the vocab.
+    #[must_use]
+    pub fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.inner.token_to_id(token)
     }
 }
 

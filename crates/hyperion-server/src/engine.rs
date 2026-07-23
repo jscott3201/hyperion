@@ -4,16 +4,19 @@
 //! Architecture (02 §Threading model): one dedicated engine thread owns all
 //! MLX/native state — `Model` and `KvState` are `!Send`, so they cannot cross
 //! threads. This module is the **synchronous core** that runs on that thread:
-//! [`Engine::drive`] prefill-chunks the prompt, then decodes one token
-//! at a time, reading each sampled `token_id` back through the M3
-//! `hyp_step_result_fields` accessor (ADR 0003) until `max_tokens` or EOS.
+//! [`Engine::stream`] prefills the prompt, then decodes one token at a time,
+//! reading each sampled `token_id` back through the M3 `hyp_step_result_fields`
+//! accessor (ADR 0003) and yielding a [`StepEvent`] per step until `max_tokens`
+//! or EOS. [`Engine::drive`] is the non-streaming collector wrapper.
 //!
 //! The axum/SSE transport (PR B) owns an `Engine` on a dedicated thread and
-//! feeds it `EngineRequest`s over a bounded mpsc channel; cancel-on-drop
-//! propagates a [`CancelToken`] the loop checks between steps/chunks. PR A
-//! ships the synchronous driver + the single-flight/cancel primitives it
-//! depends on, verified by a model-free unit suite and a self-hosted M5
-//! byte-identical test.
+//! feeds it `EngineRequest`s; [`Engine::stream`] sends each decoded token over
+//! a bounded `tokio::sync::mpsc` channel (cap 8, 06 §Concurrency) that the
+//! handler converts to SSE frames. Cancel propagates two ways: an explicit
+//! [`CancelToken`] polled between steps, and the dropped-receiver path — when
+//! the client disconnects, the axum response future drops the channel receiver
+//! and the engine's next `blocking_send` fails, surfacing
+//! [`EngineError::Cancelled`]. That is cancel-on-client-drop, end-to-end.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -125,6 +128,42 @@ pub struct StepToken {
     pub logit: f32,
 }
 
+/// Token accounting for one generation (06 §Streaming: "usage accounting in the
+/// terminal frame, both dialects"). The terminal [`StepEvent::Done`] carries
+/// this; the SSE framer renders it into the dialect's usage field.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Usage {
+    /// The prompt token count (the rendered + tokenized prompt length).
+    pub prompt_tokens: u32,
+    /// The generated token count (tokens emitted before EOS / max_tokens).
+    pub completion_tokens: u32,
+}
+
+/// One step of a streaming generation, sent over the bounded channel from the
+/// engine thread to the axum handler (06 §Streaming: "token-incremental real
+/// SSE"). `Token` is one decoded token; `Done` is the terminal frame carrying
+/// [`Usage`]. The handler converts each into the dialect's SSE frame.
+#[derive(Clone, Copy, Debug)]
+pub enum StepEvent {
+    /// One decoded token (id + logit).
+    Token(StepToken),
+    /// The terminal frame — generation finished at `max_tokens` or EOS, with
+    /// usage accounting. Always the last event on a successful run.
+    Done(Usage),
+}
+
+impl StepEvent {
+    /// The token id if this is a `Token` event; `None` for `Done`. Convenience
+    /// for the non-streaming collector ([`Engine::drive`]) and tests.
+    #[must_use]
+    pub fn token_id(&self) -> Option<u32> {
+        match self {
+            Self::Token(t) => Some(t.id),
+            Self::Done(_) => None,
+        }
+    }
+}
+
 /// Errors the engine can surface. The axum layer maps these to the 06 error
 /// taxonomy (PR B): `Native(OomGovernor)` → 529, `Busy` → 429,
 /// `Cancelled` → 499, other `Native` → the `Status::http_status_code()` map.
@@ -160,6 +199,132 @@ impl From<SingleFlightBusy> for EngineError {
     fn from(_: SingleFlightBusy) -> Self {
         Self::Busy
     }
+}
+
+/// The streaming seam the axum layer drives a generation through. This is the
+/// **handler-facing** abstraction, not the `!Send` [`Engine`] itself: the
+/// engine thread owns the `Engine` and runs [`Engine::stream`] directly; the
+/// handler holds an `impl EngineDriver` (a mailbox sender that IS `Send`) and
+/// calls [`EngineDriver::stream`] on it. Tests inject a [`StubEngine`] (B7) so
+/// the contract/SSE/cancel tests run model-free — the stub implements this
+/// trait directly and yields a fixed [`StepEvent`] sequence.
+///
+/// `stream` hands the request to the engine thread and returns the [`Usage`].
+/// The handler separately drains the `tokio::sync::mpsc::Receiver` it created
+/// and converts each [`StepEvent`] into the dialect's SSE frame. Dropping the
+/// receiver (client disconnect) cancels via the `blocking_send` failure path
+/// inside [`Engine::stream`].
+pub trait EngineDriver: Send + Sync {
+    /// Stream one generation. Yields [`StepEvent`]s on `tx` (one `Token` per
+    /// decode step, then `Done`), returns the [`Usage`] on success. The engine
+    /// thread calls `tx.blocking_send` (sync; it runs in a plain thread, not a
+    /// tokio runtime) — a dropped receiver surfaces as
+    /// [`EngineError::Cancelled`].
+    fn stream(
+        &self,
+        request: &EngineRequest,
+        cancel: &CancelToken,
+        tx: tokio::sync::mpsc::Sender<StepEvent>,
+    ) -> Result<Usage, EngineError>;
+}
+
+/// A mailbox job: the handler sends one per generation; the engine thread
+/// receives it, runs [`Engine::stream`], and returns the result via the
+/// oneshot. The `StepEvent` channel (`tx`) is carried so the engine streams
+/// directly to the handler's receiver.
+#[allow(dead_code)]
+pub struct MailboxJob {
+    request: EngineRequest,
+    cancel: CancelToken,
+    tx: tokio::sync::mpsc::Sender<StepEvent>,
+    reply: tokio::sync::oneshot::Sender<Result<Usage, EngineError>>,
+}
+
+/// The production [`EngineDriver`]: a `Send + Sync` handle that posts
+/// [`MailboxJob`]s over a channel to the dedicated engine thread (which owns
+/// the `!Send` [`Engine`]). The handler holds an `Arc<MailboxEngine>`; the
+/// engine thread drains `rx` in [`engine_thread_loop`]. This is the real
+/// counterpart to the test [`StubEngine`].
+#[derive(Clone)]
+pub struct MailboxEngine {
+    tx: std::sync::mpsc::Sender<MailboxJob>,
+}
+
+impl MailboxEngine {
+    /// Create the mailbox pair: the `MailboxEngine` (held by the handler) +
+    /// the `Receiver` (drained by the engine thread via
+    /// [`engine_thread_loop`]). The channel is unbounded (cap 1 effectively:
+    /// the single-flight permit serializes requests before they reach here).
+    #[must_use]
+    pub fn channel() -> (Self, std::sync::mpsc::Receiver<MailboxJob>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (Self { tx }, rx)
+    }
+}
+
+impl EngineDriver for MailboxEngine {
+    fn stream(
+        &self,
+        request: &EngineRequest,
+        cancel: &CancelToken,
+        tx: tokio::sync::mpsc::Sender<StepEvent>,
+    ) -> Result<Usage, EngineError> {
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        let job = MailboxJob {
+            request: request.clone(),
+            cancel: cancel.clone(),
+            tx,
+            reply,
+        };
+        // Post the job. A send failure means the engine thread exited (shutting
+        // down) → surface as Cancelled (the request can't be served).
+        self.tx.send(job).map_err(|_| EngineError::Cancelled)?;
+        // Block waiting for the engine thread's result. The engine thread runs
+        // `Engine::stream` (which streams + returns the Usage/Err); this thread
+        // is a tokio blocking worker (the handler spawns it via
+        // `spawn_blocking`), so blocking here is correct.
+        reply_rx
+            .blocking_recv()
+            .map_err(|_| EngineError::Cancelled)?
+    }
+}
+
+/// The dedicated engine thread loop: loads the `!Send` [`Engine`] **on this
+/// thread** (the `Engine` is `!Send`, so it can't be moved in — it must be
+/// constructed where it lives), drains the mailbox receiver, runs
+/// [`Engine::stream`] per job, and posts the result. Exits when the mailbox
+/// sender is dropped (all `MailboxEngine` clones gone → shutdown). Run this on
+/// a plain `std::thread::spawn`, not a tokio task (the `Engine` is `!Send` +
+/// uses blocking `blocking_send`).
+///
+/// `load_result` is sent back via `loaded` so the caller can surface a load
+/// failure (the thread stays alive to drain the mailbox even if load failed —
+/// it exits immediately since `engine` is `Err`).
+pub fn engine_thread_loop(
+    geometry: Geometry,
+    weights_path: String,
+    rx: std::sync::mpsc::Receiver<MailboxJob>,
+    loaded: std::sync::mpsc::Sender<Result<(), EngineError>>,
+) {
+    let engine = match Engine::load(&geometry, &weights_path) {
+        Ok(e) => {
+            let _ = loaded.send(Ok(()));
+            e
+        }
+        Err(e) => {
+            let _ = loaded.send(Err(e));
+            return;
+        }
+    };
+    while let Ok(job) = rx.recv() {
+        let result = engine.stream(&job.request, &job.cancel, job.tx);
+        // A send error means the handler gave up (client disconnect) — the
+        // result is dropped; the engine already returned Cancelled via the
+        // dropped StepEvent channel. Ignore.
+        let _ = job.reply.send(result);
+    }
+    // Sender dropped → shutdown. The Engine + its native handles drop here
+    // (on the engine thread — the `!Send` invariant holds).
 }
 
 /// The loaded model + a reused step-result buffer. Owns the `!Send` native
@@ -209,11 +374,72 @@ impl Engine {
     /// Runs synchronously on the calling thread — in the server this is the
     /// dedicated engine thread. Single-flight is the caller's responsibility
     /// (the axum layer acquires a `Semaphore(1)` permit; PR B).
+    /// Drive a greedy (or sampled) generation to completion, returning the
+    /// generated token ids (excluding the prompt). The non-streaming collector
+    /// over [`Engine::stream`]: it streams into a channel and collects the
+    /// `Token` events into a `Vec`. Checks `cancel` between prefill and decode
+    /// steps.
+    ///
+    /// Runs synchronously on the calling thread — in the server this is the
+    /// dedicated engine thread. Single-flight is the caller's responsibility
+    /// (the axum layer acquires a `Semaphore(1)` permit; PR B).
     pub fn drive(
         &self,
         request: &EngineRequest,
         cancel: &CancelToken,
     ) -> Result<Vec<u32>, EngineError> {
+        // Non-streaming: a direct prefill + decode loop (NOT via `stream` —
+        // `stream`'s cap-8 channel would deadlock when this single thread
+        // both sends and drains: the 9th `blocking_send` would block forever
+        // waiting for a receiver that never runs concurrently). The streaming
+        // path's channel is only for the async handler, which drains on a
+        // separate task. This path collects directly into a `Vec`.
+        if cancel.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
+        if request.prompt_tokens.is_empty() {
+            return Err(EngineError::Native(NativeError {
+                status: Status::InvalidArgument,
+                message: "prompt_tokens is empty".into(),
+            }));
+        }
+        let mut generation = Generation {
+            kvstate: KvState::create(&self.model)?,
+        };
+        self.prefill(&mut generation, &request.prompt_tokens, cancel)?;
+        let mut generated = Vec::with_capacity(request.max_tokens as usize);
+        while generated.len() < request.max_tokens as usize {
+            if cancel.is_cancelled() {
+                return Err(EngineError::Cancelled);
+            }
+            let step = self.decode_step(&mut generation, &request.sampling)?;
+            generated.push(step.id);
+            if request.eos_token_id == Some(step.id) {
+                break;
+            }
+        }
+        Ok(generated)
+    }
+
+    /// Stream a generation: prefill, then decode one token at a time, yielding
+    /// a [`StepEvent::Token`] per step on `tx` and a terminal
+    /// [`StepEvent::Done`] with [`Usage`]. The decode loop checks `cancel`
+    /// between steps (Cancelled → early return). **Cancel-on-client-drop**: if
+    /// the receiver is dropped (the axum response future dropped on client
+    /// disconnect), the next `tx.blocking_send` returns `SendError`, mapped to
+    /// [`EngineError::Cancelled`] — no explicit [`CancelToken`] fire needed.
+    ///
+    /// Runs synchronously on the calling thread (the dedicated engine thread).
+    /// `tx.blocking_send` is safe from a non-async thread: it blocks the
+    /// caller until the channel has room or the receiver drops; it needs no
+    /// tokio runtime. The bounded cap (8) is the backpressure mechanism — a
+    /// slow client throttles the engine rather than dropping events.
+    pub fn stream(
+        &self,
+        request: &EngineRequest,
+        cancel: &CancelToken,
+        tx: tokio::sync::mpsc::Sender<StepEvent>,
+    ) -> Result<Usage, EngineError> {
         if cancel.is_cancelled() {
             return Err(EngineError::Cancelled);
         }
@@ -235,23 +461,40 @@ impl Engine {
 
         self.prefill(&mut generation, &request.prompt_tokens, cancel)?;
 
-        let mut generated = Vec::with_capacity(request.max_tokens as usize);
-
-        while generated.len() < request.max_tokens as usize {
+        let mut completion_tokens = 0u32;
+        while completion_tokens < request.max_tokens {
             if cancel.is_cancelled() {
                 return Err(EngineError::Cancelled);
             }
             // decode_block decodes n_tokens=1 from the current KV offset — the
             // last token is already in the KV from prefill (or the prior step),
             // so no token is fed back here. The sampled id is read out and
-            // appended; the native side advances the offset for the next call.
+            // streamed; the native side advances the offset for the next call.
             let step = self.decode_step(&mut generation, &request.sampling)?;
-            generated.push(step.id);
+            completion_tokens += 1;
+
+            // Yield the token. A dropped receiver (client disconnect) makes
+            // `blocking_send` return Err → Cancelled (cancel-on-client-drop).
+            if tx.blocking_send(StepEvent::Token(step)).is_err() {
+                return Err(EngineError::Cancelled);
+            }
+
             if request.eos_token_id == Some(step.id) {
                 break;
             }
         }
-        Ok(generated)
+
+        let usage = Usage {
+            prompt_tokens: u32::try_from(request.prompt_tokens.len()).unwrap_or(u32::MAX),
+            completion_tokens,
+        };
+        // The terminal frame. A dropped receiver here is still a cancel (the
+        // client gave up before the Done frame); surface Cancelled so the
+        // handler doesn't report a spurious success.
+        if tx.blocking_send(StepEvent::Done(usage)).is_err() {
+            return Err(EngineError::Cancelled);
+        }
+        Ok(usage)
     }
 
     /// Prefill the entire prompt in a single native call. The native
@@ -308,8 +551,76 @@ impl Engine {
     }
 }
 
+/// Test-support: a model-free `EngineDriver` for the contract/SSE/cancel
+/// tests (B7). Compiled unconditionally so integration tests (a separate
+/// crate) can import it; production code doesn't use it.
+#[allow(dead_code)]
+pub mod test_support {
+    use super::*;
+
+    /// A model-free `EngineDriver` for the contract/SSE/cancel tests (B7). Yields
+    /// a fixed `StepEvent` sequence — one `Token` per id in `tokens`, then
+    /// `Done`. `block_after` sleeps the engine thread before that index (to let
+    /// a test drop the receiver mid-stream and observe cancel-on-drop); `None`
+    /// never blocks. This exercises the streaming seam with no native model.
+    pub struct StubEngine {
+        pub tokens: Vec<u32>,
+        /// If `Some(i)`, `tokio::time::sleep` before yielding `tokens[i]` so the
+        /// test can race a receiver drop past that point.
+        pub block_after: Option<usize>,
+    }
+
+    impl EngineDriver for StubEngine {
+        fn stream(
+            &self,
+            request: &EngineRequest,
+            cancel: &CancelToken,
+            tx: tokio::sync::mpsc::Sender<StepEvent>,
+        ) -> Result<Usage, EngineError> {
+            if cancel.is_cancelled() {
+                return Err(EngineError::Cancelled);
+            }
+            let mut emitted = 0u32;
+            for (i, id) in self.tokens.iter().enumerate() {
+                if let Some(block_at) = self.block_after
+                    && i == block_at
+                {
+                    // A blocking sleep on a sync engine thread. The test
+                    // runtime is `current_thread`, so this blocks the same
+                    // thread the test drives — tests using this must spawn
+                    // the stream on a separate thread (see
+                    // `stream_returns_cancelled_on_dropped_receiver`).
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                if tx
+                    .blocking_send(StepEvent::Token(StepToken {
+                        id: *id,
+                        logit: 0.0,
+                    }))
+                    .is_err()
+                {
+                    return Err(EngineError::Cancelled);
+                }
+                emitted += 1;
+                if request.eos_token_id == Some(*id) {
+                    break;
+                }
+            }
+            let usage = Usage {
+                prompt_tokens: u32::try_from(request.prompt_tokens.len()).unwrap_or(u32::MAX),
+                completion_tokens: emitted,
+            };
+            if tx.blocking_send(StepEvent::Done(usage)).is_err() {
+                return Err(EngineError::Cancelled);
+            }
+            Ok(usage)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::StubEngine;
     use super::*;
 
     #[test]
@@ -393,6 +704,121 @@ mod tests {
             "prefill must present the whole prompt in one stream, not slice it"
         );
         assert_eq!(stream.is_prompt, 1, "prompt framing must be flagged");
+    }
+
+    /// A `StubEngine` yields one `Token` per id then `Done`; the receiver
+    /// observes exactly that sequence, in order (model-free, no native calls).
+    #[test]
+    fn stream_yields_one_token_event_per_step_then_done() {
+        let engine = StubEngine {
+            tokens: vec![7, 3, 40, 100],
+            block_after: None,
+        };
+        let request = EngineRequest {
+            prompt_tokens: vec![1, 2],
+            max_tokens: 4,
+            eos_token_id: None,
+            sampling: None,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StepEvent>(8);
+        // `stream` uses `blocking_send`, which is fine on a plain thread; drive
+        // it on a std thread so this synchronous test doesn't need a runtime
+        // for the send side (the recv side is sync via `blocking_recv`).
+        let handle = std::thread::spawn(move || engine.stream(&request, &CancelToken::new(), tx));
+        let mut ids = Vec::new();
+        let mut terminal = None;
+        while let Some(event) = rx.blocking_recv() {
+            match event {
+                StepEvent::Token(t) => ids.push(t.id),
+                StepEvent::Done(u) => terminal = Some(u),
+            }
+        }
+        let usage = handle
+            .join()
+            .expect("stream thread panicked")
+            .expect("stream ok");
+        assert_eq!(ids, vec![7, 3, 40, 100]);
+        assert_eq!(terminal, Some(usage));
+        assert_eq!(usage.completion_tokens, 4);
+        assert_eq!(usage.prompt_tokens, 2);
+    }
+
+    /// EOS stops the stream early: the stub honors `eos_token_id` and emits
+    /// `Done` with the truncated `completion_tokens` count.
+    #[test]
+    fn stream_stops_at_eos() {
+        let engine = StubEngine {
+            tokens: vec![7, 3, 40, 100],
+            block_after: None,
+        };
+        let request = EngineRequest {
+            prompt_tokens: vec![1],
+            max_tokens: 4,
+            eos_token_id: Some(40),
+            sampling: None,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StepEvent>(8);
+        let handle = std::thread::spawn(move || engine.stream(&request, &CancelToken::new(), tx));
+        let mut ids = Vec::new();
+        while let Some(StepEvent::Token(t)) = rx.blocking_recv() {
+            ids.push(t.id);
+        }
+        let usage = handle.join().unwrap().unwrap();
+        assert_eq!(ids, vec![7, 3, 40], "stops after the EOS token");
+        assert_eq!(usage.completion_tokens, 3);
+    }
+
+    /// Cancel-on-client-drop: dropping the receiver mid-stream makes the next
+    /// `blocking_send` fail → `stream` returns `Cancelled`. The stub blocks
+    /// after the first token so the drop races past it. Model-free.
+    #[test]
+    fn stream_returns_cancelled_on_dropped_receiver() {
+        let engine = StubEngine {
+            tokens: vec![7, 3, 40, 100],
+            block_after: Some(1), // sleep before yielding tokens[1]
+        };
+        let request = EngineRequest {
+            prompt_tokens: vec![1],
+            max_tokens: 4,
+            eos_token_id: None,
+            sampling: None,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StepEvent>(8);
+        let handle = std::thread::spawn(move || engine.stream(&request, &CancelToken::new(), tx));
+        // Take the first token, then drop the receiver (simulate client
+        // disconnect while the engine sleeps before token 2).
+        let _first = rx.blocking_recv();
+        drop(rx);
+        let result = handle.join().expect("stream thread panicked");
+        assert!(
+            matches!(result, Err(EngineError::Cancelled)),
+            "a dropped receiver must surface as Cancelled, got {result:?}"
+        );
+    }
+
+    /// A cancel fired before the loop starts short-circuits to `Cancelled`
+    /// without touching the channel (no events sent).
+    #[test]
+    fn stream_short_circuits_on_pre_cancelled_token() {
+        let engine = StubEngine {
+            tokens: vec![7, 3],
+            block_after: None,
+        };
+        let request = EngineRequest {
+            prompt_tokens: vec![1],
+            max_tokens: 4,
+            eos_token_id: None,
+            sampling: None,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StepEvent>(8);
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let result = engine.stream(&request, &cancel, tx);
+        assert!(matches!(result, Err(EngineError::Cancelled)));
+        assert!(
+            rx.blocking_recv().is_none(),
+            "no events on a pre-cancelled run"
+        );
     }
 
     /// The tiny fixture's geometry, mirroring `make_tiny_geometry()` in the
