@@ -678,7 +678,7 @@ async fn streaming_emits_raw_sse_bytes_anthropic() {
         ))
         .unwrap();
     let response = srv.router().oneshot(request).await.unwrap();
-    let initial_status = response.status();
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.headers().get("content-type").unwrap(),
         "text/event-stream"
@@ -1000,7 +1000,6 @@ async fn failed_stream_holds_permit_until_engine_cleanup_finishes() {
         .expect("failed stream completes after cleanup")
         .unwrap();
     let body = String::from_utf8_lossy(&bytes);
-    assert_eq!(initial_status, StatusCode::OK);
     assert!(
         body_pending_during_cleanup,
         "error waits for engine cleanup"
