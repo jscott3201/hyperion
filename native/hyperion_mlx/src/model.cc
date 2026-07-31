@@ -254,10 +254,7 @@ void write_step_result(
     const ForwardPass::GreedySample& sample,
     std::uint32_t near_tie_events,
     HypGovernorState governor_state,
-    std::uint64_t peak_mlx_bytes,
-    std::uint64_t active_mlx_bytes,
-    std::uint64_t local_kv_bytes,
-    std::uint64_t global_kv_bytes) {
+    const StepTelemetrySnapshot& telemetry) {
     if (result == nullptr || result->magic != kStepResultMagic) {
         return; // invalid handle: no-op (the ABI call already validated, but never trust across the seam)
     }
@@ -267,10 +264,10 @@ void write_step_result(
     result->fields = HypStepResultFields{};
     result->fields.token_id = sample.token_id;
     result->fields.logit = sample.logit;
-    result->fields.peak_mlx_bytes = peak_mlx_bytes;
-    result->fields.active_mlx_bytes = active_mlx_bytes;
-    result->fields.local_kv_bytes = local_kv_bytes;
-    result->fields.global_kv_bytes = global_kv_bytes;
+    result->fields.peak_mlx_bytes = telemetry.peak_mlx_bytes;
+    result->fields.active_mlx_bytes = mx::get_active_memory();
+    result->fields.local_kv_bytes = telemetry.local_kv_bytes;
+    result->fields.global_kv_bytes = telemetry.global_kv_bytes;
     result->fields.governor_state = governor_state;
     result->fields.near_tie_events = near_tie_events;
 }
@@ -279,20 +276,17 @@ void write_step_result_sampled(
     HypStepResult result,
     const ForwardPass::StochasticSample& sample,
     HypGovernorState governor_state,
-    std::uint64_t peak_mlx_bytes,
-    std::uint64_t active_mlx_bytes,
-    std::uint64_t local_kv_bytes,
-    std::uint64_t global_kv_bytes) {
+    const StepTelemetrySnapshot& telemetry) {
     if (result == nullptr || result->magic != kStepResultMagic) {
         return;
     }
     result->fields = HypStepResultFields{};
     result->fields.token_id = sample.token_id;
     result->fields.logit = sample.logit;
-    result->fields.peak_mlx_bytes = peak_mlx_bytes;
-    result->fields.active_mlx_bytes = active_mlx_bytes;
-    result->fields.local_kv_bytes = local_kv_bytes;
-    result->fields.global_kv_bytes = global_kv_bytes;
+    result->fields.peak_mlx_bytes = telemetry.peak_mlx_bytes;
+    result->fields.active_mlx_bytes = mx::get_active_memory();
+    result->fields.local_kv_bytes = telemetry.local_kv_bytes;
+    result->fields.global_kv_bytes = telemetry.global_kv_bytes;
     result->fields.governor_state = governor_state;
     result->fields.near_tie_events = 0u; // near-tie is a greedy-only metric
     result->fields.top_k_logprob_count = sample.top_k_count;
@@ -469,18 +463,18 @@ HypStatus hyp_prefill_chunk(HypModel model,
 
     try {
         const mx::Stream s = *model->stream;
+        hyperion::model::StepTelemetryAccumulator telemetry;
         const auto operation_plan =
             hyperion::model::plan_kv_growth(*kvstate->kv, tokens->count);
         auto settled_staging_plan = operation_plan;
         settled_staging_plan.requires_transaction = false;
         if (!operation_plan.representable) {
-            const auto decision = model->governor->evaluate(
+            const auto decision = telemetry.observe(model->governor->evaluate(
                 std::min<std::uint32_t>(2048, tokens->count), 0, *kvstate->kv,
-                hyperion::governor::StepKind::Prefill, &operation_plan);
+                hyperion::governor::StepKind::Prefill, &operation_plan));
             hyperion::model::write_step_result(
                 out_result, hyperion::model::ForwardPass::GreedySample{0, 0.0F, false},
-                0u, HYP_GOVERNOR_HARD_REJECT, decision.predicted_peak_bytes,
-                mx::get_active_memory(), decision.local_kv_bytes, decision.global_kv_bytes);
+                0u, HYP_GOVERNOR_HARD_REJECT, telemetry.snapshot(*kvstate->kv));
             return hyperion::model::fail(HYP_STATUS_OOM_GOVERNOR, decision.reason);
         }
         hyperion::model::KvGrowthTransaction transaction(
@@ -510,31 +504,29 @@ HypStatus hyp_prefill_chunk(HypModel model,
         while (offset < total) {
             std::uint32_t take = std::min(kPrefillChunkSize, total - offset);
             // Governor admission: predict the peak for this chunk at the current offset.
-            auto decision = model->governor->evaluate(
+            auto decision = telemetry.observe(model->governor->evaluate(
                 take, offset, transaction.state(),
                 hyperion::governor::StepKind::Prefill,
-                offset == 0 ? &operation_plan : &settled_staging_plan);
+                offset == 0 ? &operation_plan : &settled_staging_plan));
             if (decision.admission == hyperion::governor::Admission::HardRejected) {
                 // Even 1 token would breach the ceiling — reject the whole prefill.
                 hyperion::model::write_step_result(
-                    out_result, sample, 0u, HYP_GOVERNOR_HARD_REJECT,
-                    decision.predicted_peak_bytes, mx::get_active_memory(),
-                    decision.local_kv_bytes, decision.global_kv_bytes);
+                    out_result, hyperion::model::ForwardPass::GreedySample{0, 0.0F, false},
+                    0u, HYP_GOVERNOR_HARD_REJECT, telemetry.snapshot(*kvstate->kv));
                 return hyperion::model::fail(
                     HYP_STATUS_OOM_GOVERNOR, decision.reason);
             }
             if (decision.admission == hyperion::governor::Admission::SoftPaused) {
                 // Halve the chunk and retry (down to 1 token; below that, hard reject).
                 take = std::max(std::uint32_t{1}, take / 2);
-                decision = model->governor->evaluate(
+                decision = telemetry.observe(model->governor->evaluate(
                     take, offset, transaction.state(),
                     hyperion::governor::StepKind::Prefill,
-                    offset == 0 ? &operation_plan : &settled_staging_plan);
+                    offset == 0 ? &operation_plan : &settled_staging_plan));
                 if (decision.admission == hyperion::governor::Admission::HardRejected) {
                     hyperion::model::write_step_result(
-                        out_result, sample, 0u, HYP_GOVERNOR_HARD_REJECT,
-                        decision.predicted_peak_bytes, mx::get_active_memory(),
-                        decision.local_kv_bytes, decision.global_kv_bytes);
+                        out_result, hyperion::model::ForwardPass::GreedySample{0, 0.0F, false},
+                        0u, HYP_GOVERNOR_HARD_REJECT, telemetry.snapshot(*kvstate->kv));
                     return hyperion::model::fail(
                         HYP_STATUS_OOM_GOVERNOR, decision.reason);
                 }
@@ -558,23 +550,9 @@ HypStatus hyp_prefill_chunk(HypModel model,
         transaction.publish();
         kvstate->offset = total;            // advance the autoregressive cursor
         kvstate->last_token = sample.token_id;
-        // Fill the step result with governor telemetry (M2-2.6b). The per-chunk
-        // ``decision`` is loop-scoped (each chunk is re-evaluated), so read the FINAL
-        // state here: a 0-token probe at offset=total is always Accepted and returns
-        // the populated KV byte counts. ``predict_peak`` of that same probe is the
-        // steady-state peak after prefill completes (NOT the fabricated O(total²)
-        // transient of a single full-prompt chunk, which never executes under 2048
-        // chunking). peak reports the settled working set + full KV + 0-token
-        // transient + reserve.
-        const auto final_state = model->governor->evaluate(
-            0, total, *kvstate->kv, hyperion::governor::StepKind::Prefill);
-        const std::uint64_t peak = hyperion::governor::predict_peak(
-            0, total, *kvstate->kv, *model->geometry,
-            hyperion::governor::StepKind::Prefill);
         hyperion::model::write_step_result(
             out_result, sample, sample.near_tie ? 1u : 0u,
-            HYP_GOVERNOR_READY, peak, mx::get_active_memory(),
-            final_state.local_kv_bytes, final_state.global_kv_bytes);
+            HYP_GOVERNOR_READY, telemetry.snapshot(*kvstate->kv));
         return hyperion::model::ok();
     } catch (const std::bad_alloc&) {
         return hyperion::model::fail(
@@ -610,12 +588,13 @@ HypStatus hyp_decode_block(HypModel model,
         return hyperion::model::fail(
             HYP_STATUS_INVALID_ARGUMENT, "decode requires a populated KV state (prefill first)");
     }
+    hyperion::model::StepTelemetryAccumulator telemetry;
     if (n_tokens == 0) {
-        // Nothing to do; leave the step-result zeroed + READY. (A no-op decode is a
-        // legal call shape — a verify block of size 0, M7.)
+        // A no-op decode attempts no admission. It still reports the live cache
+        // allocation and active MLX bytes at this terminal write.
         hyperion::model::write_step_result(
             out_result, hyperion::model::ForwardPass::GreedySample{0, 0.0F, false}, 0u,
-            HYP_GOVERNOR_READY, 0, mx::get_active_memory(), 0, 0);
+            HYP_GOVERNOR_READY, telemetry.snapshot(*kvstate->kv));
         return hyperion::model::ok();
     }
 
@@ -625,14 +604,13 @@ HypStatus hyp_decode_block(HypModel model,
     // admission sums every sequential capacity-bucket replacement in the block.
     const auto operation_plan =
         hyperion::model::plan_kv_growth(*kvstate->kv, n_tokens);
-    auto decision = model->governor->evaluate(
+    auto decision = telemetry.observe(model->governor->evaluate(
         n_tokens, kvstate->offset, *kvstate->kv,
-        hyperion::governor::StepKind::Decode, &operation_plan);
+        hyperion::governor::StepKind::Decode, &operation_plan));
     if (decision.admission == hyperion::governor::Admission::HardRejected) {
         hyperion::model::write_step_result(
             out_result, hyperion::model::ForwardPass::GreedySample{0, 0.0F, false}, 0u,
-            HYP_GOVERNOR_HARD_REJECT, decision.predicted_peak_bytes,
-            mx::get_active_memory(), decision.local_kv_bytes, decision.global_kv_bytes);
+            HYP_GOVERNOR_HARD_REJECT, telemetry.snapshot(*kvstate->kv));
         return hyperion::model::fail(HYP_STATUS_OOM_GOVERNOR, decision.reason);
     }
 
@@ -675,8 +653,7 @@ HypStatus hyp_decode_block(HypModel model,
         // would treat the just-allocated bucket as settled and charge it a second time.
         hyperion::model::write_step_result(
             out_result, sample, near_tie_events,
-            HYP_GOVERNOR_READY, decision.predicted_peak_bytes, mx::get_active_memory(),
-            decision.local_kv_bytes, decision.global_kv_bytes);
+            HYP_GOVERNOR_READY, telemetry.snapshot(*kvstate->kv));
         return hyperion::model::ok();
     } catch (const std::bad_alloc&) {
         return hyperion::model::fail(
@@ -726,19 +703,19 @@ HypStatus hyp_prefill_chunk_sampled(HypModel model,
     }
     try {
         const mx::Stream s = *model->stream;
+        hyperion::model::StepTelemetryAccumulator telemetry;
         const auto operation_plan =
             hyperion::model::plan_kv_growth(*kvstate->kv, tokens->count);
         auto settled_staging_plan = operation_plan;
         settled_staging_plan.requires_transaction = false;
         if (!operation_plan.representable) {
-            const auto decision = model->governor->evaluate(
+            const auto decision = telemetry.observe(model->governor->evaluate(
                 std::min<std::uint32_t>(2048, tokens->count), 0, *kvstate->kv,
-                hyperion::governor::StepKind::Prefill, &operation_plan);
+                hyperion::governor::StepKind::Prefill, &operation_plan));
             hyperion::model::ForwardPass::StochasticSample rejected{};
             hyperion::model::write_step_result_sampled(
                 out_result, rejected, HYP_GOVERNOR_HARD_REJECT,
-                decision.predicted_peak_bytes, mx::get_active_memory(),
-                decision.local_kv_bytes, decision.global_kv_bytes);
+                telemetry.snapshot(*kvstate->kv));
             return hyperion::model::fail(HYP_STATUS_OOM_GOVERNOR, decision.reason);
         }
         hyperion::model::KvGrowthTransaction transaction(
@@ -755,28 +732,28 @@ HypStatus hyp_prefill_chunk_sampled(HypModel model,
         const std::uint32_t total = tokens->count;
         while (offset < total) {
             std::uint32_t take = std::min(kPrefillChunkSize, total - offset);
-            auto decision = model->governor->evaluate(
+            auto decision = telemetry.observe(model->governor->evaluate(
                 take, offset, transaction.state(),
                 hyperion::governor::StepKind::Prefill,
-                offset == 0 ? &operation_plan : &settled_staging_plan);
+                offset == 0 ? &operation_plan : &settled_staging_plan));
             if (decision.admission == hyperion::governor::Admission::HardRejected) {
+                hyperion::model::ForwardPass::StochasticSample rejected{};
                 hyperion::model::write_step_result_sampled(
-                    out_result, sample, HYP_GOVERNOR_HARD_REJECT,
-                    decision.predicted_peak_bytes, mx::get_active_memory(),
-                    decision.local_kv_bytes, decision.global_kv_bytes);
+                    out_result, rejected, HYP_GOVERNOR_HARD_REJECT,
+                    telemetry.snapshot(*kvstate->kv));
                 return hyperion::model::fail(HYP_STATUS_OOM_GOVERNOR, decision.reason);
             }
             if (decision.admission == hyperion::governor::Admission::SoftPaused) {
                 take = std::max(std::uint32_t{1}, take / 2);
-                decision = model->governor->evaluate(
+                decision = telemetry.observe(model->governor->evaluate(
                     take, offset, transaction.state(),
                     hyperion::governor::StepKind::Prefill,
-                    offset == 0 ? &operation_plan : &settled_staging_plan);
+                    offset == 0 ? &operation_plan : &settled_staging_plan));
                 if (decision.admission == hyperion::governor::Admission::HardRejected) {
+                    hyperion::model::ForwardPass::StochasticSample rejected{};
                     hyperion::model::write_step_result_sampled(
-                        out_result, sample, HYP_GOVERNOR_HARD_REJECT,
-                        decision.predicted_peak_bytes, mx::get_active_memory(),
-                        decision.local_kv_bytes, decision.global_kv_bytes);
+                        out_result, rejected, HYP_GOVERNOR_HARD_REJECT,
+                        telemetry.snapshot(*kvstate->kv));
                     return hyperion::model::fail(HYP_STATUS_OOM_GOVERNOR, decision.reason);
                 }
             }
@@ -798,14 +775,8 @@ HypStatus hyp_prefill_chunk_sampled(HypModel model,
         transaction.publish();
         kvstate->offset = total;
         kvstate->last_token = sample.token_id;
-        const auto final_state = model->governor->evaluate(
-            0, total, *kvstate->kv, hyperion::governor::StepKind::Prefill);
-        const std::uint64_t peak = hyperion::governor::predict_peak(
-            0, total, *kvstate->kv, *model->geometry,
-            hyperion::governor::StepKind::Prefill);
         hyperion::model::write_step_result_sampled(
-            out_result, sample, HYP_GOVERNOR_READY, peak, mx::get_active_memory(),
-            final_state.local_kv_bytes, final_state.global_kv_bytes);
+            out_result, sample, HYP_GOVERNOR_READY, telemetry.snapshot(*kvstate->kv));
         return hyperion::model::ok();
     } catch (const std::bad_alloc&) {
         return hyperion::model::fail(HYP_STATUS_INTERNAL, "native allocation failed outside predictive governor admission");
@@ -842,22 +813,23 @@ HypStatus hyp_decode_block_sampled(HypModel model,
     if (kvstate->offset == 0) {
         return hyperion::model::fail(HYP_STATUS_INVALID_ARGUMENT, "decode requires a populated KV state (prefill first)");
     }
+    hyperion::model::StepTelemetryAccumulator telemetry;
     if (n_tokens == 0) {
         hyperion::model::ForwardPass::StochasticSample sample{};
         hyperion::model::write_step_result_sampled(
-            out_result, sample, HYP_GOVERNOR_READY, 0, mx::get_active_memory(), 0, 0);
+            out_result, sample, HYP_GOVERNOR_READY, telemetry.snapshot(*kvstate->kv));
         return hyperion::model::ok();
     }
     const auto operation_plan =
         hyperion::model::plan_kv_growth(*kvstate->kv, n_tokens);
-    auto decision = model->governor->evaluate(
+    auto decision = telemetry.observe(model->governor->evaluate(
         n_tokens, kvstate->offset, *kvstate->kv,
-        hyperion::governor::StepKind::Decode, &operation_plan);
+        hyperion::governor::StepKind::Decode, &operation_plan));
     if (decision.admission == hyperion::governor::Admission::HardRejected) {
         hyperion::model::ForwardPass::StochasticSample sample{};
         hyperion::model::write_step_result_sampled(
-            out_result, sample, HYP_GOVERNOR_HARD_REJECT, decision.predicted_peak_bytes,
-            mx::get_active_memory(), decision.local_kv_bytes, decision.global_kv_bytes);
+            out_result, sample, HYP_GOVERNOR_HARD_REJECT,
+            telemetry.snapshot(*kvstate->kv));
         return hyperion::model::fail(HYP_STATUS_OOM_GOVERNOR, decision.reason);
     }
     try {
@@ -895,9 +867,7 @@ HypStatus hyp_decode_block_sampled(HypModel model,
         }
         // Successful decode telemetry reports the exact pre-step admission decision.
         hyperion::model::write_step_result_sampled(
-            out_result, sample, HYP_GOVERNOR_READY, decision.predicted_peak_bytes,
-            mx::get_active_memory(),
-            decision.local_kv_bytes, decision.global_kv_bytes);
+            out_result, sample, HYP_GOVERNOR_READY, telemetry.snapshot(*kvstate->kv));
         return hyperion::model::ok();
     } catch (const std::bad_alloc&) {
         return hyperion::model::fail(HYP_STATUS_INTERNAL, "native allocation failed outside predictive governor admission");

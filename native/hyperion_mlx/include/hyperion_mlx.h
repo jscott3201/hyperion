@@ -144,7 +144,16 @@ typedef struct HypSamplingConfig {
  *  frame (~1 MB/token), which MUST NOT cross the ABI. */
 #define HYP_TOP_K_LOGPROBS 8
 
-/** Per-step telemetry + sampled token; caller-owned handle, reused across steps. */
+/** Per-step telemetry + sampled token; caller-owned handle, reused across steps.
+ *
+ *  For a completed public prefill/decode call, ``peak_mlx_bytes`` is the maximum
+ *  governor-predicted peak presented to admission during that call. This includes
+ *  proposals handled by halve-and-retry and the decision that hard-rejected a call;
+ *  zero-token decode attempts no admission and reports zero. ``active_mlx_bytes`` is
+ *  sampled when this result is written. ``local_kv_bytes`` and ``global_kv_bytes``
+ *  are the current allocated cache capacities after successful publication, or the
+ *  unchanged/current live capacities for a zero-token no-op or governor rejection.
+ *  Invalid-argument/handle and caught INTERNAL result contents are unspecified. */
 typedef struct {
     uint32_t token_id;
     float logit;

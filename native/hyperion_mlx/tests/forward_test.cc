@@ -69,6 +69,116 @@ void require(bool cond, const std::string& msg) {
     }
 }
 
+HypStepResultFields read_public_result(HypStepResult result, const std::string& context) {
+    HypStepResultFields fields{};
+    require(
+        hyp_step_result_fields(result, &fields) == HYP_STATUS_OK,
+        context + ": public step-result accessor");
+    return fields;
+}
+
+void require_terminal_active_sample(
+    const HypStepResultFields& fields,
+    std::uint64_t active_before,
+    const std::string& context) {
+    // The writer samples active memory inside the ABI call. MLX may finish reclaiming
+    // buffers from earlier work while that call returns, so a second sample is not
+    // guaranteed to be byte-identical. Bracket the stored value with the observations
+    // immediately before and after these no-op/rejection paths, neither of which starts
+    // new MLX work.
+    const auto active_after = mx::get_active_memory();
+    require(fields.active_mlx_bytes > 0 &&
+                active_before >= fields.active_mlx_bytes &&
+                fields.active_mlx_bytes >= active_after,
+            context + ": terminal active MLX sample is bracketed by adjacent observations " +
+                "(before=" + std::to_string(active_before) + ", result=" +
+                std::to_string(fields.active_mlx_bytes) + ", after=" +
+                std::to_string(active_after) + ")");
+}
+
+constexpr std::uint64_t expected_local_kv_bytes() {
+    constexpr std::uint64_t kLocalLayers = 5;
+    constexpr std::uint64_t kCapacity = kWindow + hyperion::model::kDefaultGammaMax;
+    constexpr std::uint64_t kKAndVBf16Bytes = 2 * 2;
+    return kLocalLayers * kCapacity * kKvLocal * kHdLocal * kKAndVBf16Bytes;
+}
+
+constexpr std::uint64_t expected_global_kv_bytes(std::uint32_t committed_tokens) {
+    constexpr std::uint64_t kStep = 256;
+    constexpr std::uint64_t kKAndVBf16Bytes = 2 * 2;
+    const std::uint64_t capacity =
+        (static_cast<std::uint64_t>(committed_tokens) + kStep - 1) / kStep * kStep;
+    return capacity * kKvGlobal * kHdGlobal * kKAndVBf16Bytes;
+}
+
+void require_rejected_result(
+    const HypStepResultFields& fields,
+    std::uint64_t local_kv_bytes,
+    std::uint64_t global_kv_bytes,
+    std::uint64_t active_before,
+    const std::string& context) {
+    require(fields.governor_state == HYP_GOVERNOR_HARD_REJECT,
+            context + ": terminal governor state is HARD_REJECT");
+    require(fields.peak_mlx_bytes == std::numeric_limits<std::uint64_t>::max(),
+            context + ": unrepresentable admission reports the attempted saturated peak");
+    require_terminal_active_sample(fields, active_before, context);
+    require(fields.local_kv_bytes == local_kv_bytes &&
+            fields.global_kv_bytes == global_kv_bytes,
+            context + ": rejection reports unchanged live KV allocation");
+    require(fields.token_id == 0 && fields.logit == 0.0F &&
+            fields.near_tie_events == 0 && fields.top_k_logprob_count == 0,
+            context + ": rejected sample and sidecar are deterministic zero");
+    require(fields.top_k_logprob_ids[0] == 0 && fields.top_k_logprob_values[0] == 0.0F,
+            context + ": rejected top-k storage is cleared on result reuse");
+}
+
+Geometry make_tiny_geometry();
+
+void test_step_telemetry_accumulator() {
+    const Geometry geometry = make_tiny_geometry();
+    const mx::Stream cpu = mx::default_stream(mx::Device::cpu);
+    auto kvstate = build_kv_state(
+        build_dispatch(geometry), hyperion::model::kDefaultGammaMax,
+        mx::bfloat16, cpu);
+
+    constexpr auto kUnlimited = std::numeric_limits<std::uint64_t>::max();
+    hyperion::governor::Governor probe(geometry, kUnlimited, kUnlimited);
+    const auto p1 = probe.evaluate(
+        1, 0, kvstate, hyperion::governor::StepKind::Prefill);
+    const auto p2 = probe.evaluate(
+        2, 0, kvstate, hyperion::governor::StepKind::Prefill);
+    require(p2.predicted_peak_bytes > p1.predicted_peak_bytes,
+            "telemetry accumulator: two-token proposal predicts above one-token proposal");
+
+    // Put the soft watermark exactly at P1: P1 remains accepted (strict > check),
+    // while the real P2 decision is soft-paused. Observe P2 first, then the smaller
+    // accepted retry, matching the production halve-and-retry sequence.
+    hyperion::governor::Governor thresholded(
+        geometry, kUnlimited, p1.predicted_peak_bytes);
+    const auto accepted = thresholded.evaluate(
+        1, 0, kvstate, hyperion::governor::StepKind::Prefill);
+    const auto soft_paused = thresholded.evaluate(
+        2, 0, kvstate, hyperion::governor::StepKind::Prefill);
+    require(accepted.admission == hyperion::governor::Admission::Accepted,
+            "telemetry accumulator: real one-token retry is accepted");
+    require(soft_paused.admission == hyperion::governor::Admission::SoftPaused,
+            "telemetry accumulator: real two-token proposal is soft-paused");
+
+    hyperion::model::StepTelemetryAccumulator telemetry;
+    require(telemetry.peak_mlx_bytes() == 0,
+            "telemetry accumulator: no admission attempt starts at zero");
+    const auto observed_soft_paused = telemetry.observe(soft_paused);
+    const auto observed_retry = telemetry.observe(accepted);
+    require(observed_soft_paused.admission == hyperion::governor::Admission::SoftPaused &&
+            observed_retry.admission == hyperion::governor::Admission::Accepted,
+            "telemetry accumulator: observe returns each production decision unchanged");
+    require(telemetry.peak_mlx_bytes() == soft_paused.predicted_peak_bytes,
+            "telemetry accumulator: real handled soft-pause remains max after smaller retry");
+    std::cerr << "forward_test: StepTelemetryAccumulator keeps real soft-pause P2="
+              << soft_paused.predicted_peak_bytes << " over accepted retry P1="
+              << accepted.predicted_peak_bytes << '\n';
+}
+
 Geometry make_tiny_geometry() {
     Geometry g{};
     g.model_type = TextModelType::Gemma4UnifiedText;
@@ -389,9 +499,14 @@ void test_abi_load(const std::filesystem::path& fixture, const mx::Stream& gpu) 
     require(
         hyp_prefill_chunk(model, kv, &tokens, result) == HYP_STATUS_OK,
         "hyp_prefill_chunk succeeds (single-chunk prefill)");
-    HypStepResultFields pf = hyperion::model::step_result_read(result);
+    HypStepResultFields pf = read_public_result(result, "ABI prefill");
     require(pf.token_id < g.vocab_size, "prefill token within vocab");
     require(pf.governor_state == HYP_GOVERNOR_READY, "governor READY (governor is 2.6)");
+    require(pf.peak_mlx_bytes > 0 && pf.active_mlx_bytes > 0,
+            "prefill reports attempted peak and terminal active MLX bytes");
+    require(pf.local_kv_bytes == expected_local_kv_bytes() &&
+            pf.global_kv_bytes == expected_global_kv_bytes(tokens.count),
+            "prefill reports current post-publication KV allocation");
 
     // Cross-check the prefill token vs the inline reference argmax (same weights, same prompt).
     const mx::Stream cpu = mx::default_stream(mx::Device::cpu);
@@ -402,12 +517,35 @@ void test_abi_load(const std::filesystem::path& fixture, const mx::Stream& gpu) 
         pf.token_id == ref_tok,
         "prefill token == inline reference argmax (transcription parity on the epilogue)");
 
+    // Zero-token decode is a legal no-op: no admission attempt, but the result is a
+    // coherent live snapshot rather than hard-coded zero KV telemetry.
+    const auto zero_active_before = mx::get_active_memory();
+    require(
+        hyp_decode_block(model, kv, 0, result) == HYP_STATUS_OK,
+        "hyp_decode_block succeeds for a zero-token no-op");
+    const HypStepResultFields zero = read_public_result(result, "ABI zero decode");
+    require(zero.governor_state == HYP_GOVERNOR_READY && zero.peak_mlx_bytes == 0,
+            "zero decode reports READY and no attempted admission peak");
+    require_terminal_active_sample(zero, zero_active_before, "zero decode");
+    require(zero.local_kv_bytes == pf.local_kv_bytes &&
+            zero.global_kv_bytes == pf.global_kv_bytes,
+            "zero decode reports unchanged current KV allocation");
+    require(zero.token_id == 0 && zero.logit == 0.0F &&
+            zero.near_tie_events == 0 && zero.top_k_logprob_count == 0,
+            "zero decode clears sample fields on the reused result");
+
     // Decode 1 token (offset>0, cached-prefix read) → next token.
     require(
         hyp_decode_block(model, kv, 1, result) == HYP_STATUS_OK,
         "hyp_decode_block succeeds (offset>0 cached-prefix read)");
-    HypStepResultFields dc = hyperion::model::step_result_read(result);
+    HypStepResultFields dc = read_public_result(result, "ABI decode");
     require(dc.token_id < g.vocab_size, "decode token within vocab");
+    require(dc.governor_state == HYP_GOVERNOR_READY &&
+            dc.peak_mlx_bytes > 0 && dc.active_mlx_bytes > 0,
+            "decode reports terminal READY, attempted peak, and active MLX bytes");
+    require(dc.local_kv_bytes == pf.local_kv_bytes &&
+            dc.global_kv_bytes == pf.global_kv_bytes,
+            "decode reports live post-publication KV capacity within the same bucket");
 
     // A multi-token decode block is a sequence of q=1 forwards, not a continuation
     // prefill query. Exercise the public ABI shape so governor step-kind routing cannot
@@ -415,8 +553,22 @@ void test_abi_load(const std::filesystem::path& fixture, const mx::Stream& gpu) 
     require(
         hyp_decode_block(model, kv, 2, result) == HYP_STATUS_OK,
         "hyp_decode_block succeeds for a sequential multi-token block");
-    HypStepResultFields dc_block = hyperion::model::step_result_read(result);
+    HypStepResultFields dc_block = read_public_result(result, "ABI block decode");
     require(dc_block.token_id < g.vocab_size, "multi-token decode token within vocab");
+
+    // UINT32_MAX is deterministically unrepresentable after a populated prefix. It
+    // reaches governor rejection without allocating and must report the unchanged live
+    // cache rather than GovernorDecision's prospective saturated KV projection.
+    const auto rejected_active_before = mx::get_active_memory();
+    require(
+        hyp_decode_block(model, kv, std::numeric_limits<std::uint32_t>::max(), result) ==
+            HYP_STATUS_OOM_GOVERNOR,
+        "populated greedy decode rejects an unrepresentable block");
+    const HypStepResultFields rejected = read_public_result(result, "ABI rejected decode");
+    require_rejected_result(
+        rejected, dc_block.local_kv_bytes, dc_block.global_kv_bytes,
+        rejected_active_before,
+        "greedy hard rejection");
 
     std::cerr << "forward_test: ABI prefill+decode OK on the tiny fixture "
               << "(prefill token " << pf.token_id << " == ref " << ref_tok
@@ -597,12 +749,20 @@ void test_abi_growth_transactions(const std::filesystem::path& fixture) {
             "growth ABI: greedy kvstate create");
         require(hyp_prefill_chunk(model, kv, &tokens, result) == HYP_STATUS_OK,
             "growth ABI: greedy prefill transaction");
+        const auto prefill_fields = read_public_result(result, "growth ABI greedy prefill");
+        require(prefill_fields.local_kv_bytes == expected_local_kv_bytes() &&
+                prefill_fields.global_kv_bytes == expected_global_kv_bytes(tokens.count),
+            "growth ABI: greedy prefill publishes the first live KV bucket");
         require(hyp_decode_block(model, kv, 2, result) == HYP_STATUS_OK,
             "growth ABI: greedy decode later-crossing transaction");
-        const auto fields = hyperion::model::step_result_read(result);
+        const auto fields = read_public_result(result, "growth ABI greedy decode");
         require(fields.token_id < g.vocab_size &&
                 fields.governor_state == HYP_GOVERNOR_READY,
             "growth ABI: greedy result remains token-correct and ready");
+        require(fields.local_kv_bytes == prefill_fields.local_kv_bytes &&
+                fields.global_kv_bytes == expected_global_kv_bytes(tokens.count + 2) &&
+                fields.global_kv_bytes > prefill_fields.global_kv_bytes,
+            "growth ABI: greedy decode reports the newly published KV bucket");
         require(hyp_kvstate_free(&kv) == HYP_STATUS_OK,
             "growth ABI: greedy kvstate free");
     }
@@ -620,14 +780,57 @@ void test_abi_growth_transactions(const std::filesystem::path& fixture) {
             hyp_prefill_chunk_sampled(
                 model, kv, &tokens, &sampled, result) == HYP_STATUS_OK,
             "growth ABI: stochastic prefill transaction");
+        const auto prefill_fields = read_public_result(result, "growth ABI sampled prefill");
+        require(prefill_fields.governor_state == HYP_GOVERNOR_READY &&
+                prefill_fields.peak_mlx_bytes > 0 && prefill_fields.active_mlx_bytes > 0,
+            "growth ABI: stochastic prefill reports a completed admission snapshot");
+        require(prefill_fields.local_kv_bytes == expected_local_kv_bytes() &&
+                prefill_fields.global_kv_bytes == expected_global_kv_bytes(tokens.count),
+            "growth ABI: stochastic prefill reports current published KV allocation");
+        require(prefill_fields.top_k_logprob_count > 0,
+            "growth ABI: stochastic prefill preserves its top-k sidecar");
+
+        const auto zero_active_before = mx::get_active_memory();
+        require(
+            hyp_decode_block_sampled(model, kv, 0, &sampled, result) == HYP_STATUS_OK,
+            "growth ABI: stochastic zero-token decode");
+        const auto zero = read_public_result(result, "growth ABI sampled zero decode");
+        require(zero.governor_state == HYP_GOVERNOR_READY &&
+                zero.peak_mlx_bytes == 0,
+            "growth ABI: sampled zero decode attempts no admission");
+        require_terminal_active_sample(
+            zero, zero_active_before, "growth ABI sampled zero decode");
+        require(zero.local_kv_bytes == prefill_fields.local_kv_bytes &&
+                zero.global_kv_bytes == prefill_fields.global_kv_bytes,
+            "growth ABI: sampled zero decode reports unchanged live KV allocation");
+        require(zero.token_id == 0 && zero.logit == 0.0F &&
+                zero.near_tie_events == 0 && zero.top_k_logprob_count == 0,
+            "growth ABI: sampled zero decode clears the prior stochastic sample");
+
         require(
             hyp_decode_block_sampled(
                 model, kv, 2, &sampled, result) == HYP_STATUS_OK,
             "growth ABI: stochastic decode later-crossing transaction");
-        const auto fields = hyperion::model::step_result_read(result);
+        const auto fields = read_public_result(result, "growth ABI sampled decode");
         require(fields.token_id < g.vocab_size &&
                 fields.governor_state == HYP_GOVERNOR_READY,
             "growth ABI: sampled result remains token-correct and ready");
+        require(fields.local_kv_bytes == prefill_fields.local_kv_bytes &&
+                fields.global_kv_bytes == expected_global_kv_bytes(tokens.count + 2) &&
+                fields.global_kv_bytes > prefill_fields.global_kv_bytes,
+            "growth ABI: stochastic decode reports the newly published KV bucket");
+
+        const auto rejected_active_before = mx::get_active_memory();
+        require(
+            hyp_decode_block_sampled(
+                model, kv, std::numeric_limits<std::uint32_t>::max(),
+                &sampled, result) == HYP_STATUS_OOM_GOVERNOR,
+            "growth ABI: populated stochastic decode rejects an unrepresentable block");
+        const auto rejected = read_public_result(result, "growth ABI sampled rejection");
+        require_rejected_result(
+            rejected, fields.local_kv_bytes, fields.global_kv_bytes,
+            rejected_active_before,
+            "stochastic hard rejection");
         require(hyp_kvstate_free(&kv) == HYP_STATUS_OK,
             "growth ABI: sampled kvstate free");
     }
@@ -671,16 +874,50 @@ void test_abi_chunked_prefill(const std::filesystem::path& fixture, const mx::St
     require(
         hyp_prefill_chunk(model, kv, &tokens, result) == HYP_STATUS_OK,
         "chunked: hyp_prefill_chunk succeeds on a >2048-token prompt");
-    HypStepResultFields pf = hyperion::model::step_result_read(result);
+    HypStepResultFields pf = read_public_result(result, "chunked greedy prefill");
     require(pf.token_id < g.vocab_size, "chunked: prefill token within vocab");
+    require(pf.governor_state == HYP_GOVERNOR_READY &&
+            pf.peak_mlx_bytes > 0 && pf.active_mlx_bytes > 0,
+        "chunked: greedy multi-chunk prefill reports a completed admission snapshot");
+    require(pf.local_kv_bytes == expected_local_kv_bytes() &&
+            pf.global_kv_bytes == expected_global_kv_bytes(tokens.count),
+        "chunked: greedy multi-chunk prefill reports current published KV capacity");
     require(
         hyp_decode_block(model, kv, 1, result) == HYP_STATUS_OK,
         "chunked: decode after a long prefill succeeds (rotation read past window)");
-    HypStepResultFields dc = hyperion::model::step_result_read(result);
+    HypStepResultFields dc = read_public_result(result, "chunked greedy decode");
     require(dc.token_id < g.vocab_size, "chunked: decode token within vocab");
+    require(dc.local_kv_bytes == pf.local_kv_bytes &&
+            dc.global_kv_bytes == pf.global_kv_bytes,
+        "chunked: decode in the same global bucket reports unchanged current capacity");
+
+    require(hyp_kvstate_free(&kv) == HYP_STATUS_OK,
+        "chunked: greedy kvstate free before stochastic path");
+    require(hyp_kvstate_create(model, &kv) == HYP_STATUS_OK,
+        "chunked: stochastic kvstate create");
+    HypSamplingConfig sampled{};
+    sampled.temperature = 1.0F;
+    sampled.top_k = 8;
+    sampled.top_p = 0.9F;
+    sampled.seed = 42;
+    require(
+        hyp_prefill_chunk_sampled(model, kv, &tokens, &sampled, result) == HYP_STATUS_OK,
+        "chunked: stochastic prefill succeeds on a >2048-token prompt");
+    const HypStepResultFields sampled_pf =
+        read_public_result(result, "chunked stochastic prefill");
+    require(sampled_pf.token_id < g.vocab_size &&
+            sampled_pf.governor_state == HYP_GOVERNOR_READY &&
+            sampled_pf.peak_mlx_bytes > 0 && sampled_pf.active_mlx_bytes > 0,
+        "chunked: stochastic multi-chunk prefill reports a completed admission snapshot");
+    require(sampled_pf.local_kv_bytes == expected_local_kv_bytes() &&
+            sampled_pf.global_kv_bytes == expected_global_kv_bytes(tokens.count),
+        "chunked: stochastic multi-chunk prefill reports current published KV capacity");
+    require(sampled_pf.top_k_logprob_count > 0,
+        "chunked: stochastic multi-chunk prefill preserves top-k sampling output");
 
     std::cerr << "forward_test: chunked prefill OK (2500 tokens → 2 chunks; rotation ~150×; "
-              << "prefill token " << pf.token_id << ", decode token " << dc.token_id << ")\n";
+              << "greedy prefill token " << pf.token_id << ", decode token " << dc.token_id
+              << ", stochastic prefill token " << sampled_pf.token_id << ")\n";
 
     require(hyp_step_result_free(&result) == HYP_STATUS_OK, "chunked: step result free");
     require(hyp_kvstate_free(&kv) == HYP_STATUS_OK, "chunked: kvstate free");
@@ -719,6 +956,7 @@ int main() {
         }
         try {
             const mx::Stream gpu = mx::new_stream(mx::Device::gpu);
+            test_step_telemetry_accumulator();
             test_forward_parity(fixture, gpu);
             test_continuation_prefill_hidden_rows(fixture, gpu);
             test_abi_load(fixture, gpu);
@@ -735,6 +973,7 @@ int main() {
     const std::filesystem::path fixture(dir);
     try {
         const mx::Stream gpu = mx::new_stream(mx::Device::gpu);
+        test_step_telemetry_accumulator();
         test_forward_parity(fixture, gpu);
         test_continuation_prefill_hidden_rows(fixture, gpu);
         test_abi_load(fixture, gpu);
