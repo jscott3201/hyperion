@@ -64,20 +64,24 @@ struct GovernorDecision {
 /// ```text
 /// predicted_peak = settled_working_set
 ///                + kv_append               [16 KiB/token global]
-///                + attention_transient     [per-layer-peak]
+///                + attention_transient     [SDPA outputs + continuation scratch]
 ///                + workspace + 512 MiB reserve
 /// ```
 ///
 /// where:
 ///   settled_working_set = mx::get_active_memory() + mx::get_cache_memory()
 ///   kv_append           = n_tokens * kGlobalKvBytesPerToken
-///   attention_transient = sum over layers of
-///       (q * head_dim_local  * n_heads         [sliding]
-///        q * head_dim_global * n_heads) * dtype * safety  [global]
+///   attention_transient = (sum over layers of
+///       q * head_dim_local  * n_heads * dtype  [sliding]
+///       q * head_dim_global * n_heads * dtype  [global]) * safety
+///       + one assembled local K/V buffer for continuation prefill
 ///   (the transient is the fused-SDPA OUTPUT [B, n_heads, q, head_dim] per layer —
 ///    MLX's mx::fast::scaled_dot_product_attention is a FUSED kernel that does NOT
 ///    materialize the [q, ctx] scores matrix (it streams it), so the transient is the
 ///    output buffer, scaled by num_attention_heads — the QUERY head count. The
+///    continuation-prefill path additionally assembles the retained local prefix and
+///    current chunk into bounded K and V buffers before SDPA; the governor charges one
+///    exact per-layer peak for those buffers when ``offset > 0 && n_tokens > 1``. The
 ///    kTransientSafety factor (1.25) covers the fused-kernel tile working set. The
 ///    M2-2.6b governor modeled the full [q, ctx] scores and over-predicted by 2.3-3.6x
 ///    (M3 calibration, benchmarks/m3/governor-calibration.json); this is the fix.)

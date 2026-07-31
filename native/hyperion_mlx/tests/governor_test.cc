@@ -152,6 +152,28 @@ int main() {
     require(decision.predicted_peak_bytes >= prev_peak + kGlobalKvBytesPerToken,
         "predicted peak must grow by at least 16 KiB per token");
 
+    // Multi-token continuation prefill assembles a bounded local K+V buffer from the
+    // retained prefix plus the current chunk. At offset 8 the tiny fixture retains the
+    // full window, so q=2 charges exactly 5 KiB once (not once per sliding layer).
+    const auto fresh_prefill = gov.evaluate(2, 0, kvstate);
+    const auto continuation_prefill = gov.evaluate(2, 8, kvstate);
+    constexpr std::uint64_t kExpectedContinuationCharge =
+        2ULL * (8 + 2) * 2 * 64 * 2; // K+V * len * kv_heads * dim * bf16
+    require(
+        continuation_prefill.predicted_peak_bytes ==
+            fresh_prefill.predicted_peak_bytes + kExpectedContinuationCharge,
+        "continuation prefill must charge the assembled local K+V scratch");
+    constexpr std::uint64_t kExpectedPartialPrefixCharge =
+        2ULL * (4 + 2) * 2 * 64 * 2;
+    require(
+        gov.evaluate(2, 4, kvstate).predicted_peak_bytes ==
+            fresh_prefill.predicted_peak_bytes + kExpectedPartialPrefixCharge,
+        "continuation scratch must use the available prefix below the window");
+    require(
+        gov.evaluate(1, 12, kvstate).predicted_peak_bytes ==
+            gov.evaluate(1, 0, kvstate).predicted_peak_bytes,
+        "single-token decode must not charge continuation-prefill scratch");
+
     // ── Halve-chunk behavior ──────────────────────────────────────────────────
 
     // A very large prefill chunk should trigger SoftPaused (halve-chunk) or
@@ -195,6 +217,11 @@ int main() {
     decision = gov.evaluate(1, 0, kvstate);
     require(standalone == decision.predicted_peak_bytes,
         "predict_peak must match Governor::evaluate's predicted_peak_bytes");
+
+    const auto continuation_standalone = predict_peak(2, 8, kvstate, geometry);
+    const auto continuation_decision = gov.evaluate(2, 8, kvstate);
+    require(continuation_standalone == continuation_decision.predicted_peak_bytes,
+        "predict_peak must include the same continuation-prefill scratch charge");
 
     std::cout << "governor_test: all assertions passed\n";
     return 0;
