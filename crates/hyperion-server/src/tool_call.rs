@@ -5,7 +5,9 @@
 //! exposes the raw call block and repair telemetry for later adapters.
 
 use std::collections::HashSet;
+use std::fmt;
 
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 
 /// Gemma 4's canonical native tool-call opener.
@@ -15,6 +17,7 @@ pub const TOOL_CALL_CLOSER: &str = "<tool_call|>";
 const STALE_TOOL_CALL_OPENER: &str = "<|tool_call|>call:";
 const NATIVE_QUOTE: &str = "<|\"|>";
 const MAX_ARGUMENT_NESTING: usize = 64;
+const SCANNER_LOOKBEHIND: usize = STALE_TOOL_CALL_OPENER.len() - 1;
 
 /// Default maximum number of unique calls surfaced from one parser.
 pub const DEFAULT_MAX_TOOL_CALLS: usize = 8;
@@ -68,6 +71,12 @@ struct Candidate {
     lexical_state: LexicalState,
 }
 
+#[derive(Debug)]
+struct DiscardCandidate {
+    lexical_state: LexicalState,
+    lookbehind: String,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum LexicalState {
     Normal,
@@ -77,69 +86,75 @@ enum LexicalState {
 
 impl Candidate {
     fn scan_for_closer(&mut self) -> Option<usize> {
-        while self.scan_position < self.raw.len() {
-            let remaining = &self.raw[self.scan_position..];
-            match self.lexical_state {
-                LexicalState::Normal => {
-                    if remaining.starts_with(TOOL_CALL_CLOSER) {
-                        self.scan_position += TOOL_CALL_CLOSER.len();
-                        return Some(self.scan_position);
-                    }
-                    if remaining.starts_with(NATIVE_QUOTE) {
-                        self.scan_position += NATIVE_QUOTE.len();
-                        self.lexical_state = LexicalState::NativeString;
-                        continue;
-                    }
-                    if TOOL_CALL_CLOSER.starts_with(remaining)
-                        || NATIVE_QUOTE.starts_with(remaining)
-                    {
-                        break;
-                    }
+        scan_for_closer(&self.raw, &mut self.scan_position, &mut self.lexical_state)
+    }
+}
 
-                    let character = remaining
-                        .chars()
-                        .next()
-                        .expect("scan position is before candidate end");
-                    self.scan_position += character.len_utf8();
-                    if character == '"' {
-                        self.lexical_state = LexicalState::JsonString { escaped: false };
-                    }
+fn scan_for_closer(
+    source: &str,
+    position: &mut usize,
+    lexical_state: &mut LexicalState,
+) -> Option<usize> {
+    while *position < source.len() {
+        let remaining = &source[*position..];
+        match *lexical_state {
+            LexicalState::Normal => {
+                if remaining.starts_with(TOOL_CALL_CLOSER) {
+                    *position += TOOL_CALL_CLOSER.len();
+                    return Some(*position);
                 }
-                LexicalState::JsonString { escaped } => {
-                    let character = remaining
-                        .chars()
-                        .next()
-                        .expect("scan position is before candidate end");
-                    self.scan_position += character.len_utf8();
-                    self.lexical_state = if escaped {
-                        LexicalState::JsonString { escaped: false }
-                    } else if character == '\\' {
-                        LexicalState::JsonString { escaped: true }
-                    } else if character == '"' {
-                        LexicalState::Normal
-                    } else {
-                        LexicalState::JsonString { escaped: false }
-                    };
+                if remaining.starts_with(NATIVE_QUOTE) {
+                    *position += NATIVE_QUOTE.len();
+                    *lexical_state = LexicalState::NativeString;
+                    continue;
                 }
-                LexicalState::NativeString => {
-                    if remaining.starts_with(NATIVE_QUOTE) {
-                        self.scan_position += NATIVE_QUOTE.len();
-                        self.lexical_state = LexicalState::Normal;
-                        continue;
-                    }
-                    if NATIVE_QUOTE.starts_with(remaining) {
-                        break;
-                    }
-                    let character = remaining
-                        .chars()
-                        .next()
-                        .expect("scan position is before candidate end");
-                    self.scan_position += character.len_utf8();
+                if TOOL_CALL_CLOSER.starts_with(remaining) || NATIVE_QUOTE.starts_with(remaining) {
+                    break;
+                }
+
+                let character = remaining
+                    .chars()
+                    .next()
+                    .expect("scan position is before source end");
+                *position += character.len_utf8();
+                if character == '"' {
+                    *lexical_state = LexicalState::JsonString { escaped: false };
                 }
             }
+            LexicalState::JsonString { escaped } => {
+                let character = remaining
+                    .chars()
+                    .next()
+                    .expect("scan position is before source end");
+                *position += character.len_utf8();
+                *lexical_state = if escaped {
+                    LexicalState::JsonString { escaped: false }
+                } else if character == '\\' {
+                    LexicalState::JsonString { escaped: true }
+                } else if character == '"' {
+                    LexicalState::Normal
+                } else {
+                    LexicalState::JsonString { escaped: false }
+                };
+            }
+            LexicalState::NativeString => {
+                if remaining.starts_with(NATIVE_QUOTE) {
+                    *position += NATIVE_QUOTE.len();
+                    *lexical_state = LexicalState::Normal;
+                    continue;
+                }
+                if NATIVE_QUOTE.starts_with(remaining) {
+                    break;
+                }
+                let character = remaining
+                    .chars()
+                    .next()
+                    .expect("scan position is before source end");
+                *position += character.len_utf8();
+            }
         }
-        None
     }
+    None
 }
 
 /// Incremental, transport-neutral Gemma 4 tool-call parser.
@@ -152,11 +167,14 @@ impl Candidate {
 pub struct ToolCallParser {
     pending: String,
     candidate: Option<Candidate>,
+    discard: Option<DiscardCandidate>,
     seen: HashSet<(String, String)>,
     surfaced_calls: usize,
     max_tool_calls: usize,
     max_candidate_bytes: usize,
     stats: ToolCallStats,
+    #[cfg(test)]
+    peak_retained_scanner_bytes: usize,
 }
 
 impl Default for ToolCallParser {
@@ -182,19 +200,65 @@ impl ToolCallParser {
         Self {
             pending: String::new(),
             candidate: None,
+            discard: None,
             seen: HashSet::new(),
             surfaced_calls: 0,
             max_tool_calls,
             max_candidate_bytes,
             stats: ToolCallStats::default(),
+            #[cfg(test)]
+            peak_retained_scanner_bytes: 0,
         }
     }
 
     /// Consume the next sequential UTF-8 fragment and return newly available
     /// ordered text/call events.
     pub fn push(&mut self, fragment: &str) -> Vec<ToolCallEvent> {
-        self.pending.push_str(fragment);
-        self.process()
+        let mut events = self.process();
+        self.record_retained_peak();
+        let mut consumed = 0;
+
+        while consumed < fragment.len() {
+            let retained = self.retained_scanner_bytes();
+            let bound = self.max_candidate_bytes.saturating_add(SCANNER_LOOKBEHIND);
+            let available = bound.saturating_sub(retained);
+            let remaining = &fragment[consumed..];
+            let take = char_boundary_at_or_before(remaining, available);
+
+            if take == 0 {
+                debug_assert!(self.candidate.is_none() && self.discard.is_none());
+                let character_len = remaining
+                    .chars()
+                    .next()
+                    .expect("fragment has unconsumed text")
+                    .len_utf8();
+                let mut possible_opener = std::mem::take(&mut self.pending);
+                possible_opener.push_str(&remaining[..character_len]);
+                if possible_opener == TOOL_CALL_OPENER || possible_opener == STALE_TOOL_CALL_OPENER
+                {
+                    consumed += character_len;
+                    self.discard = Some(DiscardCandidate {
+                        lexical_state: LexicalState::Normal,
+                        lookbehind: String::new(),
+                    });
+                    self.stats.candidate_overflows =
+                        self.stats.candidate_overflows.saturating_add(1);
+                    emit_text(&mut events, possible_opener);
+                } else {
+                    possible_opener.truncate(possible_opener.len() - character_len);
+                    emit_text(&mut events, possible_opener);
+                }
+                continue;
+            }
+
+            self.pending.push_str(&remaining[..take]);
+            consumed += take;
+            self.record_retained_peak();
+            events.extend(self.process());
+            self.record_retained_peak();
+        }
+
+        events
     }
 
     /// Finish the stream, returning any incomplete candidate or delimiter
@@ -204,6 +268,7 @@ impl ToolCallParser {
         if let Some(candidate) = self.candidate.take() {
             emit_text(&mut events, candidate.raw);
         }
+        self.discard = None;
         if !self.pending.is_empty() {
             emit_text(&mut events, std::mem::take(&mut self.pending));
         }
@@ -220,6 +285,13 @@ impl ToolCallParser {
         let mut events = Vec::new();
 
         loop {
+            if self.discard.is_some() {
+                if self.process_discard(&mut events) {
+                    continue;
+                }
+                break;
+            }
+
             if self.candidate.is_some() {
                 if self.process_candidate(&mut events) {
                     continue;
@@ -269,8 +341,7 @@ impl ToolCallParser {
                 .candidate
                 .take()
                 .expect("candidate state checked above");
-            self.stats.candidate_overflows = self.stats.candidate_overflows.saturating_add(1);
-            emit_text(events, candidate.raw);
+            self.start_discard(candidate, events);
             return true;
         }
 
@@ -317,9 +388,68 @@ impl ToolCallParser {
                 .candidate
                 .take()
                 .expect("candidate state checked above");
-            self.stats.candidate_overflows = self.stats.candidate_overflows.saturating_add(1);
-            emit_text(events, candidate.raw);
+            self.start_discard(candidate, events);
             true
+        }
+    }
+
+    fn start_discard(&mut self, mut candidate: Candidate, events: &mut Vec<ToolCallEvent>) {
+        let _ = candidate.scan_for_closer();
+        let lookbehind = candidate.raw[candidate.scan_position..].to_owned();
+        self.discard = Some(DiscardCandidate {
+            lexical_state: candidate.lexical_state,
+            lookbehind,
+        });
+        self.stats.candidate_overflows = self.stats.candidate_overflows.saturating_add(1);
+        emit_text(events, candidate.raw);
+    }
+
+    /// Returns whether normal scanning can immediately continue.
+    fn process_discard(&mut self, events: &mut Vec<ToolCallEvent>) -> bool {
+        if self.pending.is_empty() {
+            return false;
+        }
+
+        let mut discard = self.discard.take().expect("discard state checked above");
+        let already_emitted = discard.lookbehind.len();
+        let mut source = discard.lookbehind;
+        source.push_str(&std::mem::take(&mut self.pending));
+        let mut position = 0;
+        let closer_end = scan_for_closer(&source, &mut position, &mut discard.lexical_state);
+
+        if let Some(end) = closer_end {
+            emit_text(events, source[already_emitted..end].to_owned());
+            self.pending.push_str(&source[end..]);
+            true
+        } else {
+            emit_text(events, source[already_emitted..].to_owned());
+            discard.lookbehind = source[position..].to_owned();
+            self.discard = Some(discard);
+            false
+        }
+    }
+
+    fn retained_scanner_bytes(&self) -> usize {
+        self.pending
+            .len()
+            .saturating_add(
+                self.candidate
+                    .as_ref()
+                    .map_or(0, |candidate| candidate.raw.len()),
+            )
+            .saturating_add(
+                self.discard
+                    .as_ref()
+                    .map_or(0, |discard| discard.lookbehind.len()),
+            )
+    }
+
+    fn record_retained_peak(&mut self) {
+        #[cfg(test)]
+        {
+            self.peak_retained_scanner_bytes = self
+                .peak_retained_scanner_bytes
+                .max(self.retained_scanner_bytes());
         }
     }
 
@@ -381,7 +511,9 @@ fn parse_candidate(raw: &str, stale_opener: bool) -> Option<ParsedCandidate> {
     }
     let argument_source = &body[object_start..];
 
-    if let Some(arguments) = NativeParser::parse_arguments(argument_source) {
+    if !native_syntax_has_external_whitespace(argument_source)
+        && let Some(arguments) = NativeParser::parse_arguments(argument_source)
+    {
         return Some(ParsedCandidate {
             name: name.to_owned(),
             arguments: Value::Object(arguments),
@@ -389,7 +521,9 @@ fn parse_candidate(raw: &str, stale_opener: bool) -> Option<ParsedCandidate> {
         });
     }
 
-    let arguments: Value = serde_json::from_str(argument_source).ok()?;
+    let arguments = serde_json::from_str::<UniqueJsonValue>(argument_source)
+        .ok()?
+        .0;
     if !arguments.is_object() {
         return None;
     }
@@ -398,6 +532,112 @@ fn parse_candidate(raw: &str, stale_opener: bool) -> Option<ParsedCandidate> {
         arguments,
         repaired: true,
     })
+}
+
+fn native_syntax_has_external_whitespace(source: &str) -> bool {
+    let mut position = 0;
+    let mut in_native_string = false;
+    while position < source.len() {
+        let remaining = &source[position..];
+        if remaining.starts_with(NATIVE_QUOTE) {
+            position += NATIVE_QUOTE.len();
+            in_native_string = !in_native_string;
+            continue;
+        }
+        let character = remaining
+            .chars()
+            .next()
+            .expect("position is before source end");
+        if !in_native_string && character.is_whitespace() {
+            return true;
+        }
+        position += character.len_utf8();
+    }
+    false
+}
+
+struct UniqueJsonValue(Value);
+
+impl<'de> Deserialize<'de> for UniqueJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonVisitor)
+    }
+}
+
+struct UniqueJsonVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonVisitor {
+    type Value = UniqueJsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .map(UniqueJsonValue)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Null))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<UniqueJsonValue>()? {
+            values.push(value.0);
+        }
+        Ok(UniqueJsonValue(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = Map::new();
+        while let Some((key, value)) = object.next_entry::<String, UniqueJsonValue>()? {
+            if values.contains_key(&key) {
+                return Err(de::Error::custom("duplicate JSON object key"));
+            }
+            values.insert(key, value.0);
+        }
+        Ok(UniqueJsonValue(Value::Object(values)))
+    }
 }
 
 struct NativeParser<'a> {
@@ -466,6 +706,9 @@ impl<'a> NativeParser<'a> {
             }
             self.position = key_end + 1;
             let value = self.parse_value(depth)?;
+            if object.contains_key(key) {
+                return None;
+            }
             object.insert(key.to_owned(), value);
             self.skip_whitespace();
             if self.consume_char('}').is_some() {
@@ -848,16 +1091,17 @@ mod tests {
     #[test]
     fn overflow_at_exact_cap_preserves_a_split_later_opener() {
         let incomplete = "<|tool_call>call:large{value:123456}";
+        let outer_closer = "<tool_call|>";
         let later = "<|tool_call>call:ok{}<tool_call|>";
         let mut parser = ToolCallParser::with_limits(8, incomplete.len());
         let mut events = parser.push(incomplete);
-        events.extend(parser.push("<"));
+        events.extend(parser.push("<tool_call|><"));
         events.extend(parser.push("|tool_call>call:ok{}<tool_call|>"));
         events.extend(parser.finish());
 
         assert_eq!(calls(&events).len(), 1);
         assert_eq!(calls(&events)[0].name, "ok");
-        assert_eq!(text(&events), incomplete);
+        assert_eq!(text(&events), format!("{incomplete}{outer_closer}"));
         assert_eq!(calls(&events)[0].raw, later);
         assert_eq!(parser.stats().candidate_overflows, 1);
     }
@@ -908,6 +1152,127 @@ mod tests {
         assert!(calls(&events).is_empty());
         assert_eq!(text(&events), raw);
         assert_eq!(parser.stats().parsed, 0);
+    }
+
+    #[test]
+    fn multi_megabyte_single_push_keeps_parser_staging_bounded() {
+        let cap = 32;
+        let raw = format!(
+            "<|tool_call>call:large{{value:<|\"|>{}<|\"|>}}<tool_call|>",
+            "x".repeat(2 * 1024 * 1024)
+        );
+        let mut parser = ToolCallParser::with_limits(8, cap);
+        let events = parser.push(&raw);
+
+        assert!(calls(&events).is_empty());
+        assert_eq!(text(&events), raw);
+        assert!(parser.candidate.is_none());
+        assert!(parser.discard.is_none());
+        assert!(parser.pending.len() <= SCANNER_LOOKBEHIND);
+        assert!(parser.peak_retained_scanner_bytes <= cap + SCANNER_LOOKBEHIND);
+        assert_eq!(parser.stats().candidate_overflows, 1);
+    }
+
+    #[test]
+    fn oversized_native_string_ignores_nested_call_until_outer_closer() {
+        let nested = "<|tool_call>call:evil{}<tool_call|>";
+        let outer = format!(
+            "<|tool_call>call:outer{{value:<|\"|>{nested}{}<|\"|>}}<tool_call|>",
+            "x".repeat(128)
+        );
+        let later = "<|tool_call>call:ok{}<tool_call|>";
+        let input = format!("{outer}{later}");
+        let mut parser = ToolCallParser::with_limits(8, 48);
+        let events = collect(&mut parser, &[&input]);
+
+        assert_eq!(calls(&events).len(), 1);
+        assert_eq!(calls(&events)[0].name, "ok");
+        assert_eq!(text(&events), outer);
+        assert_eq!(parser.stats().candidate_overflows, 1);
+    }
+
+    #[test]
+    fn oversized_json_string_preserves_lexical_state_across_one_byte_fragments() {
+        let nested = "<|tool_call>call:evil{}<tool_call|>";
+        let outer = format!(
+            "<|tool_call>call:outer{{\"value\":\"prefix \\\"quoted\\\" <|\\\"|> {nested} {}\"}}<tool_call|>",
+            "x".repeat(128)
+        );
+        let later = "<|tool_call>call:ok{}<tool_call|>";
+        let input = format!("{outer}{later}");
+        let mut parser = ToolCallParser::with_limits(8, 56);
+        let fragments = input
+            .as_bytes()
+            .iter()
+            .map(|byte| std::str::from_utf8(std::slice::from_ref(byte)).unwrap())
+            .collect::<Vec<_>>();
+        let events = collect(&mut parser, &fragments);
+
+        assert_eq!(calls(&events).len(), 1);
+        assert_eq!(calls(&events)[0].name, "ok");
+        assert_eq!(text(&events), outer);
+        assert_eq!(parser.stats().candidate_overflows, 1);
+    }
+
+    #[test]
+    fn duplicate_keys_in_native_or_json_objects_round_trip_as_text() {
+        let native_top = "<|tool_call>call:native{a:1,a:2}<tool_call|>";
+        let native_nested = "<|tool_call>call:native_nested{outer:{x:1,x:2}}<tool_call|>";
+        let json_top = "<|tool_call>call:json{\"a\":1,\"a\":2}<tool_call|>";
+        let json_nested = concat!(
+            "<|tool_call>call:json_nested{\"outer\":{\"x\":1,\"x\":2}}",
+            "<tool_call|>"
+        );
+        let input = format!("{native_top}{native_nested}{json_top}{json_nested}");
+        let mut parser = ToolCallParser::new();
+        let events = collect(&mut parser, &[&input]);
+
+        assert!(calls(&events).is_empty());
+        assert_eq!(text(&events), input);
+        assert_eq!(parser.stats().parsed, 0);
+        assert_eq!(parser.stats().wellformed, 0);
+        assert_eq!(parser.stats().repaired, 0);
+    }
+
+    #[test]
+    fn whitespace_bearing_unquoted_native_syntax_is_not_wellformed() {
+        let unquoted = "<|tool_call>call:native{a: 1}<tool_call|>";
+        let json = "<|tool_call>call:json{ \"a\": 1 }<tool_call|>";
+        let input = format!("{unquoted}{json}");
+        let mut parser = ToolCallParser::new();
+        let events = collect(&mut parser, &[&input]);
+
+        assert_eq!(calls(&events).len(), 1);
+        assert_eq!(calls(&events)[0].name, "json");
+        assert!(calls(&events)[0].repaired);
+        assert_eq!(text(&events), unquoted);
+        assert_eq!(parser.stats().parsed, 1);
+        assert_eq!(parser.stats().wellformed, 0);
+        assert_eq!(parser.stats().repaired, 1);
+    }
+
+    #[test]
+    fn tiny_cap_unicode_after_partial_stale_opener_round_trips_once() {
+        let input = "<|tool_call|>call雪text";
+        let mut parser = ToolCallParser::with_limits(8, 1);
+        let events = collect(&mut parser, &[input]);
+
+        assert!(calls(&events).is_empty());
+        assert_eq!(text(&events), input);
+        assert_eq!(parser.stats().candidate_overflows, 0);
+        assert!(parser.peak_retained_scanner_bytes <= 1 + SCANNER_LOOKBEHIND);
+    }
+
+    #[test]
+    fn zero_cap_stale_opener_enters_bounded_discard() {
+        let raw = "<|tool_call|>call:x{}<tool_call|>";
+        let mut parser = ToolCallParser::with_limits(8, 0);
+        let events = collect(&mut parser, &[raw]);
+
+        assert!(calls(&events).is_empty());
+        assert_eq!(text(&events), raw);
+        assert_eq!(parser.stats().candidate_overflows, 1);
+        assert!(parser.peak_retained_scanner_bytes <= SCANNER_LOOKBEHIND);
     }
 
     #[test]
