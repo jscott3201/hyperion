@@ -15,15 +15,20 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
+use http_body_util::BodyExt;
 use hyperion_server::auth::bind_gate;
 use hyperion_server::control::ControlState;
 use hyperion_server::engine::test_support::StubEngine;
+use hyperion_server::engine::{
+    CancelToken, EngineDriver, EngineError, EngineRequest, StepEvent, StepToken, Usage,
+};
 use hyperion_server::prepare::ContextWindow;
 use hyperion_server::server::{Server, ServerConfig};
 use hyperion_tokenizer::TokenizerHandle;
 use hyperion_tokenizer::renderer::ChatTemplate;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
+use std::sync::Mutex;
 use tower::ServiceExt;
 
 /// A minimal HuggingFace `tokenizer.json` with a tiny WordLevel vocab that
@@ -49,6 +54,35 @@ const MINIMAL_TOKENIZER_JSON: &str = r#"{
   }
 }"#;
 
+/// A model-free BPE/ByteFallback tokenizer whose generated `<0xE5>` token is
+/// unresolved by incremental `push` and becomes one replacement scalar only
+/// when the response decoder is finished at EOF.
+const EOF_FALLBACK_TOKENIZER_JSON: &str = r#"{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {"id": 0, "content": "<eos>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 1, "content": "<bos>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {"type": "ByteFallback"},
+  "model": {
+    "type": "BPE",
+    "dropout": null,
+    "unk_token": null,
+    "continuing_subword_prefix": null,
+    "end_of_word_suffix": null,
+    "fuse_unk": false,
+    "byte_fallback": true,
+    "ignore_merges": false,
+    "vocab": {"<eos>": 0, "<bos>": 1, "<0xE5>": 2},
+    "merges": []
+  }
+}"#;
+
 /// A trivial chat template that just concatenates the messages' content. It
 /// emits no special tokens (the contract tests don't need real gemma4 framing
 /// — they exercise the HTTP/taxonomy layer, not the template).
@@ -64,12 +98,32 @@ fn test_server(
     context: ContextWindow,
     control: &ControlState,
 ) -> Server {
-    let tokenizer = TokenizerHandle::from_bytes(MINIMAL_TOKENIZER_JSON.as_bytes())
-        .expect("minimal tokenizer loads");
+    test_server_with_tokenizer(stub, bearer, context, control, MINIMAL_TOKENIZER_JSON)
+}
+
+fn test_server_with_tokenizer(
+    stub: StubEngine,
+    bearer: Option<&str>,
+    context: ContextWindow,
+    control: &ControlState,
+    tokenizer_json: &str,
+) -> Server {
+    test_server_with_engine(Arc::new(stub), bearer, context, control, tokenizer_json)
+}
+
+fn test_server_with_engine(
+    engine: Arc<dyn EngineDriver>,
+    bearer: Option<&str>,
+    context: ContextWindow,
+    control: &ControlState,
+    tokenizer_json: &str,
+) -> Server {
+    let tokenizer =
+        TokenizerHandle::from_bytes(tokenizer_json.as_bytes()).expect("model-free tokenizer loads");
     let template = ChatTemplate::from_source(TRIVIAL_TEMPLATE, "<bos>", "<eos>")
         .expect("trivial template compiles");
     Server::new(ServerConfig {
-        engine: Arc::new(stub),
+        engine,
         template,
         tokenizer,
         control: control.clone(),
@@ -78,6 +132,82 @@ fn test_server(
         model_id: "test-model".to_string(),
         default_max_tokens: 64,
     })
+}
+
+struct ControlledFailureEngine {
+    cleanup_reached: std::sync::mpsc::SyncSender<()>,
+    release_cleanup: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl EngineDriver for ControlledFailureEngine {
+    fn stream(
+        &self,
+        request: &EngineRequest,
+        cancel: &CancelToken,
+        tx: tokio::sync::mpsc::Sender<StepEvent>,
+    ) -> Result<Usage, EngineError> {
+        for _ in 0..10_000 {
+            if tx
+                .blocking_send(StepEvent::Token(StepToken {
+                    id: 99_999,
+                    logit: 0.0,
+                }))
+                .is_err()
+            {
+                assert!(cancel.is_cancelled(), "decoder failure cancels engine");
+                self.cleanup_reached
+                    .send(())
+                    .expect("test observes cleanup barrier");
+                self.release_cleanup
+                    .lock()
+                    .expect("cleanup mutex")
+                    .recv()
+                    .expect("test releases cleanup barrier");
+                return Err(EngineError::Cancelled);
+            }
+        }
+        let usage = Usage {
+            prompt_tokens: u32::try_from(request.prompt_tokens.len()).unwrap_or(u32::MAX),
+            completion_tokens: 10_000,
+        };
+        tx.blocking_send(StepEvent::Done(usage))
+            .map_err(|_| EngineError::Cancelled)?;
+        Ok(usage)
+    }
+}
+
+struct ControlledDisconnectEngine {
+    started: std::sync::mpsc::SyncSender<()>,
+    cancelled_and_closed: std::sync::mpsc::SyncSender<()>,
+    release_cleanup: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl EngineDriver for ControlledDisconnectEngine {
+    fn stream(
+        &self,
+        _request: &EngineRequest,
+        cancel: &CancelToken,
+        tx: tokio::sync::mpsc::Sender<StepEvent>,
+    ) -> Result<Usage, EngineError> {
+        self.started.send(()).expect("test observes live engine");
+        loop {
+            if tx
+                .blocking_send(StepEvent::Token(StepToken { id: 2, logit: 0.0 }))
+                .is_err()
+            {
+                assert!(cancel.is_cancelled(), "response drop cancels engine");
+                self.cancelled_and_closed
+                    .send(())
+                    .expect("test observes cancellation and receiver close");
+                self.release_cleanup
+                    .lock()
+                    .expect("cleanup mutex")
+                    .recv()
+                    .expect("test releases cleanup barrier");
+                return Err(EngineError::Cancelled);
+            }
+        }
+    }
 }
 
 /// Send a request through the router, return the (status, body string).
@@ -105,6 +235,23 @@ fn fresh_control() -> ControlState {
     let c = ControlState::new("test-model");
     c.set_ready(true);
     c
+}
+
+fn streamed_text(body: &str, dialect: &str) -> String {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .filter_map(|value| match dialect {
+            "anthropic" if value["type"] == "content_block_delta" => {
+                value["delta"]["text"].as_str().map(str::to_owned)
+            }
+            "openai" => value["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(str::to_owned),
+            _ => None,
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -653,60 +800,395 @@ async fn streaming_emits_raw_sse_bytes_openai_done() {
     );
 }
 
-/// The in_flight flag clears when a stream is dropped (client disconnect).
-/// The Guard's Drop flips in_flight(false) — the fix for the review's finding
-/// that set_in_flight(false) lived inside the stream generator (never reached
-/// on a dropped future). We start a stream, drop the response (mid-stream),
-/// and assert in_flight is false afterward.
 #[tokio::test]
-async fn in_flight_clears_on_stream_drop() {
+async fn streaming_and_non_streaming_share_incremental_decode_semantics() {
     let control = fresh_control();
-    // A stub that blocks before the first token so the stream is mid-flight
-    // when we drop it.
-    let srv = Arc::new(test_server(
+    let srv = test_server(
         StubEngine {
             tokens: vec![2, 3],
-            block_after: Some(0),
+            block_after: None,
         },
         None,
         4096,
         &control,
+    );
+
+    let (status, non_streaming) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":false}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let response: serde_json::Value = serde_json::from_str(&non_streaming).unwrap();
+    let expected = response["content"][0]["text"].as_str().unwrap();
+    assert_eq!(expected, "hello world");
+
+    let (status, anthropic) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(streamed_text(&anthropic, "anthropic"), expected);
+
+    let (status, openai) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/chat/completions",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(streamed_text(&openai, "openai"), expected);
+}
+
+#[tokio::test]
+async fn eof_only_fallback_text_precedes_both_dialects_terminal_frames() {
+    let control = fresh_control();
+    let srv = test_server_with_tokenizer(
+        StubEngine {
+            tokens: vec![2],
+            block_after: None,
+        },
+        None,
+        4096,
+        &control,
+        EOF_FALLBACK_TOKENIZER_JSON,
+    );
+
+    let (status, anthropic_json) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":false}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let response: serde_json::Value = serde_json::from_str(&anthropic_json).unwrap();
+    let anthropic_expected = response["content"][0]["text"].as_str().unwrap();
+    assert_eq!(anthropic_expected, "�");
+
+    let (status, anthropic_sse) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        streamed_text(&anthropic_sse, "anthropic"),
+        anthropic_expected
+    );
+    assert_eq!(anthropic_sse.matches('�').count(), 1, "{anthropic_sse}");
+    let suffix = anthropic_sse.find("\"text\":\"�\"").unwrap();
+    let message_delta = anthropic_sse.find("event: message_delta\n").unwrap();
+    let message_stop = anthropic_sse.find("event: message_stop\n").unwrap();
+    assert!(suffix < message_delta, "EOF text precedes message_delta");
+    assert!(
+        message_delta < message_stop,
+        "message_delta precedes message_stop"
+    );
+
+    let (status, openai_json) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/chat/completions",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":false}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let response: serde_json::Value = serde_json::from_str(&openai_json).unwrap();
+    let openai_expected = response["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap();
+    assert_eq!(openai_expected, anthropic_expected);
+
+    let (status, openai_sse) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/chat/completions",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(streamed_text(&openai_sse, "openai"), openai_expected);
+    assert_eq!(openai_sse.matches('�').count(), 1, "{openai_sse}");
+    let suffix = openai_sse.find("\"content\":\"�\"").unwrap();
+    let terminal = openai_sse.find("\"finish_reason\":\"stop\"").unwrap();
+    let done = openai_sse.find("data: [DONE]\n\n").unwrap();
+    assert!(suffix < terminal, "EOF text precedes terminal chunk");
+    assert!(terminal < done, "terminal chunk precedes [DONE]");
+}
+
+#[tokio::test]
+async fn streaming_decoder_failure_is_one_opaque_error_without_terminal_frame() {
+    let control = fresh_control();
+    let srv = test_server(
+        StubEngine {
+            // Unknown IDs decode to no text in the fixture tokenizer, creating
+            // an adversarial unresolved run with substantial generation left
+            // when the 257th ID exceeds the decoder ceiling.
+            tokens: vec![99_999; 10_000],
+            block_after: None,
+        },
+        None,
+        4096,
+        &control,
+    );
+    let (status, body) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":300,"stream":true}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "SSE headers are already committed");
+    assert_eq!(body.matches("event: error\n").count(), 1, "{body}");
+    assert_eq!(body.matches("internal server error").count(), 1, "{body}");
+    assert!(
+        !body.contains("message_delta"),
+        "no successful terminal: {body}"
+    );
+    assert!(
+        !body.contains("message_stop"),
+        "no successful terminal: {body}"
+    );
+    assert!(
+        !body.contains("retained token limit"),
+        "details stay opaque: {body}"
+    );
+    assert!(!control.is_in_flight(), "failed stream releases its permit");
+    let (reload, _) = send(srv.router(), Method::POST, "/control/reload", &[], "").await;
+    assert_eq!(reload, StatusCode::NOT_IMPLEMENTED, "permit is not stuck");
+}
+
+#[tokio::test]
+async fn failed_stream_holds_permit_until_engine_cleanup_finishes() {
+    let control = fresh_control();
+    let (cleanup_tx, cleanup_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let srv = Arc::new(test_server_with_engine(
+        Arc::new(ControlledFailureEngine {
+            cleanup_reached: cleanup_tx,
+            release_cleanup: Mutex::new(release_rx),
+        }),
+        None,
+        4096,
+        &control,
+        MINIMAL_TOKENIZER_JSON,
     ));
-    let srv_clone = srv.clone();
-    // Start the stream; don't await the body.
-    let handle = tokio::spawn(async move {
-        let request = Request::builder()
-            .method(Method::POST)
-            .uri("/v1/messages")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":true}"#,
-            ))
-            .unwrap();
-        srv_clone.router().oneshot(request).await
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":300,"stream":true}"#,
+        ))
+        .unwrap();
+    let response = srv.router().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_task = tokio::spawn(async move {
+        axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
     });
-    // Let it acquire the permit + enter the engine (set in_flight true).
-    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-    assert!(control.is_in_flight(), "in_flight is true mid-stream");
-    // Simulate client disconnect: abort the task + drop the JoinHandle (which
-    // holds the Response → the SSE body → the stream → the Guard). The Guard's
-    // Drop flips in_flight(false). `abort()` drops a pending future; awaiting
-    // the handle (completed or aborted) drops the stored Response. Both paths
-    // release the guard.
-    handle.abort();
-    let _ = handle.await; // drops the Response (lazy SSE body + the Guard)
-    // Give the runtime a tick to run any pending Drop.
-    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+
+    tokio::task::spawn_blocking(move || {
+        cleanup_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("engine reaches controlled cleanup")
+    })
+    .await
+    .unwrap();
+    let body_pending_during_cleanup = !body_task.is_finished();
+    let in_flight_during_cleanup = control.is_in_flight();
+
+    let (concurrent_status, concurrent_body) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4}"#,
+    )
+    .await;
+
+    // Release before assertions so a regression cannot strand a blocking test
+    // engine during panic unwinding.
+    release_tx.send(()).expect("release engine cleanup");
+    let bytes = tokio::time::timeout(std::time::Duration::from_secs(2), body_task)
+        .await
+        .expect("failed stream completes after cleanup")
+        .unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+    assert!(
+        body_pending_during_cleanup,
+        "error waits for engine cleanup"
+    );
+    assert!(
+        in_flight_during_cleanup,
+        "permit remains held during cleanup"
+    );
+    assert_eq!(
+        concurrent_status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{concurrent_body}"
+    );
+    assert_eq!(body.matches("event: error\n").count(), 1, "{body}");
+    assert_eq!(body.matches("internal server error").count(), 1, "{body}");
+    assert!(
+        !body.contains("message_delta"),
+        "no success terminal: {body}"
+    );
+    assert!(
+        !body.contains("message_stop"),
+        "no success terminal: {body}"
+    );
+    assert!(!control.is_in_flight(), "permit releases after cleanup");
+}
+
+#[tokio::test]
+async fn non_streaming_decoder_failure_uses_opaque_dialect_envelope() {
+    let control = fresh_control();
+    let srv = test_server(
+        StubEngine {
+            tokens: vec![99_999; 10_000],
+            block_after: None,
+        },
+        None,
+        4096,
+        &control,
+    );
+    let (status, body) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/chat/completions",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":300,"stream":false}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(response["error"]["type"], "internal_server_error");
+    assert_eq!(response["error"]["message"], "internal server error");
+    assert!(
+        !body.contains("retained token limit"),
+        "details stay opaque: {body}"
+    );
     assert!(
         !control.is_in_flight(),
-        "in_flight cleared after the stream dropped (Guard::drop)"
+        "failed request releases its permit"
     );
-    // And a subsequent reload is now 501 (not stuck 409).
-    let (status, _) = send(srv.router(), Method::POST, "/control/reload", &[], "").await;
+    let (reload, _) = send(srv.router(), Method::POST, "/control/reload", &[], "").await;
+    assert_eq!(reload, StatusCode::NOT_IMPLEMENTED, "permit is not stuck");
+}
+
+/// A dropped SSE response cancels immediately but retains its generation lease
+/// until the detached blocking engine closure finishes cleanup.
+#[tokio::test]
+async fn disconnect_holds_lease_until_engine_cleanup_exits() {
+    let control = fresh_control();
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+    let (cancelled_tx, cancelled_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let srv = Arc::new(test_server_with_engine(
+        Arc::new(ControlledDisconnectEngine {
+            started: started_tx,
+            cancelled_and_closed: cancelled_tx,
+            release_cleanup: Mutex::new(release_rx),
+        }),
+        None,
+        4096,
+        &control,
+        MINIMAL_TOKENIZER_JSON,
+    ));
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":true}"#,
+        ))
+        .unwrap();
+    let response = srv.router().oneshot(request).await.unwrap();
+    let initial_status = response.status();
+    let mut body = response.into_body();
+    let opening_frame = body.frame().await.expect("opening SSE frame").unwrap();
+
+    tokio::task::spawn_blocking(move || {
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("engine is live before disconnect")
+    })
+    .await
+    .unwrap();
+    drop(body);
+    tokio::task::spawn_blocking(move || {
+        cancelled_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("engine observes cancellation and receiver close")
+    })
+    .await
+    .unwrap();
+
+    let in_flight_during_cleanup = control.is_in_flight();
+    let (concurrent_status, concurrent_body) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4}"#,
+    )
+    .await;
+    let (reload_during_cleanup, _) =
+        send(srv.router(), Method::POST, "/control/reload", &[], "").await;
+
+    release_tx.send(()).expect("release engine cleanup");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while control.is_in_flight() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("generation lease clears after engine cleanup");
+    let (reload_after_cleanup, _) =
+        send(srv.router(), Method::POST, "/control/reload", &[], "").await;
+
+    assert_eq!(initial_status, StatusCode::OK);
+    assert!(
+        opening_frame.is_data(),
+        "stream was polled before disconnect"
+    );
+    assert!(
+        in_flight_during_cleanup,
+        "engine lease keeps in_flight true during cleanup"
+    );
     assert_eq!(
-        status,
+        concurrent_status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{concurrent_body}"
+    );
+    assert_eq!(reload_during_cleanup, StatusCode::CONFLICT);
+    assert_eq!(
+        reload_after_cleanup,
         StatusCode::NOT_IMPLEMENTED,
-        "reload works after disconnect (not stuck 409)"
+        "lease clears only after engine cleanup exits"
     );
 }
 

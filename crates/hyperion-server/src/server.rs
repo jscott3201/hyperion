@@ -23,8 +23,8 @@ use axum::{Json, Router};
 use bytes::Bytes;
 use tokio::sync::Semaphore;
 
-use hyperion_tokenizer::TokenizerHandle;
 use hyperion_tokenizer::renderer::ChatTemplate;
+use hyperion_tokenizer::{SpecialTokenPolicy, TokenizerError, TokenizerHandle};
 
 use crate::auth::{AuthError, verify_bearer};
 use crate::control::{ControlState, ReloadVerdict};
@@ -58,18 +58,27 @@ pub struct Server {
 /// context-overflow 413 (prepare).
 const BODY_LIMIT: usize = 32 * 1024 * 1024;
 
-/// The single-flight + in-flight guard: holds the permit + a control clone +
-/// the cancel token for the lifetime of a generation's **stream** (not the
-/// `run` call). Released on Drop — which happens when the SSE body is fully
-/// consumed OR the response future is dropped (client disconnect). This is
-/// the fix for the adversarial findings that the permit was released when
-/// `run` returned (streaming is lazy) and that `set_in_flight(false)` lived
-/// inside the stream generator (never reached on a dropped future).
-struct Guard {
-    /// The single-flight permit — dropped releases the Semaphore(1).
+/// Shared generation lease. The response guard and blocking engine closure
+/// each hold one reference, so single-flight cannot release until both the
+/// response lifetime and detached engine cleanup have ended.
+struct GenerationLease {
     _permit: tokio::sync::OwnedSemaphorePermit,
-    /// The control state to flip in_flight(false) on Drop.
     control: ControlState,
+}
+
+impl Drop for GenerationLease {
+    fn drop(&mut self) {
+        // Clear the old state while its permit still excludes a new request.
+        // The permit is released after this drop method returns.
+        self.control.set_in_flight(false);
+    }
+}
+
+/// Response-lifetime guard. Dropping a response or handler cancels generation
+/// immediately; its shared lease is released only after the engine closure also
+/// exits.
+struct Guard {
+    _lease: Arc<GenerationLease>,
     /// The cancel token — fired on Drop so a client disconnect cancels the
     /// engine promptly (the dropped-receiver path also cancels; this covers
     /// the prefill window + any path that doesn't hit a `blocking_send`).
@@ -78,7 +87,6 @@ struct Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        self.control.set_in_flight(false);
         self.cancel.cancel();
     }
 }
@@ -93,7 +101,7 @@ pub struct ServerConfig {
     pub engine: Arc<dyn EngineDriver>,
     /// The compiled chat template (renders both dialects' messages).
     pub template: ChatTemplate,
-    /// The in-process tokenizer (encode the rendered prompt; decode each step).
+    /// The in-process tokenizer (encode the prompt; incrementally decode the response).
     pub tokenizer: TokenizerHandle,
     /// The ops state (health/stats/reload/shutdown counters).
     pub control: ControlState,
@@ -236,6 +244,13 @@ fn engine_error_response(err: EngineError, dialect: Dialect) -> Response {
     let body = ErrorEnvelope::new(status, message).to_json(dialect);
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (code, body).into_response()
+}
+
+/// Map a tokenizer failure to the dialect's opaque internal-error envelope.
+fn tokenizer_error_response(err: &TokenizerError, dialect: Dialect) -> Response {
+    eprintln!("response decoder failed: {err}");
+    let body = ErrorEnvelope::new(500, "internal server error").to_json(dialect);
+    (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────
@@ -402,22 +417,21 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
     let stream = prepared.stream;
     let prompt_tokens = prepared.prompt_tokens_len;
 
-    // Acquire the single-flight permit + arm the guard. The guard owns the
-    // permit + the control clone + the cancel token, and releases them on
-    // Drop — which happens when the SSE body is fully consumed OR the response
-    // future is dropped (client disconnect). This is the fix for the
-    // adversarial findings that the permit was released when `run` returned
-    // (streaming is lazy) and `set_in_flight(false)` lived inside the stream
-    // generator (never reached on a dropped future).
+    // Acquire single-flight and share its lease between the response guard and
+    // blocking engine closure. A disconnect cancels immediately, but permit /
+    // in-flight release waits for the detached engine closure to exit too.
     let permit = match acquire_permit(&srv.permit, &srv.control, dialect) {
         Ok(p) => p,
         Err(r) => return *r,
     };
     srv.control.set_in_flight(true);
     let cancel = CancelToken::new();
-    let guard = Guard {
+    let lease = Arc::new(GenerationLease {
         _permit: permit,
         control: srv.control.clone(),
+    });
+    let guard = Guard {
+        _lease: lease.clone(),
         cancel: cancel.clone(),
     };
 
@@ -428,8 +442,10 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
     let engine = srv.engine.clone();
     let request_clone = request.clone();
     let cancel_clone = cancel.clone();
-    let engine_task =
-        tokio::task::spawn_blocking(move || engine.stream(&request_clone, &cancel_clone, tx));
+    let engine_task = tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        engine.stream(&request_clone, &cancel_clone, tx)
+    });
 
     if stream {
         // SSE: emit the raw framer bytes directly as the body (NOT via axum's
@@ -443,55 +459,87 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
         let control = srv.control.clone();
         let request_for_stream = request.clone();
         // The guard moves into the stream so it lives as long as the stream
-        // does (consumed lazily by axum). Dropping the stream (client
-        // disconnect, or full consumption) drops the guard → releases the
-        // permit + flips in_flight(false) + cancels.
+        // does. Dropping the stream cancels generation; its shared lease keeps
+        // single-flight held until the blocking engine closure exits.
         let guard = guard;
         let stream = async_stream::stream! {
+            let mut rx = rx;
             let _guard = guard; // held for the stream's lifetime
             // The opening frames (Anthropic message_start + content_block_start;
             // empty for OpenAI). `start` is a complete SSE chunk.
             yield Ok::<Bytes, Infallible>(Bytes::from(framer.start()));
             let mut usage = Usage { prompt_tokens, completion_tokens: 0 };
-            let mut rx = rx;
+            let mut decoder = tokenizer.streaming_decoder(SpecialTokenPolicy::Skip);
+            let mut decoder_error = None;
             while let Some(event) = rx.recv().await {
                 match event {
                     StepEvent::Token(t) => {
-                        let piece = tokenizer.decode(&[t.id]);
-                        let frame = framer.token(t, &piece);
-                        yield Ok(Bytes::from(frame));
+                        match decoder.push(t.id) {
+                            Ok(Some(fragment)) if !fragment.is_empty() => {
+                                let frame = framer.text(&fragment);
+                                yield Ok(Bytes::from(frame));
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                cancel.cancel();
+                                decoder_error = Some(error);
+                                break;
+                            }
+                        }
                     }
                     StepEvent::Done(u) => usage = u,
                 }
             }
-            // The engine finished: await its result for the terminal frame.
+            // A decoder failure stops consumption immediately. Closing the
+            // bounded channel wakes a blocked engine sender so cleanup can
+            // complete before the single opaque error is framed.
+            drop(rx);
+            // Await engine cleanup before selecting the terminal or error frame.
             let result = engine_task.await.unwrap_or(Err(EngineError::Native(
                 hyperion_ffi::Error {
                     status: hyperion_ffi::Status::Internal,
                     message: "engine task failed".into(),
                 },
             )));
-            match result {
-                Ok(_) => {
-                    let stop = stop_reason(&usage, &request_for_stream, false);
-                    let frame = framer.done(usage, stop);
-                    yield Ok(Bytes::from(frame));
-                }
-                Err(EngineError::Native(n)) if n.status.http_status_code() == 529 => {
-                    // 529 mid-stream: an SSE error event, NOT an HTTP change
-                    // (headers already flushed). Bump the governor counter.
-                    control.inc_governor_rejections();
-                    let frame = framer.error(529, &n.message);
-                    yield Ok(Bytes::from(frame));
-                }
-                Err(e) => {
-                    let (status, message) = match &e {
-                        EngineError::Busy => (429, "single-flight generation is busy".to_string()),
-                        EngineError::Cancelled => (499, "client closed the request".to_string()),
-                        EngineError::Native(n) => (n.status.http_status_code(), n.message.clone()),
-                    };
-                    let frame = framer.error(status, &message);
-                    yield Ok(Bytes::from(frame));
+            if let Some(error) = decoder_error {
+                eprintln!("response decoder failed: {error}");
+                let frame = framer.error(500, "internal server error");
+                yield Ok(Bytes::from(frame));
+            } else {
+                match result {
+                    Ok(_) => match decoder.finish() {
+                        Ok(fragment) => {
+                            if !fragment.is_empty() {
+                                let frame = framer.text(&fragment);
+                                yield Ok(Bytes::from(frame));
+                            }
+                            let stop = stop_reason(&usage, &request_for_stream, false);
+                            let frame = framer.done(usage, stop);
+                            yield Ok(Bytes::from(frame));
+                        }
+                        Err(error) => {
+                            cancel.cancel();
+                            eprintln!("response decoder failed at EOF: {error}");
+                            let frame = framer.error(500, "internal server error");
+                            yield Ok(Bytes::from(frame));
+                        }
+                    },
+                    Err(EngineError::Native(n)) if n.status.http_status_code() == 529 => {
+                        // 529 mid-stream: an SSE error event, NOT an HTTP change
+                        // (headers already flushed). Bump the governor counter.
+                        control.inc_governor_rejections();
+                        let frame = framer.error(529, &n.message);
+                        yield Ok(Bytes::from(frame));
+                    }
+                    Err(e) => {
+                        let (status, message) = match &e {
+                            EngineError::Busy => (429, "single-flight generation is busy".to_string()),
+                            EngineError::Cancelled => (499, "client closed the request".to_string()),
+                            EngineError::Native(n) => (n.status.http_status_code(), n.message.clone()),
+                        };
+                        let frame = framer.error(status, &message);
+                        yield Ok(Bytes::from(frame));
+                    }
                 }
             }
         };
@@ -511,22 +559,30 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
         // Non-streaming: collect all tokens, then build a single JSON response.
         let mut text = String::new();
         let mut usage = Usage::default();
+        let mut decoder = srv.tokenizer.streaming_decoder(SpecialTokenPolicy::Skip);
+        let mut decoder_error = None;
         let mut rx = rx;
+        let _guard = guard;
         while let Some(event) = rx.recv().await {
             match event {
-                StepEvent::Token(t) => {
-                    let piece = srv.tokenizer.decode(&[t.id]);
-                    text.push_str(&piece);
-                }
+                StepEvent::Token(t) => match decoder.push(t.id) {
+                    Ok(Some(fragment)) => text.push_str(&fragment),
+                    Ok(None) => {}
+                    Err(error) => {
+                        cancel.cancel();
+                        decoder_error = Some(error);
+                        break;
+                    }
+                },
                 StepEvent::Done(u) => usage = u,
             }
         }
-        // The guard (held here) releases the permit + flips in_flight(false) on
-        // drop at the end of this scope — for the non-streaming path, the
-        // generation is complete by the time we reach here, so dropping is
-        // correct. (On a client disconnect during the await above, axum drops
-        // the handler future → this scope drops → the guard releases.)
-        let _ = guard;
+        // On decode failure, drop the receiver before joining the engine so a
+        // sender blocked on the bounded channel wakes and observes cancellation.
+        drop(rx);
+        // The response guard is held through the handler scope. If the handler
+        // is dropped, it cancels generation while the engine's shared lease
+        // keeps single-flight held until blocking cleanup exits.
         let engine_result =
             engine_task
                 .await
@@ -534,12 +590,20 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
                     status: hyperion_ffi::Status::Internal,
                     message: "engine task failed".into(),
                 })));
-        match engine_result {
-            Ok(_) => {
-                let stop = stop_reason(&usage, &request, false);
-                non_streaming_json(dialect, &srv.model_id, &text, usage, stop)
-            }
-            Err(e) => engine_error_response(e, dialect),
+        match (engine_result, decoder_error) {
+            (_, Some(error)) => tokenizer_error_response(&error, dialect),
+            (Ok(_), None) => match decoder.finish() {
+                Ok(fragment) => {
+                    text.push_str(&fragment);
+                    let stop = stop_reason(&usage, &request, false);
+                    non_streaming_json(dialect, &srv.model_id, &text, usage, stop)
+                }
+                Err(error) => {
+                    cancel.cancel();
+                    tokenizer_error_response(&error, dialect)
+                }
+            },
+            (Err(error), None) => engine_error_response(error, dialect),
         }
     }
 }
