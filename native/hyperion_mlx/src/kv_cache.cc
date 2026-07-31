@@ -113,16 +113,17 @@ void KvGrowthTransaction::materialize() {
 }
 
 void KvGrowthTransaction::publish() {
+    if (published_) {
+        throw std::logic_error("KV growth transaction published more than once");
+    }
     if (!active()) {
         return;
     }
     if (!materialized_) {
         throw std::logic_error("KV growth transaction published before materialization");
     }
-    if (published_) {
-        throw std::logic_error("KV growth transaction published more than once");
-    }
     live_.swap(staged_);
+    staged_.reset();
     published_ = true;
 }
 

@@ -564,6 +564,82 @@ void test_abi_sampler_validation(const std::filesystem::path& fixture, const mx:
     require(hyp_model_free(&model) == HYP_STATUS_OK, "sampler val: model free");
 }
 
+void test_abi_growth_transactions(const std::filesystem::path& fixture) {
+    // Exercise every non-delegating public implementation through a real global
+    // growth transaction. Prefill 255 allocates the first bucket; decode 2 begins
+    // inside it, reaches the exact boundary on step one, and crosses on step two.
+    const Geometry g = make_tiny_geometry();
+    std::vector<HypLayerType> layer_types_abi = {
+        HYP_LAYER_SLIDING, HYP_LAYER_SLIDING, HYP_LAYER_SLIDING,
+        HYP_LAYER_SLIDING, HYP_LAYER_SLIDING, HYP_LAYER_FULL,
+    };
+    HypGeometryParams abi = make_tiny_abi_geometry(layer_types_abi);
+
+    HypModel model = nullptr;
+    require(hyp_model_create(&model) == HYP_STATUS_OK,
+        "growth ABI: model create");
+    require(hyp_model_load(model, &abi, fixture.string().c_str()) == HYP_STATUS_OK,
+        "growth ABI: model load");
+    HypStepResult result = nullptr;
+    require(hyp_step_result_create(&result) == HYP_STATUS_OK,
+        "growth ABI: step result create");
+
+    std::vector<std::uint32_t> prompt(255);
+    for (std::size_t i = 0; i < prompt.size(); ++i) {
+        prompt[i] = static_cast<std::uint32_t>((7 + i) % g.vocab_size);
+    }
+    HypTokenStream tokens{
+        prompt.data(), static_cast<std::uint32_t>(prompt.size()), 1};
+
+    {
+        HypKvState kv = nullptr;
+        require(hyp_kvstate_create(model, &kv) == HYP_STATUS_OK,
+            "growth ABI: greedy kvstate create");
+        require(hyp_prefill_chunk(model, kv, &tokens, result) == HYP_STATUS_OK,
+            "growth ABI: greedy prefill transaction");
+        require(hyp_decode_block(model, kv, 2, result) == HYP_STATUS_OK,
+            "growth ABI: greedy decode later-crossing transaction");
+        const auto fields = hyperion::model::step_result_read(result);
+        require(fields.token_id < g.vocab_size &&
+                fields.governor_state == HYP_GOVERNOR_READY,
+            "growth ABI: greedy result remains token-correct and ready");
+        require(hyp_kvstate_free(&kv) == HYP_STATUS_OK,
+            "growth ABI: greedy kvstate free");
+    }
+
+    {
+        HypKvState kv = nullptr;
+        require(hyp_kvstate_create(model, &kv) == HYP_STATUS_OK,
+            "growth ABI: sampled kvstate create");
+        HypSamplingConfig sampled{};
+        sampled.temperature = 1.0F;
+        sampled.top_k = 8;
+        sampled.top_p = 0.9F;
+        sampled.seed = 42;
+        require(
+            hyp_prefill_chunk_sampled(
+                model, kv, &tokens, &sampled, result) == HYP_STATUS_OK,
+            "growth ABI: stochastic prefill transaction");
+        require(
+            hyp_decode_block_sampled(
+                model, kv, 2, &sampled, result) == HYP_STATUS_OK,
+            "growth ABI: stochastic decode later-crossing transaction");
+        const auto fields = hyperion::model::step_result_read(result);
+        require(fields.token_id < g.vocab_size &&
+                fields.governor_state == HYP_GOVERNOR_READY,
+            "growth ABI: sampled result remains token-correct and ready");
+        require(hyp_kvstate_free(&kv) == HYP_STATUS_OK,
+            "growth ABI: sampled kvstate free");
+    }
+
+    std::cerr << "forward_test: all four greedy/sampled ABI growth transactions OK "
+              << "(255-token prefill + 2-token later-crossing decode)\n";
+    require(hyp_step_result_free(&result) == HYP_STATUS_OK,
+        "growth ABI: step result free");
+    require(hyp_model_free(&model) == HYP_STATUS_OK,
+        "growth ABI: model free");
+}
+
 void test_abi_chunked_prefill(const std::filesystem::path& fixture, const mx::Stream& /*gpu*/) {
     // M2-2.6a: the chunked hyp_prefill_chunk path + the rotation read on the tiny fixture
     // (window=8, cap=16). A >2048-token prompt crosses the 2048 chunk boundary AND rotates
@@ -647,6 +723,7 @@ int main() {
             test_continuation_prefill_hidden_rows(fixture, gpu);
             test_abi_load(fixture, gpu);
             test_abi_sampler_validation(fixture, gpu);
+            test_abi_growth_transactions(fixture);
             test_abi_chunked_prefill(fixture, gpu);
             test_mask_by_kind(make_tiny_geometry(), gpu);
         } catch (const std::exception& e) {
@@ -662,6 +739,7 @@ int main() {
         test_continuation_prefill_hidden_rows(fixture, gpu);
         test_abi_load(fixture, gpu);
         test_abi_sampler_validation(fixture, gpu);
+        test_abi_growth_transactions(fixture);
         test_abi_chunked_prefill(fixture, gpu);
         test_mask_by_kind(make_tiny_geometry(), gpu);
     } catch (const std::exception& e) {

@@ -148,13 +148,30 @@ std::uint64_t staging_cow_bytes(
         return 0;
     }
 
+    auto tensor_bytes = [](
+        std::uint32_t capacity,
+        std::uint32_t heads,
+        std::uint32_t dim) {
+        std::uint64_t bytes = saturating_multiply(capacity, heads);
+        bytes = saturating_multiply(bytes, dim);
+        return saturating_multiply(bytes, kBf16Bytes);
+    };
+
     std::uint64_t total = 0;
     for (const auto& cache : kvstate.local) {
-        std::uint64_t bytes = saturating_multiply(
-            cache.capacity(), cache.num_kv_heads());
-        bytes = saturating_multiply(bytes, cache.head_dim());
-        bytes = saturating_multiply(bytes, 2 * kBf16Bytes); // K + V
-        total = saturating_add(total, bytes);
+        const std::uint64_t per_tensor = tensor_bytes(
+            cache.capacity(), cache.num_kv_heads(), cache.head_dim());
+        total = saturating_add(total, saturating_multiply(per_tensor, 2));
+        // Fresh mx::zeros inputs are lazy. Staging aliases those descriptors, so
+        // the first functional rebind cannot donate and evaluation retains both
+        // the original input and the staged candidate at peak. Once an original
+        // is available, settled memory already includes it and no surcharge is due.
+        if (!cache.keys().is_available()) {
+            total = saturating_add(total, per_tensor);
+        }
+        if (!cache.values().is_available()) {
+            total = saturating_add(total, per_tensor);
+        }
     }
     for (const auto& cache : kvstate.global) {
         const bool grows = hyperion::model::projected_global_capacity(
@@ -163,13 +180,26 @@ std::uint64_t staging_cow_bytes(
             grows && step_kind == StepKind::Decode &&
             cache.committed_len() < cache.capacity();
         if (grows && !decode_current_candidate) {
-            continue;
+            // Replacement accounting already covers the staged candidate.
+        } else {
+            const std::uint64_t candidate = tensor_bytes(
+                cache.capacity(), cache.num_kv_heads(), cache.head_dim());
+            total = saturating_add(
+                total, saturating_multiply(candidate, 2)); // K + V
         }
-        std::uint64_t bytes = saturating_multiply(
-            cache.capacity(), cache.num_kv_heads());
-        bytes = saturating_multiply(bytes, cache.head_dim());
-        bytes = saturating_multiply(bytes, 2 * kBf16Bytes); // K + V
-        total = saturating_add(total, bytes);
+        // A non-empty global append reads the old K/V whether it rebinds in the
+        // current bucket or copies the prefix into a replacement. Charge each
+        // unavailable retained input; capacity-zero buffers are not copied.
+        if (cache.capacity() > 0) {
+            const std::uint64_t retained = tensor_bytes(
+                cache.capacity(), cache.num_kv_heads(), cache.head_dim());
+            if (!cache.keys().is_available()) {
+                total = saturating_add(total, retained);
+            }
+            if (!cache.values().is_available()) {
+                total = saturating_add(total, retained);
+            }
+        }
     }
     return total;
 }

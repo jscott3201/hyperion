@@ -640,14 +640,15 @@ HypStatus hyp_decode_block(HypModel model,
         const mx::Stream s = *model->stream;
         hyperion::model::KvGrowthTransaction transaction(
             kvstate->kv, operation_plan);
+        const bool transactional = transaction.active();
         std::uint32_t near_tie_events = 0;
         hyperion::model::ForwardPass::GreedySample sample{0, 0.0F, false};
         std::uint32_t staged_offset = kvstate->offset;
         std::uint32_t staged_last_token = kvstate->last_token;
         std::uint32_t& execution_offset =
-            transaction.active() ? staged_offset : kvstate->offset;
+            transactional ? staged_offset : kvstate->offset;
         std::uint32_t& execution_last_token =
-            transaction.active() ? staged_last_token : kvstate->last_token;
+            transactional ? staged_last_token : kvstate->last_token;
         // Autoregressive loop: embed last_token → forward at the current offset (q_len=1,
         // cached-prefix read) → epilogue → advance cursor. For greedy M2 the caller uses
         // n_tokens=1 per call; n_tokens>1 is the speculative-verify block shape (M7).
@@ -666,7 +667,7 @@ HypStatus hyp_decode_block(HypModel model,
         }
         transaction.materialize();
         transaction.publish();
-        if (transaction.active()) {
+        if (transactional) {
             kvstate->offset = staged_offset;
             kvstate->last_token = staged_last_token;
         }
@@ -863,6 +864,7 @@ HypStatus hyp_decode_block_sampled(HypModel model,
         const mx::Stream s = *model->stream;
         hyperion::model::KvGrowthTransaction transaction(
             kvstate->kv, operation_plan);
+        const bool transactional = transaction.active();
         hyperion::model::ForwardPass::StochasticSample sample{};
         // Per-request RNG: seed advances each step so a single seed yields a reproducible
         // stream (same seed → same tokens). std::mt19937_64 advanced by a per-step salt.
@@ -870,9 +872,9 @@ HypStatus hyp_decode_block_sampled(HypModel model,
         std::uint32_t staged_offset = kvstate->offset;
         std::uint32_t staged_last_token = kvstate->last_token;
         std::uint32_t& execution_offset =
-            transaction.active() ? staged_offset : kvstate->offset;
+            transactional ? staged_offset : kvstate->offset;
         std::uint32_t& execution_last_token =
-            transaction.active() ? staged_last_token : kvstate->last_token;
+            transactional ? staged_last_token : kvstate->last_token;
         for (std::uint32_t step = 0; step < n_tokens; ++step) {
             int32_t id = static_cast<int32_t>(execution_last_token);
             mx::array ids = mx::array(&id, mx::Shape{1}, mx::int32);
@@ -887,7 +889,7 @@ HypStatus hyp_decode_block_sampled(HypModel model,
         }
         transaction.materialize();
         transaction.publish();
-        if (transaction.active()) {
+        if (transactional) {
             kvstate->offset = staged_offset;
             kvstate->last_token = staged_last_token;
         }

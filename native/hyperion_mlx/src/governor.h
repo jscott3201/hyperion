@@ -82,7 +82,8 @@ struct GovernorDecision {
 ///       or the sum of every crossed replacement capacity for sequential decode
 ///   staging_cow = all local K+V storage plus non-growing global K+V storage when
 ///       any global cache grows; sequential decode also charges a growing cache's
-///       current candidate when no-growth appends precede its first crossing
+///       current candidate when no-growth appends precede its first crossing; each
+///       unavailable retained K/V input is charged until settled memory contains it
 ///   attention_transient = (sum over layers of
 ///       q * head_dim_local  * n_heads * dtype  [sliding]
 ///       q * head_dim_global * n_heads * dtype  [global]) * safety

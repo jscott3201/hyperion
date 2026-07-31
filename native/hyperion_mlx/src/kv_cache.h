@@ -128,8 +128,10 @@ class LocalKvCache {
     std::uint32_t head_dim_;
 };
 
-/// One global (full) layer's capacity-stepped KV cache. K=V when ``k_eq_v`` —
-/// one tensor, and ``keys()``/``values()`` alias it.
+/// One global (full) layer's capacity-stepped KV cache. K and V are always
+/// stored in distinct tensors. ``k_eq_v`` means the forward computation has no
+/// separate v_proj weight; it does not make the normalized/rotated cache values
+/// identical or aliased.
 ///
 /// Shape: ``[capacity, num_kv_heads, head_dim]``; ``capacity`` grows in
 /// ``step``-token increments (default 256, the prefill chunk / bucket size) at
@@ -161,7 +163,7 @@ class GlobalKvCache {
 
     /// Append ``n`` committed tokens, growing capacity by whole steps at bucket
     /// boundaries. ``k_update``/``v_update`` shape ``[n, h, d]`` in the cache
-    /// dtype; ``v_update`` is ignored when ``k_eq_v`` (K IS V).
+    /// dtype. Both updates are stored, including when ``k_eq_v`` is true.
     void append(const mlx::core::array& k_update, const mlx::core::array& v_update, std::uint32_t n);
 
     [[nodiscard]] const mlx::core::array& keys() const { return k_; }
@@ -234,12 +236,8 @@ class KvGrowthTransaction {
 
     [[nodiscard]] bool active() const { return staged_ != nullptr; }
     [[nodiscard]] bool materialized() const { return materialized_; }
-    [[nodiscard]] KvState& state() {
-        return active() && !published_ ? *staged_ : *live_;
-    }
-    [[nodiscard]] const KvState& state() const {
-        return active() && !published_ ? *staged_ : *live_;
-    }
+    [[nodiscard]] KvState& state() { return active() ? *staged_ : *live_; }
+    [[nodiscard]] const KvState& state() const { return active() ? *staged_ : *live_; }
 
     /// Root every staged K/V output in the forward-result barrier. No-growth
     /// operations return ``output`` byte-for-byte (same MLX descriptor identity).
@@ -250,7 +248,8 @@ class KvGrowthTransaction {
     /// this after a rooted sampling/eval barrier does not recompute the graphs.
     void materialize();
 
-    /// Publish the already-materialized state with the noexcept unique_ptr swap.
+    /// Publish the already-materialized state with the noexcept unique_ptr swap,
+    /// then release the old live state before returning.
     void publish();
 
   private:

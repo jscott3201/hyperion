@@ -139,6 +139,7 @@ int main() {
         2ULL * 256 * 1 * 128 * 2; // K+V * capacity * heads * dim * BF16
     constexpr std::uint64_t kLocalStagingCowBytes =
         5ULL * 2 * 16 * 2 * 64 * 2; // layers * K+V * cap * heads * dim * BF16
+    constexpr std::uint64_t kLocalLazyOriginalBytes = kLocalStagingCowBytes;
     constexpr std::uint64_t kOneTokenTransient =
         (5ULL * 1 * 64 * 4 * 2 + 1ULL * 1 * 128 * 4 * 2) * 5 / 4;
 
@@ -162,8 +163,9 @@ int main() {
     require(
         decision.predicted_peak_bytes ==
             empty_zero.predicted_peak_bytes + kGlobalBucketBytes +
-                kLocalStagingCowBytes + kOneTokenTransient,
-        "first allocation must charge replacement plus full local staging COW");
+                kLocalStagingCowBytes + kLocalLazyOriginalBytes +
+                kOneTokenTransient,
+        "first allocation must charge replacement, local candidate, and lazy originals");
 
     Governor soft_gov(
         geometry, std::numeric_limits<std::uint64_t>::max(),
@@ -183,8 +185,45 @@ int main() {
     require(
         two_token_first_bucket.predicted_peak_bytes ==
             empty_zero.predicted_peak_bytes + kGlobalBucketBytes +
-                kLocalStagingCowBytes + 2 * kOneTokenTransient,
+                kLocalStagingCowBytes + kLocalLazyOriginalBytes +
+                2 * kOneTokenTransient,
         "within-bucket proposal must not charge per-logical-token KV growth");
+
+    // The lazy-original term is conditional, not a permanent doubling. Pin the
+    // incremental prediction before and after explicitly materializing the same
+    // fresh local inputs: settled memory rises, while the lazy surcharge disappears.
+    auto materialized_originals_state = build_kv_state(
+        hyperion::model::build_dispatch(geometry),
+        hyperion::model::kDefaultGammaMax, mx::bfloat16, s);
+    const auto lazy_originals_zero = gov.evaluate(
+        0, 0, materialized_originals_state, StepKind::Prefill);
+    const auto lazy_originals_growth = gov.evaluate(
+        1, 0, materialized_originals_state, StepKind::Prefill);
+    require(
+        lazy_originals_growth.predicted_peak_bytes -
+                lazy_originals_zero.predicted_peak_bytes ==
+            kGlobalBucketBytes + kLocalStagingCowBytes +
+                kLocalLazyOriginalBytes + kOneTokenTransient,
+        "lazy fresh inputs must add retained originals to the growth increment");
+    std::vector<mx::array> local_originals;
+    for (const auto& cache : materialized_originals_state.local) {
+        local_originals.push_back(cache.keys());
+        local_originals.push_back(cache.values());
+    }
+    mx::eval(local_originals);
+    for (const auto& cache : materialized_originals_state.local) {
+        require(cache.keys().is_available() && cache.values().is_available(),
+            "explicit local-original eval must make every retained input available");
+    }
+    const auto available_originals_zero = gov.evaluate(
+        0, 0, materialized_originals_state, StepKind::Prefill);
+    const auto available_originals_growth = gov.evaluate(
+        1, 0, materialized_originals_state, StepKind::Prefill);
+    require(
+        available_originals_growth.predicted_peak_bytes -
+                available_originals_zero.predicted_peak_bytes ==
+            kGlobalBucketBytes + kLocalStagingCowBytes + kOneTokenTransient,
+        "available originals must be represented by settled memory, not double charged");
 
     // Decode appends sequential q=1 forwards. Crossing three capacity steps therefore
     // allocates replacement sizes 1 + 2 + 3 buckets, while persistent telemetry reports
@@ -205,7 +244,8 @@ int main() {
     require(
         multistep.predicted_peak_bytes ==
             multistep_zero.predicted_peak_bytes + 6 * kGlobalBucketBytes +
-                kLocalStagingCowBytes + kOneTokenTransient,
+                kLocalStagingCowBytes + kLocalLazyOriginalBytes +
+                kOneTokenTransient,
         "multi-step decode must charge sequential replacements and one q=1 transient");
     require(
         predict_peak(513, 0, multistep_kvstate, geometry, StepKind::Decode) ==
@@ -221,8 +261,32 @@ int main() {
     require(
         multistep_prefill.predicted_peak_bytes ==
             multistep_zero.predicted_peak_bytes + 3 * kGlobalBucketBytes +
-                kLocalStagingCowBytes + 513 * kOneTokenTransient,
+                kLocalStagingCowBytes + kLocalLazyOriginalBytes +
+                513 * kOneTokenTransient,
         "multi-step prefill must charge only its one final replacement allocation");
+
+    // An unavailable non-empty global input is retained by the replacement graph
+    // even at an exact boundary. It is not yet represented by settled memory, so
+    // admission must charge its current K+V in addition to the replacement.
+    auto lazy_global_state = build_kv_state(
+        hyperion::model::build_dispatch(geometry),
+        hyperion::model::kDefaultGammaMax, mx::bfloat16, s);
+    const mx::array lazy_bucket = mx::ones({256, 1, 128}, mx::bfloat16, s);
+    lazy_global_state.global[0].append(lazy_bucket, lazy_bucket, 256);
+    require(!lazy_global_state.global[0].keys().is_available() &&
+            !lazy_global_state.global[0].values().is_available(),
+        "lazy global negative control must remain unavailable before admission");
+    const auto lazy_global_zero =
+        gov.evaluate(0, 256, lazy_global_state, StepKind::Decode);
+    const auto lazy_global_growth =
+        gov.evaluate(1, 256, lazy_global_state, StepKind::Decode);
+    require(
+        lazy_global_growth.predicted_peak_bytes -
+                lazy_global_zero.predicted_peak_bytes ==
+            2 * kGlobalBucketBytes + kGlobalBucketBytes +
+                kLocalStagingCowBytes + kLocalLazyOriginalBytes +
+                kOneTokenTransient,
+        "unavailable old global K+V must be charged at exact growth");
 
     // Multi-token continuation prefill assembles a bounded local K+V buffer from the
     // retained prefix plus the current chunk. At offset 8 the tiny fixture retains the
@@ -290,14 +354,16 @@ int main() {
     require(
         later_decode_crossing.predicted_peak_bytes ==
             four_token_zero.predicted_peak_bytes + 3 * kGlobalBucketBytes +
-                kLocalStagingCowBytes + kOneTokenTransient,
+                kLocalStagingCowBytes + kLocalLazyOriginalBytes +
+                kOneTokenTransient,
         "later decode crossing must charge current candidate plus replacement and local COW");
     const auto one_shot_prefill_crossing =
         gov.evaluate(253, 4, kvstate, StepKind::Prefill);
     require(
         one_shot_prefill_crossing.predicted_peak_bytes ==
             four_token_zero.predicted_peak_bytes + 2 * kGlobalBucketBytes +
-                kLocalStagingCowBytes + 253 * kOneTokenTransient +
+                kLocalStagingCowBytes + kLocalLazyOriginalBytes +
+                253 * kOneTokenTransient +
                 2ULL * (4 + 253) * 2 * 64 * 2,
         "one-shot prefill crossing must not charge decode's current-capacity candidate");
 
@@ -322,7 +388,8 @@ int main() {
     require(
         boundary_crossing.predicted_peak_bytes ==
             boundary_zero.predicted_peak_bytes + 2 * kGlobalBucketBytes +
-                kLocalStagingCowBytes + kOneTokenTransient,
+                kLocalStagingCowBytes + kLocalLazyOriginalBytes +
+                kOneTokenTransient,
         "256 to 257 must charge replacement K+V plus local staging COW");
 
     // Starting at one full bucket, 513 sequential decode tokens cross replacements
@@ -334,14 +401,16 @@ int main() {
     require(
         boundary_multicross.predicted_peak_bytes ==
             boundary_zero.predicted_peak_bytes + 9 * kGlobalBucketBytes +
-                kLocalStagingCowBytes + kOneTokenTransient,
+                kLocalStagingCowBytes + kLocalLazyOriginalBytes +
+                kOneTokenTransient,
         "boundary multi-cross decode must charge replacements plus local staging COW");
 
     // A ceiling that would admit delta-only accounting must reject full replacement
     // accounting. Old-buffer bytes are already part of settled MLX memory.
     const std::uint64_t delta_only_ceiling =
         boundary_zero.predicted_peak_bytes + kGlobalBucketBytes +
-            kLocalStagingCowBytes + kOneTokenTransient;
+            kLocalStagingCowBytes + kLocalLazyOriginalBytes +
+            kOneTokenTransient;
     Governor tight_gov(geometry, delta_only_ceiling, delta_only_ceiling);
     const auto replacement_rejection =
         tight_gov.evaluate(1, 256, kvstate, StepKind::Decode);
@@ -377,7 +446,7 @@ int main() {
         one_grows.predicted_peak_bytes ==
             two_global_zero.predicted_peak_bytes + 2 * kGlobalBucketBytes +
                 kGlobalBucketBytes + kLocalStagingCowBytes +
-                kTwoGlobalOneTokenTransient,
+                kLocalLazyOriginalBytes + kTwoGlobalOneTokenTransient,
         "growth transaction must charge a non-growing global layer's full K+V COW");
 
     // Proposals that exceed uint32 committed length / signed-int MLX capacity fail

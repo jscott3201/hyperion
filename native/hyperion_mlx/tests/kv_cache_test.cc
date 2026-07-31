@@ -478,11 +478,32 @@ void test_growth_transaction_atomicity(const mx::Stream& s) {
     require(tx.materialized(), "transaction: verification records materialization");
     tx.publish();
     require(live.get() != original_ptr, "transaction: commit swaps the owning pointer");
+    require(!tx.active(),
+        "transaction: publish releases the old state and clears staged ownership");
+    require(&tx.state() == live.get(),
+        "transaction: post-publish state resolves only to the new live owner");
     require(live->local[0].committed_len() == 1,
         "transaction: local index commits with the state");
     require(live->global[0].committed_len() == 1 &&
             live->global[1].committed_len() == 1,
         "transaction: all global indices commit together");
+    const mx::array post_publish_hidden =
+        mx::add(mx::array(5.0F), mx::array(6.0F), s);
+    const mx::array post_publish_rooted =
+        tx.root_forward_result(post_publish_hidden);
+    require(post_publish_rooted.id() == post_publish_hidden.id(),
+        "transaction: post-publish rooting cannot reference released stale buffers");
+    tx.materialize();
+    require(post_publish_hidden.status() == mx::array::Status::unscheduled,
+        "transaction: post-publish materialize is a no-op on released stale buffers");
+    bool double_publish_rejected = false;
+    try {
+        tx.publish();
+    } catch (const std::logic_error&) {
+        double_publish_rejected = true;
+    }
+    require(double_publish_rejected,
+        "transaction: a second growth publication remains rejected");
 
     // Inject a later-layer exception after earlier local/global staged mutation.
     // Destruction without publish preserves pointer, descriptors, contents, and indices.
