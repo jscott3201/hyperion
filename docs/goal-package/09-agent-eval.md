@@ -60,13 +60,12 @@ the M5 baseline run — baseline-then-gate, the floor is measured not invented).
   keep the prompt payload out of the public repository until its redistribution terms have
   been independently verified; O-2 does not relicense external evaluation data.
 - **Thinking-mode A/B:** suite runs thinking-on vs thinking-off arms; ledger records
-  quality-vs-token-budget curves (feeds target workload profiles' budget defaults).
+  quality-vs-token-budget curves (feeds deployment profiles' budget defaults).
 - 12B-vs-E4B capability delta on the same suite (M8) — the tier-admission evidence the
   pointforge/eval programs consume downstream.
 
 ## Relationship to project-level evals
 
 Engine-repo eval answers "does the ENGINE serve the model faithfully and fast" (fidelity,
-latency, memory, determinism). Model-capability evaluation for target admission (A12
-tuples, W1–W5 gates) lives in its own project per the owner's scoping — this suite feeds it
-evidence rows but does not replace it.
+latency, memory, determinism). Product-level model-capability admission lives in its own
+project per the owner's scoping — this suite feeds it evidence rows but does not replace it.

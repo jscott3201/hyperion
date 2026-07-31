@@ -76,8 +76,8 @@ obstacle).
 
 ## Real-workload benchmark methodology (Helios heritage)
 
-- 8-family real-context corpus rebuilt for the actual use case: agent tool-chains (target
-  W1 FDD explain, W2 recommendations, W4 copilot chat, W5 tagging), long-transcript
+- 8-family real-context corpus rebuilt for the actual use case: facility-diagnostic,
+  recommendation, operator-assistance, and tagging tool chains; long-transcript
   multi-turn, RAG-ish document QA at 4K/8K/16K, short chat. Prompt files frozen with SHA-256
   manifests (Helios pattern; its corpus files are reusable formats, contents replaced —
   no Rust code-review prompts as "real workload" for a smart-buildings engine).
