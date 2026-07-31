@@ -34,9 +34,9 @@ engine thread between steps/chunks. Usage accounting in the terminal frame (both
 
 Greedy (`temperature: 0`) and sampled modes. Defaults per Google model card: t=1.0,
 top_p=0.95, top_k=64 (single-source; recorded as such). min_p, presence/frequency/repetition
-penalties supported. Per-request `seed` honored and echoed. target workloads: tagging runs
-greedy-intent; copilot chat runs sampled defaults — both are first-class (greedy-only was a
-bonsai limitation, dropped).
+penalties supported. Per-request `seed` honored and echoed. Deterministic tagging runs use
+greedy intent; interactive assistant workloads use sampled defaults — both are first-class
+(greedy-only was a bonsai limitation, dropped).
 
 ## Tool calling (Gemma 4 native wire format)
 
@@ -66,15 +66,15 @@ bonsai limitation, dropped).
 - `<|channel|>thought` deltas streamed as a distinct SSE lane (Anthropic: `thinking` content
   block type; OpenAI: `reasoning_content`-style extension field) so agent frameworks can
   render/budget them.
-- **Thinking budget:** per-request `max_thinking_tokens` (default unlimited; target agent
-  profiles will set 512–2048). On budget hit: inject the thought-close sequence and continue
+- **Thinking budget:** per-request `max_thinking_tokens` (default unlimited; deployment
+  profiles may set 512–2048). On budget hit: inject the thought-close sequence and continue
   to the answer — policy lives Rust-side, no native knowledge. (Budget policy is our design;
   the mode itself is Google-documented.)
 
 ## Constrained JSON (O-4 — the strict-output lane) [M5]
 
-Reality: neither predecessor had it; both post-hoc repaired. For target W1–W5, tool-arg
-validity is the reliability boundary, and "validator disposes" (pointforge) plus repair
+Reality: neither predecessor had it; both post-hoc repaired. For the target tool-driven
+workloads, tool-argument validity is the reliability boundary, and "validator disposes" plus repair
 telemetry already de-risks v0. So:
 
 - **v0 (M3):** post-hoc parser + repair + `validator disposes` downstream — ship first.

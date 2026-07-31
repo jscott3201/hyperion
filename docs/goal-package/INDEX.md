@@ -50,12 +50,17 @@ is dropped entirely — poor measured agentic quality (EVAL-RESULTS.md, 2026-07-
 - Engine + quantization are identity-tuple fields (A12 posture): hyperion on MLX is local/dev/
   commissioning evidence, not a production substrate claim.
 
+## Ruled owner decisions
+
+| ID | Decision | Ruling |
+|---|---|---|
+| O-2 | License / open-vs-private | **Ruled 2026-07-31:** public source; Hyperion-authored source and documentation are `MIT OR Apache-2.0` at the recipient's option. Model artifacts and third-party material retain their own terms. See ADR 0005. |
+
 ## Open owner decisions
 
 | ID | Decision | Default until ruled |
 |---|---|---|
 | O-1 | Project name (hyperion; alternates: sequoialess naming, keep `gemma4d` lineage) | hyperion |
-| O-2 | License / open-vs-private (target open-core posture applies) | Apache-2.0 OR MIT dual, private repo |
 | O-3 | E2B tier inclusion in v1 gates | Out; geometry supported, ungated |
 | O-4 | Constrained-JSON decoder: build token-mask engine vs port (xgrammar-style) vs post-hoc-only v1 | Build minimal schema-mask engine at M5, post-hoc fallback |
 | O-5 | Multimodal (12B encoder-free 35M projector; nameplate OCR) timing | Post-v1 lane, not gated |

@@ -110,5 +110,5 @@ explicitly:
 
 Greedy mode must be run-to-run deterministic on the same machine/build (single stream, no
 batch-size-dependent reduction switches — we control the kernel dispatch). Sampled mode uses
-a seeded RNG recorded per request. This is the local analog of the target determinism brand
-posture; document any MLX-internal nondeterminism found rather than papering over it.
+a seeded RNG recorded per request. This is the runtime's reproducibility posture; document any
+MLX-internal nondeterminism found rather than papering over it.

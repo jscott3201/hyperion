@@ -1,5 +1,8 @@
 .DS_Store
+
+# Machine-local agent identities
 codex-id.json
+claude-id.json
 
 # Rust and native build output
 /target/

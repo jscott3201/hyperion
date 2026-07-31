@@ -43,6 +43,13 @@ truth for identity, acquisition status, license review, local hashes, and milest
 - License/frontmatter review: local model-card frontmatter declares `apache-2.0` and links the
   Gemma 4 license; final source hash binds that reviewed card to the snapshot
 
+### Committed M0-derived oracle fixtures
+
+The four real-model oracle fixtures under `native/hyperion_mlx/tests/fixtures/` contain
+activations, logits, and token IDs generated from the converted M0 artifact—not checkpoint
+weight tensors. They are Apache-2.0-only and documented with exact sizes and SHA-256 hashes in
+the root `PROVENANCE.md` and the fixture-directory `README.md`.
+
 ## M1 E4B baseline artifact
 
 - Source directory: `artifacts/models/gemma4-e4b-qat-source/`

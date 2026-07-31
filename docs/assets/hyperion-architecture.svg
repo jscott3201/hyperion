@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="430" viewBox="0 0 1200 430" role="img" aria-labelledby="title desc">
+  <title id="title">Hyperion runtime architecture</title>
+  <desc id="desc">OpenAI and Anthropic clients pass through a Rust serving plane and a narrow C ABI into the C++ MLX engine on Apple M5. A pinned oracle and evidence ledger validate the engine outside the request path.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1220"/>
+      <stop offset="1" stop-color="#111c33"/>
+    </linearGradient>
+    <linearGradient id="rust" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7c3aed"/>
+      <stop offset="1" stop-color="#4f46e5"/>
+    </linearGradient>
+    <linearGradient id="native" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0891b2"/>
+      <stop offset="1" stop-color="#0f766e"/>
+    </linearGradient>
+    <linearGradient id="m5" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f59e0b"/>
+      <stop offset="1" stop-color="#ea580c"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#94a3b8"/>
+    </marker>
+    <style>
+      .label { font: 700 19px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #f8fafc; }
+      .detail { font: 500 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #dbeafe; }
+      .eyebrow { font: 700 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #94a3b8; letter-spacing: 1.4px; }
+      .lane { font: 650 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #cbd5e1; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="430" rx="24" fill="url(#background)"/>
+  <text x="48" y="48" class="eyebrow">HYPERION REQUEST PATH</text>
+
+  <rect x="48" y="82" width="210" height="170" rx="18" fill="#1e293b" stroke="#475569" stroke-width="2"/>
+  <text x="72" y="120" class="label">API clients</text>
+  <text x="72" y="154" class="detail">OpenAI-style chat</text>
+  <text x="72" y="180" class="detail">Anthropic-style messages</text>
+  <text x="72" y="206" class="detail">SSE + JSON</text>
+
+  <path d="M258 167 H310" stroke="#94a3b8" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <rect x="320" y="82" width="280" height="170" rx="18" fill="url(#rust)"/>
+  <text x="344" y="120" class="label">Rust serving plane</text>
+  <text x="344" y="154" class="detail">axum · tokenizer · policy</text>
+  <text x="344" y="180" class="detail">single-flight · cancellation</text>
+  <text x="344" y="206" class="detail">auth · framing · telemetry</text>
+
+  <path d="M600 167 H650" stroke="#94a3b8" stroke-width="3" marker-end="url(#arrow)"/>
+  <rect x="610" y="135" width="82" height="64" rx="14" fill="#0f172a" stroke="#a78bfa" stroke-width="2"/>
+  <text x="651" y="160" text-anchor="middle" class="eyebrow">NARROW</text>
+  <text x="651" y="181" text-anchor="middle" class="detail">C ABI</text>
+
+  <rect x="702" y="82" width="276" height="170" rx="18" fill="url(#native)"/>
+  <text x="726" y="120" class="label">C++ / MLX engine</text>
+  <text x="726" y="154" class="detail">Gemma 4 graph + weights</text>
+  <text x="726" y="180" class="detail">hybrid KV + governor</text>
+  <text x="726" y="206" class="detail">Metal kernels · explicit stream</text>
+
+  <path d="M978 167 H1018" stroke="#94a3b8" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <rect x="1028" y="82" width="124" height="170" rx="18" fill="url(#m5)"/>
+  <text x="1090" y="126" text-anchor="middle" class="label">Apple</text>
+  <text x="1090" y="154" text-anchor="middle" class="label">M5+</text>
+  <text x="1090" y="188" text-anchor="middle" class="detail">Metal GPU</text>
+  <text x="1090" y="214" text-anchor="middle" class="detail">unified memory</text>
+
+  <text x="48" y="303" class="eyebrow">VERIFICATION LANE · OFF THE REQUEST PATH</text>
+  <rect x="48" y="326" width="1104" height="62" rx="16" fill="#172033" stroke="#475569" stroke-width="2" stroke-dasharray="7 7"/>
+  <text x="76" y="364" class="lane">Pinned mlx-lm oracle</text>
+  <path d="M252 357 H354" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="380" y="364" class="lane">Parity + A/B gates</text>
+  <path d="M550 357 H652" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="678" y="364" class="lane">Append-only evidence</text>
+  <path d="M866 357 H968" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="994" y="364" class="lane">Promotion decision</text>
+</svg>

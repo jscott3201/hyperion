@@ -5,8 +5,8 @@
 One sentence: **the best-in-class local inference engine for the Gemma 4 family on M5 Macs,
 measured on agentic quality-per-watt-per-GB, not on generic benchmark theater.**
 
-hyperion exists so that target agentic workloads (FDD explanation, recommendations,
-point tagging, operator copilot — the W1–W5 workload family) run on a 16 GB MacBook Pro M5
+hyperion exists so that demanding local agentic workloads (facility diagnostics,
+recommendations, point tagging, and operator-assistance workflows) run on a 16 GB MacBook Pro M5
 with: fast time-to-first-token on long agent transcripts, decode throughput at or beyond the
 memory-bandwidth ceiling via speculative decoding, strict tool-call reliability, and evidence
 for every claim. It is also the dev/eval substrate for prompt & schema iteration ahead of
