@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
+use http_body_util::BodyExt;
 use hyperion_server::auth::bind_gate;
 use hyperion_server::control::ControlState;
 use hyperion_server::engine::test_support::StubEngine;
@@ -172,6 +173,40 @@ impl EngineDriver for ControlledFailureEngine {
         tx.blocking_send(StepEvent::Done(usage))
             .map_err(|_| EngineError::Cancelled)?;
         Ok(usage)
+    }
+}
+
+struct ControlledDisconnectEngine {
+    started: std::sync::mpsc::SyncSender<()>,
+    cancelled_and_closed: std::sync::mpsc::SyncSender<()>,
+    release_cleanup: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl EngineDriver for ControlledDisconnectEngine {
+    fn stream(
+        &self,
+        _request: &EngineRequest,
+        cancel: &CancelToken,
+        tx: tokio::sync::mpsc::Sender<StepEvent>,
+    ) -> Result<Usage, EngineError> {
+        self.started.send(()).expect("test observes live engine");
+        loop {
+            if tx
+                .blocking_send(StepEvent::Token(StepToken { id: 2, logit: 0.0 }))
+                .is_err()
+            {
+                assert!(cancel.is_cancelled(), "response drop cancels engine");
+                self.cancelled_and_closed
+                    .send(())
+                    .expect("test observes cancellation and receiver close");
+                self.release_cleanup
+                    .lock()
+                    .expect("cleanup mutex")
+                    .recv()
+                    .expect("test releases cleanup barrier");
+                return Err(EngineError::Cancelled);
+            }
+        }
     }
 }
 
@@ -1063,60 +1098,97 @@ async fn non_streaming_decoder_failure_uses_opaque_dialect_envelope() {
     assert_eq!(reload, StatusCode::NOT_IMPLEMENTED, "permit is not stuck");
 }
 
-/// The in_flight flag clears when a stream is dropped (client disconnect).
-/// The Guard's Drop flips in_flight(false) — the fix for the review's finding
-/// that set_in_flight(false) lived inside the stream generator (never reached
-/// on a dropped future). We start a stream, drop the response (mid-stream),
-/// and assert in_flight is false afterward.
+/// A dropped SSE response cancels immediately but retains its generation lease
+/// until the detached blocking engine closure finishes cleanup.
 #[tokio::test]
-async fn in_flight_clears_on_stream_drop() {
+async fn disconnect_holds_lease_until_engine_cleanup_exits() {
     let control = fresh_control();
-    // A stub that blocks before the first token so the stream is mid-flight
-    // when we drop it.
-    let srv = Arc::new(test_server(
-        StubEngine {
-            tokens: vec![2, 3],
-            block_after: Some(0),
-        },
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+    let (cancelled_tx, cancelled_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let srv = Arc::new(test_server_with_engine(
+        Arc::new(ControlledDisconnectEngine {
+            started: started_tx,
+            cancelled_and_closed: cancelled_tx,
+            release_cleanup: Mutex::new(release_rx),
+        }),
         None,
         4096,
         &control,
+        MINIMAL_TOKENIZER_JSON,
     ));
-    let srv_clone = srv.clone();
-    // Start the stream; don't await the body.
-    let handle = tokio::spawn(async move {
-        let request = Request::builder()
-            .method(Method::POST)
-            .uri("/v1/messages")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":true}"#,
-            ))
-            .unwrap();
-        srv_clone.router().oneshot(request).await
-    });
-    // Let it acquire the permit + enter the engine (set in_flight true).
-    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-    assert!(control.is_in_flight(), "in_flight is true mid-stream");
-    // Simulate client disconnect: abort the task + drop the JoinHandle (which
-    // holds the Response → the SSE body → the stream → the Guard). The Guard's
-    // Drop flips in_flight(false). `abort()` drops a pending future; awaiting
-    // the handle (completed or aborted) drops the stored Response. Both paths
-    // release the guard.
-    handle.abort();
-    let _ = handle.await; // drops the Response (lazy SSE body + the Guard)
-    // Give the runtime a tick to run any pending Drop.
-    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":true}"#,
+        ))
+        .unwrap();
+    let response = srv.router().oneshot(request).await.unwrap();
+    let initial_status = response.status();
+    let mut body = response.into_body();
+    let opening_frame = body.frame().await.expect("opening SSE frame").unwrap();
+
+    tokio::task::spawn_blocking(move || {
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("engine is live before disconnect")
+    })
+    .await
+    .unwrap();
+    drop(body);
+    tokio::task::spawn_blocking(move || {
+        cancelled_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("engine observes cancellation and receiver close")
+    })
+    .await
+    .unwrap();
+
+    let in_flight_during_cleanup = control.is_in_flight();
+    let (concurrent_status, concurrent_body) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4}"#,
+    )
+    .await;
+    let (reload_during_cleanup, _) =
+        send(srv.router(), Method::POST, "/control/reload", &[], "").await;
+
+    release_tx.send(()).expect("release engine cleanup");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while control.is_in_flight() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("generation lease clears after engine cleanup");
+    let (reload_after_cleanup, _) =
+        send(srv.router(), Method::POST, "/control/reload", &[], "").await;
+
+    assert_eq!(initial_status, StatusCode::OK);
     assert!(
-        !control.is_in_flight(),
-        "in_flight cleared after the stream dropped (Guard::drop)"
+        opening_frame.is_data(),
+        "stream was polled before disconnect"
     );
-    // And a subsequent reload is now 501 (not stuck 409).
-    let (status, _) = send(srv.router(), Method::POST, "/control/reload", &[], "").await;
+    assert!(
+        in_flight_during_cleanup,
+        "engine lease keeps in_flight true during cleanup"
+    );
     assert_eq!(
-        status,
+        concurrent_status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{concurrent_body}"
+    );
+    assert_eq!(reload_during_cleanup, StatusCode::CONFLICT);
+    assert_eq!(
+        reload_after_cleanup,
         StatusCode::NOT_IMPLEMENTED,
-        "reload works after disconnect (not stuck 409)"
+        "lease clears only after engine cleanup exits"
     );
 }
 

@@ -58,18 +58,28 @@ pub struct Server {
 /// context-overflow 413 (prepare).
 const BODY_LIMIT: usize = 32 * 1024 * 1024;
 
-/// The single-flight + in-flight guard: holds the permit + a control clone +
-/// the cancel token for the lifetime of a generation's **stream** (not the
-/// `run` call). Released on Drop — which happens when the SSE body is fully
-/// consumed OR the response future is dropped (client disconnect). This is
-/// the fix for the adversarial findings that the permit was released when
-/// `run` returned (streaming is lazy) and that `set_in_flight(false)` lived
-/// inside the stream generator (never reached on a dropped future).
-struct Guard {
-    /// The single-flight permit — dropped releases the Semaphore(1).
-    _permit: tokio::sync::OwnedSemaphorePermit,
-    /// The control state to flip in_flight(false) on Drop.
+/// Shared generation lease. The response guard and blocking engine closure
+/// each hold one reference, so single-flight cannot release until both the
+/// response lifetime and detached engine cleanup have ended.
+struct GenerationLease {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
     control: ControlState,
+}
+
+impl Drop for GenerationLease {
+    fn drop(&mut self) {
+        // Release the semaphore before advertising idle so a new request
+        // cannot observe `in_flight=false` while single-flight is still held.
+        drop(self.permit.take());
+        self.control.set_in_flight(false);
+    }
+}
+
+/// Response-lifetime guard. Dropping a response or handler cancels generation
+/// immediately; its shared lease is released only after the engine closure also
+/// exits.
+struct Guard {
+    _lease: Arc<GenerationLease>,
     /// The cancel token — fired on Drop so a client disconnect cancels the
     /// engine promptly (the dropped-receiver path also cancels; this covers
     /// the prefill window + any path that doesn't hit a `blocking_send`).
@@ -78,7 +88,6 @@ struct Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        self.control.set_in_flight(false);
         self.cancel.cancel();
     }
 }
@@ -409,22 +418,21 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
     let stream = prepared.stream;
     let prompt_tokens = prepared.prompt_tokens_len;
 
-    // Acquire the single-flight permit + arm the guard. The guard owns the
-    // permit + the control clone + the cancel token, and releases them on
-    // Drop — which happens when the SSE body is fully consumed OR the response
-    // future is dropped (client disconnect). This is the fix for the
-    // adversarial findings that the permit was released when `run` returned
-    // (streaming is lazy) and `set_in_flight(false)` lived inside the stream
-    // generator (never reached on a dropped future).
+    // Acquire single-flight and share its lease between the response guard and
+    // blocking engine closure. A disconnect cancels immediately, but permit /
+    // in-flight release waits for the detached engine closure to exit too.
     let permit = match acquire_permit(&srv.permit, &srv.control, dialect) {
         Ok(p) => p,
         Err(r) => return *r,
     };
     srv.control.set_in_flight(true);
     let cancel = CancelToken::new();
-    let guard = Guard {
-        _permit: permit,
+    let lease = Arc::new(GenerationLease {
+        permit: Some(permit),
         control: srv.control.clone(),
+    });
+    let guard = Guard {
+        _lease: lease.clone(),
         cancel: cancel.clone(),
     };
 
@@ -435,8 +443,10 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
     let engine = srv.engine.clone();
     let request_clone = request.clone();
     let cancel_clone = cancel.clone();
-    let engine_task =
-        tokio::task::spawn_blocking(move || engine.stream(&request_clone, &cancel_clone, tx));
+    let engine_task = tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        engine.stream(&request_clone, &cancel_clone, tx)
+    });
 
     if stream {
         // SSE: emit the raw framer bytes directly as the body (NOT via axum's
@@ -450,11 +460,11 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
         let control = srv.control.clone();
         let request_for_stream = request.clone();
         // The guard moves into the stream so it lives as long as the stream
-        // does (consumed lazily by axum). Dropping the stream (client
-        // disconnect, or full consumption) drops the guard → releases the
-        // permit + flips in_flight(false) + cancels.
+        // does. Dropping the stream cancels generation; its shared lease keeps
+        // single-flight held until the blocking engine closure exits.
         let guard = guard;
         let stream = async_stream::stream! {
+            let mut rx = rx;
             let _guard = guard; // held for the stream's lifetime
             // The opening frames (Anthropic message_start + content_block_start;
             // empty for OpenAI). `start` is a complete SSE chunk.
@@ -462,7 +472,6 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
             let mut usage = Usage { prompt_tokens, completion_tokens: 0 };
             let mut decoder = tokenizer.streaming_decoder(SpecialTokenPolicy::Skip);
             let mut decoder_error = None;
-            let mut rx = rx;
             while let Some(event) = rx.recv().await {
                 match event {
                     StepEvent::Token(t) => {
@@ -572,11 +581,9 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
         // On decode failure, drop the receiver before joining the engine so a
         // sender blocked on the bounded channel wakes and observes cancellation.
         drop(rx);
-        // The guard (held here) releases the permit + flips in_flight(false) on
-        // drop at the end of this scope — for the non-streaming path, the
-        // generation is complete by the time we reach here, so dropping is
-        // correct. (On a client disconnect during the await above, axum drops
-        // the handler future → this scope drops → the guard releases.)
+        // The response guard is held through the handler scope. If the handler
+        // is dropped, it cancels generation while the engine's shared lease
+        // keeps single-flight held until blocking cleanup exits.
         let engine_result =
             engine_task
                 .await
