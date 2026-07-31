@@ -241,7 +241,7 @@ fn engine_error_response(err: EngineError, dialect: Dialect) -> Response {
 /// Map a tokenizer failure to the dialect's opaque internal-error envelope.
 fn tokenizer_error_response(err: &TokenizerError, dialect: Dialect) -> Response {
     eprintln!("response decoder failed: {err}");
-    let body = ErrorEnvelope::new(500, err.to_string()).to_json(dialect);
+    let body = ErrorEnvelope::new(500, "internal server error").to_json(dialect);
     (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
 }
 

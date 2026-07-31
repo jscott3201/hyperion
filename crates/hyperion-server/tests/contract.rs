@@ -18,12 +18,16 @@ use axum::http::{Method, Request, StatusCode};
 use hyperion_server::auth::bind_gate;
 use hyperion_server::control::ControlState;
 use hyperion_server::engine::test_support::StubEngine;
+use hyperion_server::engine::{
+    CancelToken, EngineDriver, EngineError, EngineRequest, StepEvent, StepToken, Usage,
+};
 use hyperion_server::prepare::ContextWindow;
 use hyperion_server::server::{Server, ServerConfig};
 use hyperion_tokenizer::TokenizerHandle;
 use hyperion_tokenizer::renderer::ChatTemplate;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
+use std::sync::Mutex;
 use tower::ServiceExt;
 
 /// A minimal HuggingFace `tokenizer.json` with a tiny WordLevel vocab that
@@ -103,12 +107,22 @@ fn test_server_with_tokenizer(
     control: &ControlState,
     tokenizer_json: &str,
 ) -> Server {
+    test_server_with_engine(Arc::new(stub), bearer, context, control, tokenizer_json)
+}
+
+fn test_server_with_engine(
+    engine: Arc<dyn EngineDriver>,
+    bearer: Option<&str>,
+    context: ContextWindow,
+    control: &ControlState,
+    tokenizer_json: &str,
+) -> Server {
     let tokenizer =
         TokenizerHandle::from_bytes(tokenizer_json.as_bytes()).expect("model-free tokenizer loads");
     let template = ChatTemplate::from_source(TRIVIAL_TEMPLATE, "<bos>", "<eos>")
         .expect("trivial template compiles");
     Server::new(ServerConfig {
-        engine: Arc::new(stub),
+        engine,
         template,
         tokenizer,
         control: control.clone(),
@@ -117,6 +131,48 @@ fn test_server_with_tokenizer(
         model_id: "test-model".to_string(),
         default_max_tokens: 64,
     })
+}
+
+struct ControlledFailureEngine {
+    cleanup_reached: std::sync::mpsc::SyncSender<()>,
+    release_cleanup: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl EngineDriver for ControlledFailureEngine {
+    fn stream(
+        &self,
+        request: &EngineRequest,
+        cancel: &CancelToken,
+        tx: tokio::sync::mpsc::Sender<StepEvent>,
+    ) -> Result<Usage, EngineError> {
+        for _ in 0..10_000 {
+            if tx
+                .blocking_send(StepEvent::Token(StepToken {
+                    id: 99_999,
+                    logit: 0.0,
+                }))
+                .is_err()
+            {
+                assert!(cancel.is_cancelled(), "decoder failure cancels engine");
+                self.cleanup_reached
+                    .send(())
+                    .expect("test observes cleanup barrier");
+                self.release_cleanup
+                    .lock()
+                    .expect("cleanup mutex")
+                    .recv()
+                    .expect("test releases cleanup barrier");
+                return Err(EngineError::Cancelled);
+            }
+        }
+        let usage = Usage {
+            prompt_tokens: u32::try_from(request.prompt_tokens.len()).unwrap_or(u32::MAX),
+            completion_tokens: 10_000,
+        };
+        tx.blocking_send(StepEvent::Done(usage))
+            .map_err(|_| EngineError::Cancelled)?;
+        Ok(usage)
+    }
 }
 
 /// Send a request through the router, return the (status, body string).
@@ -622,7 +678,7 @@ async fn streaming_emits_raw_sse_bytes_anthropic() {
         ))
         .unwrap();
     let response = srv.router().oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    let initial_status = response.status();
     assert_eq!(
         response.headers().get("content-type").unwrap(),
         "text/event-stream"
@@ -883,6 +939,92 @@ async fn streaming_decoder_failure_is_one_opaque_error_without_terminal_frame() 
     assert!(!control.is_in_flight(), "failed stream releases its permit");
     let (reload, _) = send(srv.router(), Method::POST, "/control/reload", &[], "").await;
     assert_eq!(reload, StatusCode::NOT_IMPLEMENTED, "permit is not stuck");
+}
+
+#[tokio::test]
+async fn failed_stream_holds_permit_until_engine_cleanup_finishes() {
+    let control = fresh_control();
+    let (cleanup_tx, cleanup_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let srv = Arc::new(test_server_with_engine(
+        Arc::new(ControlledFailureEngine {
+            cleanup_reached: cleanup_tx,
+            release_cleanup: Mutex::new(release_rx),
+        }),
+        None,
+        4096,
+        &control,
+        MINIMAL_TOKENIZER_JSON,
+    ));
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":300,"stream":true}"#,
+        ))
+        .unwrap();
+    let response = srv.router().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_task = tokio::spawn(async move {
+        axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+    });
+
+    tokio::task::spawn_blocking(move || {
+        cleanup_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("engine reaches controlled cleanup")
+    })
+    .await
+    .unwrap();
+    let body_pending_during_cleanup = !body_task.is_finished();
+    let in_flight_during_cleanup = control.is_in_flight();
+
+    let (concurrent_status, concurrent_body) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4}"#,
+    )
+    .await;
+
+    // Release before assertions so a regression cannot strand a blocking test
+    // engine during panic unwinding.
+    release_tx.send(()).expect("release engine cleanup");
+    let bytes = tokio::time::timeout(std::time::Duration::from_secs(2), body_task)
+        .await
+        .expect("failed stream completes after cleanup")
+        .unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+    assert_eq!(initial_status, StatusCode::OK);
+    assert!(
+        body_pending_during_cleanup,
+        "error waits for engine cleanup"
+    );
+    assert!(
+        in_flight_during_cleanup,
+        "permit remains held during cleanup"
+    );
+    assert_eq!(
+        concurrent_status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{concurrent_body}"
+    );
+    assert_eq!(body.matches("event: error\n").count(), 1, "{body}");
+    assert_eq!(body.matches("internal server error").count(), 1, "{body}");
+    assert!(
+        !body.contains("message_delta"),
+        "no success terminal: {body}"
+    );
+    assert!(
+        !body.contains("message_stop"),
+        "no success terminal: {body}"
+    );
+    assert!(!control.is_in_flight(), "permit releases after cleanup");
 }
 
 #[tokio::test]

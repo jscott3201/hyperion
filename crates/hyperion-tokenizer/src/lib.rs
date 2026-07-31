@@ -52,6 +52,18 @@ pub const fn contract() -> TokenizerContract {
 pub struct TokenizerHandle {
     inner: Arc<Tokenizer>,
     vocab_size: usize,
+    special_token_ids: Arc<HashSet<u32>>,
+}
+
+fn added_special_token_ids(tokenizer: &Tokenizer) -> Arc<HashSet<u32>> {
+    Arc::new(
+        tokenizer
+            .get_added_vocabulary()
+            .get_added_tokens_decoder()
+            .iter()
+            .filter_map(|(id, token)| token.special.then_some(*id))
+            .collect(),
+    )
 }
 
 /// A load or encode error.
@@ -85,7 +97,7 @@ impl SpecialTokenPolicy {
 pub struct StreamingDecoder {
     tokenizer: Arc<Tokenizer>,
     skip_special_tokens: bool,
-    skipped_special_ids: HashSet<u32>,
+    skipped_special_ids: Option<Arc<HashSet<u32>>>,
     ids: Vec<u32>,
     prefix: String,
     prefix_index: usize,
@@ -98,7 +110,11 @@ impl StreamingDecoder {
         // its stream helper still retains the corresponding ID. Skip them at
         // the boundary so controls cannot consume unresolved-state capacity or
         // disturb an incomplete byte-fallback sequence.
-        if self.skipped_special_ids.contains(&id) {
+        if self
+            .skipped_special_ids
+            .as_ref()
+            .is_some_and(|ids| ids.contains(&id))
+        {
             return Ok(None);
         }
         if self.ids.len() >= MAX_RETAINED_TOKEN_IDS {
@@ -182,9 +198,11 @@ impl TokenizerHandle {
     pub fn from_file(path: &Path) -> Result<Self, TokenizerError> {
         let inner = Tokenizer::from_file(path).map_err(|e| TokenizerError::Load(e.to_string()))?;
         let vocab_size = inner.get_vocab_size(true);
+        let special_token_ids = added_special_token_ids(&inner);
         Ok(Self {
             inner: Arc::new(inner),
             vocab_size,
+            special_token_ids,
         })
     }
 
@@ -195,9 +213,11 @@ impl TokenizerHandle {
         let inner =
             Tokenizer::from_bytes(bytes).map_err(|e| TokenizerError::Load(e.to_string()))?;
         let vocab_size = inner.get_vocab_size(true);
+        let special_token_ids = added_special_token_ids(&inner);
         Ok(Self {
             inner: Arc::new(inner),
             vocab_size,
+            special_token_ids,
         })
     }
 
@@ -223,14 +243,9 @@ impl TokenizerHandle {
     #[must_use]
     pub fn streaming_decoder(&self, policy: SpecialTokenPolicy) -> StreamingDecoder {
         let skipped_special_ids = if policy == SpecialTokenPolicy::Skip {
-            self.inner
-                .get_added_vocabulary()
-                .get_added_tokens_decoder()
-                .iter()
-                .filter_map(|(id, token)| token.special.then_some(*id))
-                .collect()
+            Some(self.special_token_ids.clone())
         } else {
-            HashSet::new()
+            None
         };
         StreamingDecoder {
             tokenizer: self.inner.clone(),
@@ -275,9 +290,11 @@ mod tests {
 
     fn handle(inner: Tokenizer) -> TokenizerHandle {
         let vocab_size = inner.get_vocab_size(true);
+        let special_token_ids = added_special_token_ids(&inner);
         TokenizerHandle {
             inner: Arc::new(inner),
             vocab_size,
+            special_token_ids,
         }
     }
 
@@ -396,6 +413,20 @@ mod tests {
             .expect("special token registers");
         let tokenizer = handle(inner);
         let special_id = tokenizer.token_to_id("<eos>").expect("special ID");
+
+        let first = tokenizer.streaming_decoder(SpecialTokenPolicy::Skip);
+        let second = tokenizer.streaming_decoder(SpecialTokenPolicy::Skip);
+        assert!(Arc::ptr_eq(
+            first.skipped_special_ids.as_ref().unwrap(),
+            second.skipped_special_ids.as_ref().unwrap()
+        ));
+        assert!(
+            tokenizer
+                .streaming_decoder(SpecialTokenPolicy::Preserve)
+                .skipped_special_ids
+                .is_none(),
+            "Preserve does not carry the skip set"
+        );
 
         let mut decoder = tokenizer.streaming_decoder(SpecialTokenPolicy::Skip);
         assert_eq!(decoder.push(0).unwrap(), None);
