@@ -67,31 +67,17 @@ std::uint64_t arithmetic_series_sum(
 
 GlobalKvProjection project_global_kv(
     const KvState& kvstate,
-    std::uint32_t n_tokens,
-    StepKind step_kind) {
+    StepKind step_kind,
+    const hyperion::model::KvGrowthPlan& plan) {
+    if (!plan.representable) {
+        return fail_closed_global_projection();
+    }
     std::uint64_t persistent_total = 0;
     std::uint64_t reallocation_total = 0;
     for (const auto& cache : kvstate.global) {
         const std::uint64_t current_capacity = cache.capacity();
-        std::uint64_t projected_capacity = current_capacity;
-        if (n_tokens != 0) {
-            const std::uint64_t proposed_len =
-                static_cast<std::uint64_t>(cache.committed_len()) + n_tokens;
-            if (proposed_len > std::numeric_limits<std::uint32_t>::max()) {
-                return fail_closed_global_projection();
-            }
-            const std::uint64_t step = cache.step();
-            const std::uint64_t steps = proposed_len / step + (proposed_len % step != 0);
-            const std::uint64_t required_capacity = saturating_multiply(steps, step);
-
-            // MLX shape dimensions are signed ints (kv_shape casts capacity to int).
-            // A larger rounded bucket cannot safely be submitted to the allocator.
-            if (required_capacity >
-                static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
-                return fail_closed_global_projection();
-            }
-            projected_capacity = std::max(current_capacity, required_capacity);
-        }
+        const std::uint64_t projected_capacity =
+            hyperion::model::projected_global_capacity(cache, plan.n_tokens);
 
         // Each cache owns distinct K and V BF16 buffers, including k_eq_v models.
         std::uint64_t bytes_per_capacity = saturating_multiply(
@@ -143,6 +129,49 @@ GlobalKvProjection project_global_kv(
         }
     }
     return {persistent_total, reallocation_total};
+}
+
+/// Copy-on-write allocation introduced by staging a whole growth operation.
+/// Every local cache is rebound on the staged state. A global cache that does
+/// not grow is also rebound at its current capacity. For sequential decode, a
+/// crossing cache additionally needs its current-capacity candidate when the
+/// block begins inside the bucket; later replacement candidates remain covered
+/// by project_global_kv's replacement series.
+std::uint64_t staging_cow_bytes(
+    const KvState& kvstate,
+    const hyperion::model::KvGrowthPlan& plan,
+    StepKind step_kind) {
+    if (!plan.representable) {
+        return kMaxBytes;
+    }
+    if (!plan.requires_transaction) {
+        return 0;
+    }
+
+    std::uint64_t total = 0;
+    for (const auto& cache : kvstate.local) {
+        std::uint64_t bytes = saturating_multiply(
+            cache.capacity(), cache.num_kv_heads());
+        bytes = saturating_multiply(bytes, cache.head_dim());
+        bytes = saturating_multiply(bytes, 2 * kBf16Bytes); // K + V
+        total = saturating_add(total, bytes);
+    }
+    for (const auto& cache : kvstate.global) {
+        const bool grows = hyperion::model::projected_global_capacity(
+            cache, plan.n_tokens) > cache.capacity();
+        const bool decode_current_candidate =
+            grows && step_kind == StepKind::Decode &&
+            cache.committed_len() < cache.capacity();
+        if (grows && !decode_current_candidate) {
+            continue;
+        }
+        std::uint64_t bytes = saturating_multiply(
+            cache.capacity(), cache.num_kv_heads());
+        bytes = saturating_multiply(bytes, cache.head_dim());
+        bytes = saturating_multiply(bytes, 2 * kBf16Bytes); // K + V
+        total = saturating_add(total, bytes);
+    }
+    return total;
 }
 
 /// Extra materialized K+V buffers used by sliding continuation prefill. Forward
@@ -210,13 +239,18 @@ MemoryPrediction predict_memory(
     std::uint32_t offset,
     const KvState& kvstate,
     const Geometry& geometry,
-    StepKind step_kind) {
+    StepKind step_kind,
+    const hyperion::model::KvGrowthPlan* operation_plan) {
+    const auto derived_plan = hyperion::model::plan_kv_growth(kvstate, n_tokens);
+    const auto& plan = operation_plan == nullptr ? derived_plan : *operation_plan;
     const std::uint64_t settled = saturating_add(
         mx::get_active_memory(), mx::get_cache_memory());
     const GlobalKvProjection global =
-        project_global_kv(kvstate, n_tokens, step_kind);
+        project_global_kv(kvstate, step_kind, derived_plan);
 
     std::uint64_t predicted = saturating_add(settled, global.reallocation_bytes);
+    predicted = saturating_add(
+        predicted, staging_cow_bytes(kvstate, plan, step_kind));
     predicted = saturating_add(
         predicted,
         attention_transient_bytes(geometry, n_tokens, offset, step_kind));
@@ -240,12 +274,11 @@ std::uint64_t Governor::local_kv_bytes(const KvState& kvstate) const {
     std::uint64_t total = 0;
     for (const auto& cache : kvstate.local) {
         // Each LocalKvCache stores K and V, each [capacity, n_kv_heads, head_dim] bf16.
-        const std::uint64_t per_tensor =
-            static_cast<std::uint64_t>(cache.capacity()) *
-            static_cast<std::uint64_t>(cache.num_kv_heads()) *
-            static_cast<std::uint64_t>(cache.head_dim()) *
-            kBf16Bytes;
-        total += 2 * per_tensor; // K + V
+        std::uint64_t bytes = saturating_multiply(
+            cache.capacity(), cache.num_kv_heads());
+        bytes = saturating_multiply(bytes, cache.head_dim());
+        bytes = saturating_multiply(bytes, 2 * kBf16Bytes); // K + V
+        total = saturating_add(total, bytes);
     }
     return total;
 }
@@ -254,9 +287,10 @@ GovernorDecision Governor::evaluate(
     std::uint32_t n_tokens,
     std::uint32_t offset,
     const KvState& kvstate,
-    StepKind step_kind) const {
+    StepKind step_kind,
+    const hyperion::model::KvGrowthPlan* operation_plan) const {
     const MemoryPrediction prediction = predict_memory(
-        n_tokens, offset, kvstate, geometry_, step_kind);
+        n_tokens, offset, kvstate, geometry_, step_kind, operation_plan);
 
     // Local allocation is fixed; global telemetry is projected post-step allocation.
     const std::uint64_t local_kv = local_kv_bytes(kvstate);
@@ -296,8 +330,10 @@ std::uint64_t predict_peak(
     std::uint32_t offset,
     const KvState& kvstate,
     const Geometry& geometry,
-    StepKind step_kind) {
-    return predict_memory(n_tokens, offset, kvstate, geometry, step_kind).peak_bytes;
+    StepKind step_kind,
+    const hyperion::model::KvGrowthPlan* operation_plan) {
+    return predict_memory(
+        n_tokens, offset, kvstate, geometry, step_kind, operation_plan).peak_bytes;
 }
 
 std::uint32_t throughput_optimum_context(std::uint64_t budget_ceiling_bytes) {

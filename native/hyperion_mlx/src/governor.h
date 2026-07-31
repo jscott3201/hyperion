@@ -71,6 +71,7 @@ struct GovernorDecision {
 /// ```text
 /// predicted_peak = settled_working_set
 ///                + kv_reallocation_peak    [full replacement buffers on growth]
+///                + staging_cow             [growth-transaction cache candidates]
 ///                + attention_transient     [SDPA outputs + continuation scratch]
 ///                + workspace + 512 MiB reserve
 /// ```
@@ -79,6 +80,9 @@ struct GovernorDecision {
 ///   settled_working_set = mx::get_active_memory() + mx::get_cache_memory()
 ///   kv_reallocation_peak = full projected K+V bytes for each growing prefill cache,
 ///       or the sum of every crossed replacement capacity for sequential decode
+///   staging_cow = all local K+V storage plus non-growing global K+V storage when
+///       any global cache grows; sequential decode also charges a growing cache's
+///       current candidate when no-growth appends precede its first crossing
 ///   attention_transient = (sum over layers of
 ///       q * head_dim_local  * n_heads * dtype  [sliding]
 ///       q * head_dim_global * n_heads * dtype  [global]) * safety
@@ -116,7 +120,8 @@ class Governor {
         std::uint32_t n_tokens,
         std::uint32_t offset,
         const KvState& kvstate,
-        StepKind step_kind) const;
+        StepKind step_kind,
+        const hyperion::model::KvGrowthPlan* operation_plan = nullptr) const;
 
     /// The hard ceiling this governor checks against (bytes).
     [[nodiscard]] std::uint64_t budget_ceiling_bytes() const { return budget_ceiling_bytes_; }
@@ -139,7 +144,8 @@ class Governor {
     std::uint32_t offset,
     const KvState& kvstate,
     const Geometry& geometry,
-    StepKind step_kind);
+    StepKind step_kind,
+    const hyperion::model::KvGrowthPlan* operation_plan = nullptr);
 
 /// The throughput-optimum context length (A4) — the context at which throughput
 /// peaks before memory pressure dominates. NOT the ceiling; the governor targets

@@ -137,6 +137,8 @@ int main() {
 
     constexpr std::uint64_t kGlobalBucketBytes =
         2ULL * 256 * 1 * 128 * 2; // K+V * capacity * heads * dim * BF16
+    constexpr std::uint64_t kLocalStagingCowBytes =
+        5ULL * 2 * 16 * 2 * 64 * 2; // layers * K+V * cap * heads * dim * BF16
     constexpr std::uint64_t kOneTokenTransient =
         (5ULL * 1 * 64 * 4 * 2 + 1ULL * 1 * 128 * 4 * 2) * 5 / 4;
 
@@ -159,8 +161,9 @@ int main() {
         "first token must project one full global KV bucket");
     require(
         decision.predicted_peak_bytes ==
-            empty_zero.predicted_peak_bytes + kGlobalBucketBytes + kOneTokenTransient,
-        "first allocation must charge the full projected global KV bucket");
+            empty_zero.predicted_peak_bytes + kGlobalBucketBytes +
+                kLocalStagingCowBytes + kOneTokenTransient,
+        "first allocation must charge replacement plus full local staging COW");
 
     Governor soft_gov(
         geometry, std::numeric_limits<std::uint64_t>::max(),
@@ -179,7 +182,8 @@ int main() {
         "within-bucket proposal must retain one projected global KV bucket");
     require(
         two_token_first_bucket.predicted_peak_bytes ==
-            empty_zero.predicted_peak_bytes + kGlobalBucketBytes + 2 * kOneTokenTransient,
+            empty_zero.predicted_peak_bytes + kGlobalBucketBytes +
+                kLocalStagingCowBytes + 2 * kOneTokenTransient,
         "within-bucket proposal must not charge per-logical-token KV growth");
 
     // Decode appends sequential q=1 forwards. Crossing three capacity steps therefore
@@ -201,7 +205,7 @@ int main() {
     require(
         multistep.predicted_peak_bytes ==
             multistep_zero.predicted_peak_bytes + 6 * kGlobalBucketBytes +
-                kOneTokenTransient,
+                kLocalStagingCowBytes + kOneTokenTransient,
         "multi-step decode must charge sequential replacements and one q=1 transient");
     require(
         predict_peak(513, 0, multistep_kvstate, geometry, StepKind::Decode) ==
@@ -217,7 +221,7 @@ int main() {
     require(
         multistep_prefill.predicted_peak_bytes ==
             multistep_zero.predicted_peak_bytes + 3 * kGlobalBucketBytes +
-                513 * kOneTokenTransient,
+                kLocalStagingCowBytes + 513 * kOneTokenTransient,
         "multi-step prefill must charge only its one final replacement allocation");
 
     // Multi-token continuation prefill assembles a bounded local K+V buffer from the
@@ -277,6 +281,26 @@ int main() {
             four_token_zero.predicted_peak_bytes + kOneTokenTransient,
         "within allocated bucket must charge zero KV allocation transient");
 
+    // A sequential block that starts inside the bucket performs staged no-growth
+    // writes before its later crossing. Charge the current-capacity COW candidate
+    // in addition to the eventual two-bucket replacement. One-shot prefill grows
+    // before writing and therefore has no analogous current-capacity candidate.
+    const auto later_decode_crossing =
+        gov.evaluate(253, 4, kvstate, StepKind::Decode);
+    require(
+        later_decode_crossing.predicted_peak_bytes ==
+            four_token_zero.predicted_peak_bytes + 3 * kGlobalBucketBytes +
+                kLocalStagingCowBytes + kOneTokenTransient,
+        "later decode crossing must charge current candidate plus replacement and local COW");
+    const auto one_shot_prefill_crossing =
+        gov.evaluate(253, 4, kvstate, StepKind::Prefill);
+    require(
+        one_shot_prefill_crossing.predicted_peak_bytes ==
+            four_token_zero.predicted_peak_bytes + 2 * kGlobalBucketBytes +
+                kLocalStagingCowBytes + 253 * kOneTokenTransient +
+                2ULL * (4 + 253) * 2 * 64 * 2,
+        "one-shot prefill crossing must not charge decode's current-capacity candidate");
+
     // Fill the remainder to the exact end of the first 256-token bucket.
     {
         const std::uint32_t n = 252;
@@ -298,8 +322,8 @@ int main() {
     require(
         boundary_crossing.predicted_peak_bytes ==
             boundary_zero.predicted_peak_bytes + 2 * kGlobalBucketBytes +
-                kOneTokenTransient,
-        "bucket growth must charge full replacement K+V, not only the capacity delta");
+                kLocalStagingCowBytes + kOneTokenTransient,
+        "256 to 257 must charge replacement K+V plus local staging COW");
 
     // Starting at one full bucket, 513 sequential decode tokens cross replacements
     // of 2 + 3 + 4 buckets and finish with four persistent buckets.
@@ -310,13 +334,14 @@ int main() {
     require(
         boundary_multicross.predicted_peak_bytes ==
             boundary_zero.predicted_peak_bytes + 9 * kGlobalBucketBytes +
-                kOneTokenTransient,
-        "boundary multi-cross decode must charge 2+3+4 replacements and one q=1 transient");
+                kLocalStagingCowBytes + kOneTokenTransient,
+        "boundary multi-cross decode must charge replacements plus local staging COW");
 
     // A ceiling that would admit delta-only accounting must reject full replacement
     // accounting. Old-buffer bytes are already part of settled MLX memory.
     const std::uint64_t delta_only_ceiling =
-        boundary_zero.predicted_peak_bytes + kGlobalBucketBytes + kOneTokenTransient;
+        boundary_zero.predicted_peak_bytes + kGlobalBucketBytes +
+            kLocalStagingCowBytes + kOneTokenTransient;
     Governor tight_gov(geometry, delta_only_ceiling, delta_only_ceiling);
     const auto replacement_rejection =
         tight_gov.evaluate(1, 256, kvstate, StepKind::Decode);
@@ -324,6 +349,36 @@ int main() {
         "full replacement allocation must reject a ceiling that delta-only charging would admit");
     require(replacement_rejection.global_kv_bytes == 2 * kGlobalBucketBytes,
         "hard rejection telemetry must still report projected post-step global KV bytes");
+
+    // If one global layer grows, another non-growing global layer is still staged
+    // and loses donation on its first rebind. Pin that full current K+V candidate.
+    auto two_global_geometry = geometry;
+    two_global_geometry.layer_types.push_back(LayerType::Full);
+    two_global_geometry.num_hidden_layers += 1;
+    auto two_global_state = build_kv_state(
+        hyperion::model::build_dispatch(two_global_geometry),
+        hyperion::model::kDefaultGammaMax, mx::bfloat16, s);
+    const mx::array full_bucket = mx::ones({256, 1, 128}, mx::bfloat16, s);
+    const mx::array one_token = mx::ones({1, 1, 128}, mx::bfloat16, s);
+    two_global_state.global[0].append(full_bucket, full_bucket, 256);
+    two_global_state.global[1].append(one_token, one_token, 1);
+    mx::eval(
+        two_global_state.global[0].keys(), two_global_state.global[0].values(),
+        two_global_state.global[1].keys(), two_global_state.global[1].values());
+    Governor two_global_gov(
+        two_global_geometry, budget.effective_bytes, budget.soft_watermark_bytes);
+    const auto two_global_zero =
+        two_global_gov.evaluate(0, 256, two_global_state, StepKind::Decode);
+    const auto one_grows =
+        two_global_gov.evaluate(1, 256, two_global_state, StepKind::Decode);
+    constexpr std::uint64_t kTwoGlobalOneTokenTransient =
+        (5ULL * 1 * 64 * 4 * 2 + 2ULL * 1 * 128 * 4 * 2) * 5 / 4;
+    require(
+        one_grows.predicted_peak_bytes ==
+            two_global_zero.predicted_peak_bytes + 2 * kGlobalBucketBytes +
+                kGlobalBucketBytes + kLocalStagingCowBytes +
+                kTwoGlobalOneTokenTransient,
+        "growth transaction must charge a non-growing global layer's full K+V COW");
 
     // Proposals that exceed uint32 committed length / signed-int MLX capacity fail
     // closed instead of wrapping into a small capacity prediction.

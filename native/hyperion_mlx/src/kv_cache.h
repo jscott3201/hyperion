@@ -4,6 +4,7 @@
 #include "dispatch.h"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include <mlx/mlx.h>
@@ -193,6 +194,72 @@ class GlobalKvCache {
 struct KvState {
     std::vector<LocalKvCache> local;
     std::vector<GlobalKvCache> global;
+};
+
+/// Whole-public-call KV growth plan. Execution and admission both consume this
+/// object so an operation cannot stage under a different bucket-crossing decision
+/// than the governor charged. The plan is allocation-free on the hot path.
+struct KvGrowthPlan {
+    bool representable = true;
+    bool requires_transaction = false;
+    std::uint32_t n_tokens = 0;
+};
+
+/// Plan an append of ``n_tokens`` to every cache in ``state``. The plan fails
+/// closed when a committed cursor, a rounded global bucket, or an MLX signed
+/// dimension cannot represent the result.
+[[nodiscard]] KvGrowthPlan plan_kv_growth(
+    const KvState& state,
+    std::uint32_t n_tokens);
+
+/// Project one global cache's rounded capacity. Call only with the token count
+/// from a representable ``KvGrowthPlan`` for the containing state.
+[[nodiscard]] std::uint32_t projected_global_capacity(
+    const GlobalKvCache& cache,
+    std::uint32_t n_tokens);
+
+/// Transaction used only for whole calls whose plan crosses a global capacity
+/// bucket. The staged state is a shallow copy: MLX array handles alias the live
+/// state until the first functional cache rebind creates the charged COW buffer.
+/// The caller must materialize before publish; destruction before publication
+/// leaves the live unique_ptr untouched.
+class KvGrowthTransaction {
+  public:
+    KvGrowthTransaction(
+        std::unique_ptr<KvState>& live,
+        const KvGrowthPlan& plan);
+
+    KvGrowthTransaction(const KvGrowthTransaction&) = delete;
+    KvGrowthTransaction& operator=(const KvGrowthTransaction&) = delete;
+
+    [[nodiscard]] bool active() const { return staged_ != nullptr; }
+    [[nodiscard]] bool materialized() const { return materialized_; }
+    [[nodiscard]] KvState& state() {
+        return active() && !published_ ? *staged_ : *live_;
+    }
+    [[nodiscard]] const KvState& state() const {
+        return active() && !published_ ? *staged_ : *live_;
+    }
+
+    /// Root every staged K/V output in the forward-result barrier. No-growth
+    /// operations return ``output`` byte-for-byte (same MLX descriptor identity).
+    [[nodiscard]] mlx::core::array root_forward_result(
+        const mlx::core::array& output) const;
+
+    /// Synchronously verify every staged K/V graph before publication. Calling
+    /// this after a rooted sampling/eval barrier does not recompute the graphs.
+    void materialize();
+
+    /// Publish the already-materialized state with the noexcept unique_ptr swap.
+    void publish();
+
+  private:
+    [[nodiscard]] std::vector<mlx::core::array> staged_outputs() const;
+
+    std::unique_ptr<KvState>& live_;
+    std::unique_ptr<KvState> staged_;
+    bool materialized_ = false;
+    bool published_ = false;
 };
 
 /// Allocate the heterogeneous KV state from a resolved dispatch table.

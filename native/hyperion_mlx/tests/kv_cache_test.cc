@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -28,6 +30,9 @@ using hyperion::model::Geometry;
 using hyperion::model::GlobalKvCache;
 using hyperion::model::LayerType;
 using hyperion::model::LocalKvCache;
+using hyperion::model::KvGrowthTransaction;
+using hyperion::model::KvState;
+using hyperion::model::plan_kv_growth;
 using hyperion::model::RopeSpec;
 using hyperion::model::TextModelType;
 
@@ -398,6 +403,189 @@ void test_build_kv_state(const mx::Stream& s) {
     require(state.global[0].capacity() == 256, "builder-built global grew one step");
 }
 
+std::unique_ptr<KvState> make_transaction_state(const mx::Stream& s) {
+    auto state = std::make_unique<KvState>();
+    state->local.emplace_back(4, 4, 1, 2, mx::float32, s);
+    state->global.emplace_back(256, 1, 2, true, mx::float32, s);
+    state->global.emplace_back(256, 1, 2, true, mx::float32, s);
+    return state;
+}
+
+void test_growth_plan_boundaries(const mx::Stream& s) {
+    auto state = make_transaction_state(s);
+    const auto first = plan_kv_growth(*state, 1);
+    require(first.representable && first.requires_transaction,
+        "plan: first bucket requires a transaction");
+
+    const auto first_255 = make_update(255, 0, s, 1, 2);
+    for (auto& cache : state->global) {
+        cache.append(first_255, first_255, 255);
+    }
+    const auto exact_boundary = plan_kv_growth(*state, 1);
+    require(exact_boundary.representable && !exact_boundary.requires_transaction,
+        "plan: append landing exactly at capacity stays on the direct path");
+    const auto later_crossing = plan_kv_growth(*state, 2);
+    require(later_crossing.representable && later_crossing.requires_transaction,
+        "plan: a later token in one whole call triggers staging before its first write");
+
+    const auto one = make_update(1, 255, s, 1, 2);
+    for (auto& cache : state->global) {
+        cache.append(one, one, 1);
+    }
+    const auto boundary_plus_one = plan_kv_growth(*state, 1);
+    require(boundary_plus_one.representable && boundary_plus_one.requires_transaction,
+        "plan: 256 to 257 crosses the next bucket");
+
+    const auto overflow = plan_kv_growth(
+        *state, std::numeric_limits<std::uint32_t>::max());
+    require(!overflow.representable,
+        "plan: uint32 committed-length overflow fails closed");
+    auto empty = make_transaction_state(s);
+    const auto signed_shape_overflow = plan_kv_growth(
+        *empty, static_cast<std::uint32_t>(std::numeric_limits<int>::max()));
+    require(!signed_shape_overflow.representable,
+        "plan: rounded capacity beyond signed MLX dimensions fails closed");
+}
+
+void test_growth_transaction_atomicity(const mx::Stream& s) {
+    // Successful all-layer commit: both cache kinds and both global caches publish
+    // together, with every staged output synchronously available first.
+    auto live = make_transaction_state(s);
+    KvState* const original_ptr = live.get();
+    const auto plan = plan_kv_growth(*live, 1);
+    KvGrowthTransaction tx(live, plan);
+    require(tx.active(), "transaction: growth allocates a staged state");
+    const auto local = make_update(1, 10, s, 1, 2);
+    tx.state().local[0].append_committed(local, local, 1);
+    for (std::size_t i = 0; i < tx.state().global.size(); ++i) {
+        const auto update = make_update(1, static_cast<std::uint32_t>(20 + i), s, 1, 2);
+        tx.state().global[i].append(update, update, 1);
+    }
+    const mx::array hidden = mx::add(mx::array(1.0F), mx::array(2.0F), s);
+    const mx::array rooted = tx.root_forward_result(hidden);
+    require(rooted.id() != hidden.id(),
+        "transaction: growth injects staged cache dependencies into the barrier");
+    mx::eval(rooted);
+    for (const auto& cache : tx.state().local) {
+        require(cache.keys().is_available() && cache.values().is_available(),
+            "transaction: rooted fresh-prefill local outputs materialize");
+    }
+    for (const auto& cache : tx.state().global) {
+        require(cache.keys().is_available() && cache.values().is_available(),
+            "transaction: rooted fresh-prefill global outputs materialize");
+    }
+    tx.materialize();
+    require(tx.materialized(), "transaction: verification records materialization");
+    tx.publish();
+    require(live.get() != original_ptr, "transaction: commit swaps the owning pointer");
+    require(live->local[0].committed_len() == 1,
+        "transaction: local index commits with the state");
+    require(live->global[0].committed_len() == 1 &&
+            live->global[1].committed_len() == 1,
+        "transaction: all global indices commit together");
+
+    // Inject a later-layer exception after earlier local/global staged mutation.
+    // Destruction without publish preserves pointer, descriptors, contents, and indices.
+    auto failed_live = make_transaction_state(s);
+    KvState* const failed_ptr = failed_live.get();
+    const std::uint32_t public_cursor = 17;
+    std::uint32_t staged_cursor = public_cursor;
+    const auto local_k_id = failed_live->local[0].keys().id();
+    const auto global0_k_id = failed_live->global[0].keys().id();
+    try {
+        KvGrowthTransaction failed_tx(
+            failed_live, plan_kv_growth(*failed_live, 1));
+        failed_tx.state().local[0].append_committed(local, local, 1);
+        failed_tx.state().global[0].append(local, local, 1);
+        staged_cursor += 1;
+        throw std::runtime_error("injected later global layer failure");
+    } catch (const std::runtime_error&) {
+    }
+    require(failed_live.get() == failed_ptr,
+        "transaction: later-layer exception leaves live pointer unchanged");
+    require(failed_live->local[0].keys().id() == local_k_id &&
+            failed_live->global[0].keys().id() == global0_k_id,
+        "transaction: later-layer exception leaves live array identities unchanged");
+    require(failed_live->local[0].committed_len() == 0 &&
+            failed_live->global[0].committed_len() == 0 &&
+            failed_live->global[1].committed_len() == 0,
+        "transaction: later-layer exception leaves every live index unchanged");
+    require(public_cursor == 17 && staged_cursor == 18,
+        "transaction: failure leaves the public cursor unchanged while its local is discarded");
+    require(region_matches(
+            failed_live->local[0].keys(), 0,
+            mx::zeros({1, 1, 2}, mx::float32, s), 0, 1, s, 1, 2),
+        "transaction: later-layer exception leaves live cache content unchanged");
+
+    // A malformed later cache update may fail during graph construction or its
+    // verification eval. Either way it occurs only on the staged owner.
+    auto construction_failed_live = make_transaction_state(s);
+    KvState* const construction_failed_ptr = construction_failed_live.get();
+    bool construction_failed = false;
+    try {
+        KvGrowthTransaction construction_failed_tx(
+            construction_failed_live,
+            plan_kv_growth(*construction_failed_live, 1));
+        construction_failed_tx.state().local[0].append_committed(local, local, 1);
+        const mx::array malformed = mx::ones({1, 1, 3}, mx::float32, s);
+        construction_failed_tx.state().global[0].append(malformed, malformed, 1);
+        construction_failed_tx.materialize();
+    } catch (const std::exception&) {
+        construction_failed = true;
+    }
+    require(construction_failed,
+        "transaction: malformed staged cache graph deterministically fails");
+    require(construction_failed_live.get() == construction_failed_ptr &&
+            construction_failed_live->local[0].committed_len() == 0 &&
+            construction_failed_live->global[0].committed_len() == 0,
+        "transaction: cache construction/eval failure leaves live state unchanged");
+
+    // Publication is forbidden until the synchronous materialization gate succeeds.
+    auto eval_failed_live = make_transaction_state(s);
+    KvState* const eval_failed_ptr = eval_failed_live.get();
+    try {
+        KvGrowthTransaction eval_failed_tx(
+            eval_failed_live, plan_kv_growth(*eval_failed_live, 1));
+        eval_failed_tx.state().local[0].append_committed(local, local, 1);
+        eval_failed_tx.publish();
+        require(false, "transaction: publish-before-materialize must throw");
+    } catch (const std::logic_error&) {
+    }
+    require(eval_failed_live.get() == eval_failed_ptr &&
+            eval_failed_live->local[0].committed_len() == 0,
+        "transaction: injected verification failure cannot publish partial state");
+}
+
+void test_no_growth_transaction_bypass(const mx::Stream& s) {
+    auto live = make_transaction_state(s);
+    const auto first = make_update(1, 0, s, 1, 2);
+    for (auto& cache : live->global) {
+        cache.append(first, first, 1);
+    }
+    mx::eval(
+        live->global[0].keys(), live->global[0].values(),
+        live->global[1].keys(), live->global[1].values());
+    KvState* const original_ptr = live.get();
+    const auto plan = plan_kv_growth(*live, 1);
+    require(plan.representable && !plan.requires_transaction,
+        "no-growth: inside-bucket append does not request staging");
+    KvGrowthTransaction tx(live, plan);
+    require(!tx.active() && &tx.state() == live.get(),
+        "no-growth: transaction aliases the direct live path without a staged state");
+    const mx::array hidden = mx::add(mx::array(3.0F), mx::array(4.0F), s);
+    require(hidden.status() == mx::array::Status::unscheduled,
+        "no-growth: negative-control output starts unevaluated");
+    const mx::array rooted = tx.root_forward_result(hidden);
+    require(rooted.id() == hidden.id(),
+        "no-growth: no dependency node is injected");
+    tx.materialize();
+    tx.publish();
+    require(hidden.status() == mx::array::Status::unscheduled,
+        "no-growth: transaction performs no synchronous evaluation");
+    require(live.get() == original_ptr,
+        "no-growth: transaction performs no pointer publication");
+}
+
 } // namespace
 
 int main() {
@@ -413,6 +601,9 @@ int main() {
         test_local_append_committed_wrap(stream);
         test_local_rotation_read(stream);
         test_build_kv_state(stream);
+        test_growth_plan_boundaries(stream);
+        test_growth_transaction_atomicity(stream);
+        test_no_growth_transaction_bypass(stream);
     } catch (const std::exception& error) {
         std::cerr << "kv_cache_test: uncaught exception: " << error.what() << '\n';
         return 1;

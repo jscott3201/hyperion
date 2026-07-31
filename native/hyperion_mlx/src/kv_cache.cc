@@ -1,6 +1,8 @@
 #include "kv_cache.h"
 
 #include <algorithm>
+#include <limits>
+#include <memory>
 #include <stdexcept>
 
 namespace mx = mlx::core;
@@ -15,6 +17,114 @@ mx::Shape kv_shape(std::uint32_t capacity, std::uint32_t heads, std::uint32_t di
 }
 
 } // namespace
+
+KvGrowthPlan plan_kv_growth(const KvState& state, std::uint32_t n_tokens) {
+    KvGrowthPlan plan;
+    plan.n_tokens = n_tokens;
+
+    for (const auto& cache : state.local) {
+        const std::uint64_t proposed =
+            static_cast<std::uint64_t>(cache.committed_len()) + n_tokens;
+        if (proposed > std::numeric_limits<std::uint32_t>::max()) {
+            plan.representable = false;
+            return plan;
+        }
+    }
+
+    for (const auto& cache : state.global) {
+        const std::uint64_t proposed =
+            static_cast<std::uint64_t>(cache.committed_len()) + n_tokens;
+        if (proposed > std::numeric_limits<std::uint32_t>::max()) {
+            plan.representable = false;
+            return plan;
+        }
+        const std::uint64_t step = cache.step();
+        const std::uint64_t steps = proposed / step + (proposed % step != 0);
+        const std::uint64_t required = steps * step;
+        if (required > static_cast<std::uint64_t>(std::numeric_limits<int>::max()) ||
+            required > std::numeric_limits<std::uint32_t>::max()) {
+            plan.representable = false;
+            return plan;
+        }
+        const auto projected = static_cast<std::uint32_t>(
+            std::max<std::uint64_t>(cache.capacity(), required));
+        plan.requires_transaction =
+            plan.requires_transaction || projected > cache.capacity();
+    }
+    return plan;
+}
+
+std::uint32_t projected_global_capacity(
+    const GlobalKvCache& cache,
+    std::uint32_t n_tokens) {
+    const std::uint64_t proposed =
+        static_cast<std::uint64_t>(cache.committed_len()) + n_tokens;
+    const std::uint64_t step = cache.step();
+    const std::uint64_t steps = proposed / step + (proposed % step != 0);
+    return static_cast<std::uint32_t>(
+        std::max<std::uint64_t>(cache.capacity(), steps * step));
+}
+
+KvGrowthTransaction::KvGrowthTransaction(
+    std::unique_ptr<KvState>& live,
+    const KvGrowthPlan& plan)
+    : live_(live) {
+    if (live_ == nullptr) {
+        throw std::invalid_argument("KV growth transaction requires live state");
+    }
+    if (!plan.representable) {
+        throw std::overflow_error("KV operation exceeds representable cache dimensions");
+    }
+    if (plan.requires_transaction) {
+        staged_ = std::make_unique<KvState>(*live_);
+    }
+}
+
+std::vector<mx::array> KvGrowthTransaction::staged_outputs() const {
+    std::vector<mx::array> outputs;
+    if (!active()) {
+        return outputs;
+    }
+    outputs.reserve(2 * (staged_->local.size() + staged_->global.size()));
+    for (const auto& cache : staged_->local) {
+        outputs.push_back(cache.keys());
+        outputs.push_back(cache.values());
+    }
+    for (const auto& cache : staged_->global) {
+        outputs.push_back(cache.keys());
+        outputs.push_back(cache.values());
+    }
+    return outputs;
+}
+
+mx::array KvGrowthTransaction::root_forward_result(const mx::array& output) const {
+    if (!active()) {
+        return output;
+    }
+    return mx::depends({output}, staged_outputs()).front();
+}
+
+void KvGrowthTransaction::materialize() {
+    if (!active()) {
+        return;
+    }
+    mx::eval(staged_outputs());
+    materialized_ = true;
+}
+
+void KvGrowthTransaction::publish() {
+    if (!active()) {
+        return;
+    }
+    if (!materialized_) {
+        throw std::logic_error("KV growth transaction published before materialization");
+    }
+    if (published_) {
+        throw std::logic_error("KV growth transaction published more than once");
+    }
+    live_.swap(staged_);
+    published_ = true;
+}
 
 // ---------------------------------------------------------------------------
 // LocalKvCache
