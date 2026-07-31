@@ -38,6 +38,14 @@ enum class Admission {
     HardRejected,
 };
 
+/// Execution shape being admitted. ``n_tokens`` is a single forward query length for
+/// prefill, but a count of sequential q=1 forwards for decode; the distinction keeps
+/// continuation-prefill-only scratch out of decode admission and telemetry.
+enum class StepKind {
+    Prefill,
+    Decode,
+};
+
 /// Governor state reported back to the caller + telemetry.
 struct GovernorDecision {
     Admission admission;
@@ -64,20 +72,25 @@ struct GovernorDecision {
 /// ```text
 /// predicted_peak = settled_working_set
 ///                + kv_append               [16 KiB/token global]
-///                + attention_transient     [per-layer-peak]
+///                + attention_transient     [SDPA outputs + continuation scratch]
 ///                + workspace + 512 MiB reserve
 /// ```
 ///
 /// where:
 ///   settled_working_set = mx::get_active_memory() + mx::get_cache_memory()
 ///   kv_append           = n_tokens * kGlobalKvBytesPerToken
-///   attention_transient = sum over layers of
-///       (q * head_dim_local  * n_heads         [sliding]
-///        q * head_dim_global * n_heads) * dtype * safety  [global]
+///   attention_transient = (sum over layers of
+///       q * head_dim_local  * n_heads * dtype  [sliding]
+///       q * head_dim_global * n_heads * dtype  [global]) * safety
+///       + one assembled local K/V buffer for continuation prefill
 ///   (the transient is the fused-SDPA OUTPUT [B, n_heads, q, head_dim] per layer —
 ///    MLX's mx::fast::scaled_dot_product_attention is a FUSED kernel that does NOT
 ///    materialize the [q, ctx] scores matrix (it streams it), so the transient is the
 ///    output buffer, scaled by num_attention_heads — the QUERY head count. The
+///    continuation-prefill path additionally assembles the retained local prefix and
+///    current chunk into bounded K and V buffers before SDPA; the governor charges one
+///    exact per-layer peak for those buffers on ``StepKind::Prefill`` when
+///    ``offset > 0 && n_tokens > 1``. The
 ///    kTransientSafety factor (1.25) covers the fused-kernel tile working set. The
 ///    M2-2.6b governor modeled the full [q, ctx] scores and over-predicted by 2.3-3.6x
 ///    (M3 calibration, benchmarks/m3/governor-calibration.json); this is the fix.)
@@ -95,11 +108,13 @@ class Governor {
 
     /// Predict admission for a prefill/decode step of ``n_tokens`` at the given
     /// committed ``offset`` (the current prefix length; 0 for a fresh prefill).
-    /// ``kvstate`` is read to compute the current local/global KV byte counts.
+    /// ``kvstate`` is read to compute the current local/global KV byte counts;
+    /// ``step_kind`` distinguishes a multi-token query from sequential q=1 decode.
     [[nodiscard]] GovernorDecision evaluate(
         std::uint32_t n_tokens,
         std::uint32_t offset,
-        const KvState& kvstate) const;
+        const KvState& kvstate,
+        StepKind step_kind) const;
 
     /// The hard ceiling this governor checks against (bytes).
     [[nodiscard]] std::uint64_t budget_ceiling_bytes() const { return budget_ceiling_bytes_; }
@@ -118,7 +133,8 @@ class Governor {
     /// Predicted attention transient for one step of ``n_tokens`` at ``offset`` (bytes).
     [[nodiscard]] std::uint64_t attention_transient(
         std::uint32_t n_tokens,
-        std::uint32_t offset) const;
+        std::uint32_t offset,
+        StepKind step_kind) const;
 };
 
 /// Compute the predicted peak for a step WITHOUT admission (for telemetry fill
@@ -127,7 +143,8 @@ class Governor {
     std::uint32_t n_tokens,
     std::uint32_t offset,
     const KvState& kvstate,
-    const Geometry& geometry);
+    const Geometry& geometry,
+    StepKind step_kind);
 
 /// The throughput-optimum context length (A4) — the context at which throughput
 /// peaks before memory pressure dominates. NOT the ceiling; the governor targets

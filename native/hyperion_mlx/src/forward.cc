@@ -35,6 +35,53 @@ mx::array read_kv_view(const mx::array& buf, std::uint32_t n, int h, int d, mx::
     return mx::transpose(r, {0, 2, 1, 3}, s);                             // [1, h, n, d]
 }
 
+/// The exact K/V-axis length consumed by attention. A multi-token continuation on a
+/// sliding layer needs the prior trailing window plus every current token so each query
+/// row can select its own causal window. Single-token decode keeps its sealed final-window
+/// axis, while offset-0 prefill and global attention keep the full committed axis.
+std::uint32_t attention_kv_len(
+    LayerType kind,
+    std::uint32_t q_len,
+    std::uint32_t offset,
+    std::uint32_t window) {
+    const std::uint32_t committed = offset + q_len;
+    if (kind != LayerType::Sliding || offset == 0) {
+        return committed;
+    }
+    if (q_len == 1) {
+        return std::min(window, committed);
+    }
+    return std::min(window, offset) + q_len;
+}
+
+/// Assemble a bounded transient ``[prior trailing prefix] + [current chunk]`` view for
+/// continuation prefill. The persistent ring remains ``window + gamma_max``; this scratch
+/// tensor is populated with slice_update so no grow-and-copy cache is introduced.
+mx::array assemble_continuation_kv(
+    const mx::array& prefix,
+    const mx::array& current,
+    int prefix_len,
+    int q_len,
+    int h,
+    int d,
+    mx::Stream s) {
+    mx::array assembled = mx::zeros({1, h, prefix_len + q_len, d}, current.dtype(), s);
+    assembled = mx::slice_update(
+        assembled,
+        prefix,
+        {0, 0, 0, 0},
+        {1, h, prefix_len, d},
+        {1, 1, 1, 1},
+        s);
+    return mx::slice_update(
+        assembled,
+        current,
+        {0, 0, prefix_len, 0},
+        {1, h, prefix_len + q_len, d},
+        {1, 1, 1, 1},
+        s);
+}
+
 } // namespace
 
 ForwardPass::ForwardPass(
@@ -383,6 +430,28 @@ ForwardPass::AttentionInternals ForwardPass::attention(
     // offset==0 SDPA read chunk-local k (not the cache) so 2.3b never exercised this.
     mx::array k_append = mx::reshape(mx::transpose(k, {0, 2, 1, 3}, stream_), {L, n_kv_heads, head_dim}, stream_);
     mx::array v_append = mx::reshape(mx::transpose(v, {0, 2, 1, 3}, stream_), {L, n_kv_heads, head_dim}, stream_);
+
+    // SDPA defaults to the current chunk. For a multi-token sliding continuation, gather
+    // the prior committed trailing window BEFORE the append can overwrite ring slots,
+    // then assemble the bounded transient prefix+chunk axis. The existing absolute-position
+    // mask bands and causal-masks that axis per query row.
+    mx::array k_attn = k;
+    mx::array v_attn = v;
+    const bool sliding_continuation_prefill =
+        ref.kind == LayerType::Sliding && offset > 0 && L > 1;
+    if (sliding_continuation_prefill) {
+        LocalKvCache& cache = kvstate.local[ref.per_kind_index];
+        const std::uint32_t prefix_len = std::min(geometry_.sliding_window, offset);
+        mx::array k_prefix = cache.read_window(
+            cache.keys(), prefix_len, n_kv_heads, head_dim, stream_);
+        mx::array v_prefix = cache.read_window(
+            cache.values(), prefix_len, n_kv_heads, head_dim, stream_);
+        k_attn = assemble_continuation_kv(
+            k_prefix, k, static_cast<int>(prefix_len), L, n_kv_heads, head_dim, stream_);
+        v_attn = assemble_continuation_kv(
+            v_prefix, v, static_cast<int>(prefix_len), L, n_kv_heads, head_dim, stream_);
+    }
+
     if (ref.kind == LayerType::Sliding) {
         LocalKvCache& cache = kvstate.local[ref.per_kind_index];
         // Direct committed append (chunked by cap internally) — replaces the gamma-
@@ -394,33 +463,24 @@ ForwardPass::AttentionInternals ForwardPass::attention(
         cache.append(k_append, v_append, static_cast<std::uint32_t>(L));
     }
 
-    // SDPA K/V: offset==0 attends over the chunk's own post-rope K/V (the 2.3b
-    // bit-exact path, UNCHANGED — do not risk the proven seal). offset>0 (decode)
-    // reads the full cached prefix INCL. this chunk's just-appended K/V from the
-    // cache buffers — the cached-prefix attention read (2.7). The sliding ring is
-    // in its linear region for pos < window (slot_for(pos) == pos); the rotation
-    // read past the window is 2.6. attn_len == committed == offset + L.
-    mx::array k_attn = k;
-    mx::array v_attn = v;
+    // offset==0 attends over the current chunk (the sealed 2.3b path). Multi-token
+    // sliding continuation already holds prior-window+chunk above. Single-token decode
+    // and global continuation retain their existing post-append cache reads.
     if (offset > 0) {
         if (ref.kind == LayerType::Sliding) {
-            LocalKvCache& cache = kvstate.local[ref.per_kind_index];
-            const std::uint32_t attn = cache.attention_len(); // == committed
-            const std::uint32_t win = geometry_.sliding_window;
-            // Sliding attention reads only the last min(window, committed) tokens.
-            // For attn <= window all committed tokens are in-window → the linear slice
-            // [0:attn] is exactly the last attn tokens (the 2.7 decode fast-path, bit-
-            // identical to read_kv_rotated for this case — keeps the 2.7 seal on the same
-            // code path, zero risk). Past the window the ring has rotated (or will, once
-            // attn > cap) → read_kv_rotated gathers the last min(window, attn) in logical
-            // order via slot_for (the 2.6 rotation read). The mask (kv_len =
-            // min(window, offset+L)) matches the read length.
-            if (attn <= win) {
-                k_attn = read_kv_view(cache.keys(), attn, n_kv_heads, head_dim, stream_);
-                v_attn = read_kv_view(cache.values(), attn, n_kv_heads, head_dim, stream_);
-            } else {
-                k_attn = cache.read_window(cache.keys(), win, n_kv_heads, head_dim, stream_);
-                v_attn = cache.read_window(cache.values(), win, n_kv_heads, head_dim, stream_);
+            if (!sliding_continuation_prefill) {
+                LocalKvCache& cache = kvstate.local[ref.per_kind_index];
+                const std::uint32_t attn = cache.attention_len(); // == committed
+                const std::uint32_t win = geometry_.sliding_window;
+                // Sealed single-token decode: for attn <= window, the linear prefix is
+                // already the final window; past it, gather the rotated final window.
+                if (attn <= win) {
+                    k_attn = read_kv_view(cache.keys(), attn, n_kv_heads, head_dim, stream_);
+                    v_attn = read_kv_view(cache.values(), attn, n_kv_heads, head_dim, stream_);
+                } else {
+                    k_attn = cache.read_window(cache.keys(), win, n_kv_heads, head_dim, stream_);
+                    v_attn = cache.read_window(cache.values(), win, n_kv_heads, head_dim, stream_);
+                }
             }
         } else {
             GlobalKvCache& cache = kvstate.global[ref.per_kind_index];
@@ -481,20 +541,19 @@ mx::array ForwardPass::forward(const mx::array& h, KvState& kvstate, std::uint32
     // The mask's kv_len must match the SDPA's K/V read length:
     //  - offset==0: the SDPA reads the chunk-local K/V (kv_len = committed = offset+L = L),
     //    for BOTH kinds (the 2.3b bit-exact path; the cache is appended but not read).
-    //  - offset>0 sliding: the cache read returns only min(window, committed) tokens.
+    //  - multi-token sliding continuation: prior min(window, offset) + all current rows.
+    //  - single-token sliding decode: the cache read returns min(window, committed).
     //  - offset>0 global: the cache read returns all committed (full causal, no window).
     // For offset==0 with L > window (a 2048-token prefill chunk) the sliding mask is
     // [L, L] with the trailing-window constraint (zeroes out-of-window) — matching the
     // chunk-local K/V of length L (NOT a window-sized slice).
     const int L = static_cast<int>(h.shape(1));
     const std::uint32_t q_len = static_cast<std::uint32_t>(L);
-    const std::uint32_t committed = offset + q_len;
     const std::uint32_t win = geometry_.sliding_window;
     mx::array state = h;
     for (std::size_t layer = 0; layer < weights_.layers.size(); ++layer) {
         const LayerType kind = dispatch_.per_layer[layer];
-        const std::uint32_t kv_len =
-            (offset > 0 && kind == LayerType::Sliding) ? std::min(win, committed) : committed;
+        const std::uint32_t kv_len = attention_kv_len(kind, q_len, offset, win);
         mx::array mask = build_mask(kind, q_len, kv_len, offset);
         state = decoder_layer(state, layer, mask, kvstate, offset);
     }
@@ -515,13 +574,11 @@ mx::array ForwardPass::forward_faulted(
     // identical to forward().
     const int L = static_cast<int>(h.shape(1));
     const std::uint32_t q_len = static_cast<std::uint32_t>(L);
-    const std::uint32_t committed = offset + q_len;
     const std::uint32_t win = geometry_.sliding_window;
     mx::array state = h;
     for (std::size_t layer = 0; layer < weights_.layers.size(); ++layer) {
         const LayerType kind = dispatch_.per_layer[layer];
-        const std::uint32_t kv_len =
-            (offset > 0 && kind == LayerType::Sliding) ? std::min(win, committed) : committed;
+        const std::uint32_t kv_len = attention_kv_len(kind, q_len, offset, win);
         mx::array mask = build_mask(kind, q_len, kv_len, offset);
         // The faulted layer's per-layer residual scale is multiplied by
         // layer_scalar_factor (the single-layer structural fault); every other layer

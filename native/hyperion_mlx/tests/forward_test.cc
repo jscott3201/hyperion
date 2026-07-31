@@ -299,6 +299,66 @@ void test_forward_parity(const std::filesystem::path& fixture, const mx::Stream&
     require(g_mask.shape(0) == 4 && g_mask.shape(1) == 16, "global mask shape [q,kv]");
 }
 
+void test_continuation_prefill_hidden_rows(const std::filesystem::path& fixture, const mx::Stream& gpu) {
+    const Geometry g = make_tiny_geometry();
+    require(!g.validate().has_value(), "continuation prefill: tiny geometry validates");
+    const auto dispatch = build_dispatch(g);
+    const mx::Stream cpu = mx::default_stream(mx::Device::cpu);
+    ModelWeights weights = load_model_weights(fixture, g, 64, 4, cpu);
+    ForwardPass fwd(g, dispatch, weights, gpu);
+
+    // Prefix 12 > window 8; appending the 8-token continuation crosses the local
+    // ring's 16-token capacity. Every continuation row must nevertheless match the
+    // corresponding row from the same 20-token sequence evaluated in one shot.
+    constexpr int kPrefix = 12;
+    constexpr int kContinuation = 8;
+    constexpr int kSequence = kPrefix + kContinuation;
+    std::vector<int32_t> host_ids;
+    host_ids.reserve(kSequence);
+    for (int i = 0; i < kSequence; ++i) {
+        host_ids.push_back((i * 17 + 7) % static_cast<int>(g.vocab_size));
+    }
+    mx::array ids = mx::array(host_ids.data(), mx::Shape{kSequence}, mx::int32);
+
+    auto one_shot_kv = build_kv_state(
+        dispatch, hyperion::model::kDefaultGammaMax, mx::bfloat16, gpu);
+    mx::array one_shot = fwd.forward(fwd.embed(ids), one_shot_kv, 0);
+
+    auto split_kv = build_kv_state(
+        dispatch, hyperion::model::kDefaultGammaMax, mx::bfloat16, gpu);
+    mx::array prefix_ids = mx::slice(ids, {0}, {kPrefix}, {1}, gpu);
+    mx::array continuation_ids = mx::slice(ids, {kPrefix}, {kSequence}, {1}, gpu);
+    mx::array prefix_hidden = fwd.forward(fwd.embed(prefix_ids), split_kv, 0);
+    mx::eval(prefix_hidden);
+    mx::array continuation = fwd.forward(
+        fwd.embed(continuation_ids), split_kv, kPrefix);
+
+    mx::array expected = mx::slice(
+        one_shot,
+        {0, kPrefix, 0},
+        {1, kSequence, static_cast<int>(g.hidden_size)},
+        {1, 1, 1},
+        gpu);
+    mx::eval(continuation);
+    mx::eval(expected);
+    mx::array abs_diff = mx::astype(
+        mx::abs(mx::subtract(continuation, expected, gpu), gpu), mx::float32, gpu);
+    mx::array max_diff = mx::max(abs_diff, gpu);
+    mx::eval(max_diff);
+    mx::synchronize(gpu);
+
+    constexpr float kRtol = 1e-2F;
+    constexpr float kAtol = 1e-2F;
+    const float observed_max_diff = max_diff.item<float>();
+    require(
+        allclose(continuation, expected, gpu, kRtol, kAtol),
+        "continuation prefill: all 8 final-normalized hidden rows match one-shot suffix "
+        "(rtol=1e-2, atol=1e-2; max |delta|=" + std::to_string(observed_max_diff) + ")");
+    std::cerr << "forward_test: continuation prefill all hidden rows match one-shot suffix "
+              << "(offset 12, q_len 8, window 8, ring cap 16; max |delta|="
+              << observed_max_diff << ")\n";
+}
+
 void test_abi_load(const std::filesystem::path& fixture, const mx::Stream& gpu) {
     // The real hyp_model_load + hyp_prefill_chunk + hyp_decode_block path on the tiny
     // fixture (M2-2.7): single-chunk prefill → first token; decode 1 → next token. The
@@ -349,9 +409,19 @@ void test_abi_load(const std::filesystem::path& fixture, const mx::Stream& gpu) 
     HypStepResultFields dc = hyperion::model::step_result_read(result);
     require(dc.token_id < g.vocab_size, "decode token within vocab");
 
+    // A multi-token decode block is a sequence of q=1 forwards, not a continuation
+    // prefill query. Exercise the public ABI shape so governor step-kind routing cannot
+    // silently regress back to charging continuation-prefill scratch.
+    require(
+        hyp_decode_block(model, kv, 2, result) == HYP_STATUS_OK,
+        "hyp_decode_block succeeds for a sequential multi-token block");
+    HypStepResultFields dc_block = hyperion::model::step_result_read(result);
+    require(dc_block.token_id < g.vocab_size, "multi-token decode token within vocab");
+
     std::cerr << "forward_test: ABI prefill+decode OK on the tiny fixture "
               << "(prefill token " << pf.token_id << " == ref " << ref_tok
               << "; decode token " << dc.token_id
+              << "; block decode token " << dc_block.token_id
               << "; near_tie_events=" << dc.near_tie_events << ")\n";
 
     require(hyp_step_result_free(&result) == HYP_STATUS_OK, "step result free");
@@ -574,6 +644,7 @@ int main() {
         try {
             const mx::Stream gpu = mx::new_stream(mx::Device::gpu);
             test_forward_parity(fixture, gpu);
+            test_continuation_prefill_hidden_rows(fixture, gpu);
             test_abi_load(fixture, gpu);
             test_abi_sampler_validation(fixture, gpu);
             test_abi_chunked_prefill(fixture, gpu);
@@ -588,6 +659,7 @@ int main() {
     try {
         const mx::Stream gpu = mx::new_stream(mx::Device::gpu);
         test_forward_parity(fixture, gpu);
+        test_continuation_prefill_hidden_rows(fixture, gpu);
         test_abi_load(fixture, gpu);
         test_abi_sampler_validation(fixture, gpu);
         test_abi_chunked_prefill(fixture, gpu);
