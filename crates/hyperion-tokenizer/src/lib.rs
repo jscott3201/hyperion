@@ -18,6 +18,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use tokenizers::Tokenizer;
+use tokenizers::tokenizer::step_decode_stream;
+
+const MAX_RETAINED_TOKEN_IDS: usize = 256;
+const MAX_RETAINED_TEXT_BYTES: usize = 64 * 1024;
 
 /// Stable description of the tokenizer execution boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,6 +59,101 @@ pub enum TokenizerError {
     Load(String),
     Encode(String),
     Decode(String),
+}
+
+/// Whether incremental decoding omits or retains added special-token text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpecialTokenPolicy {
+    /// Omit added special tokens such as EOS from decoded output.
+    Skip,
+    /// Retain added special tokens exactly as the tokenizer decodes them.
+    Preserve,
+}
+
+impl SpecialTokenPolicy {
+    const fn skip_special_tokens(self) -> bool {
+        matches!(self, Self::Skip)
+    }
+}
+
+/// Per-response incremental decoder with explicitly bounded retained state.
+///
+/// The underlying tokenizer needs a short token/prefix history to preserve
+/// whitespace and assemble byte-fallback UTF-8. This wrapper owns that state,
+/// caps it, and supplies the EOF flush that the dependency does not expose.
+pub struct StreamingDecoder {
+    tokenizer: Arc<Tokenizer>,
+    skip_special_tokens: bool,
+    ids: Vec<u32>,
+    prefix: String,
+    prefix_index: usize,
+}
+
+impl StreamingDecoder {
+    /// Push one generated token ID, returning only newly safe decoded text.
+    pub fn push(&mut self, id: u32) -> Result<Option<String>, TokenizerError> {
+        if self.ids.len() >= MAX_RETAINED_TOKEN_IDS {
+            return Err(TokenizerError::Decode(format!(
+                "streaming decoder retained token limit exceeded (maximum {MAX_RETAINED_TOKEN_IDS})"
+            )));
+        }
+
+        // Advance transactionally so an error or bound violation cannot leave
+        // the public decoder in an over-limit or partially-mutated state.
+        let mut ids = self.ids.clone();
+        let mut prefix = self.prefix.clone();
+        let mut prefix_index = self.prefix_index;
+        let fragment = step_decode_stream(
+            &self.tokenizer,
+            vec![id],
+            self.skip_special_tokens,
+            &mut ids,
+            &mut prefix,
+            &mut prefix_index,
+        )
+        .map_err(|e| TokenizerError::Decode(e.to_string()))?;
+
+        if ids.len() > MAX_RETAINED_TOKEN_IDS {
+            return Err(TokenizerError::Decode(format!(
+                "streaming decoder retained token limit exceeded (maximum {MAX_RETAINED_TOKEN_IDS})"
+            )));
+        }
+        if prefix.len() > MAX_RETAINED_TEXT_BYTES {
+            return Err(TokenizerError::Decode(format!(
+                "streaming decoder retained text limit exceeded (maximum {MAX_RETAINED_TEXT_BYTES} bytes)"
+            )));
+        }
+
+        self.ids = ids;
+        self.prefix = prefix;
+        self.prefix_index = prefix_index;
+        Ok(fragment)
+    }
+
+    /// Finish a successful response and emit its unresolved EOF suffix once.
+    ///
+    /// The consuming API makes repeat finish impossible:
+    ///
+    /// ```compile_fail
+    /// fn finish_twice(decoder: hyperion_tokenizer::StreamingDecoder) {
+    ///     let _ = decoder.finish();
+    ///     let _ = decoder.finish();
+    /// }
+    /// ```
+    pub fn finish(self) -> Result<String, TokenizerError> {
+        let decoded = self
+            .tokenizer
+            .decode(&self.ids, self.skip_special_tokens)
+            .map_err(|e| TokenizerError::Decode(e.to_string()))?;
+        decoded
+            .strip_prefix(&self.prefix)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                TokenizerError::Decode(
+                    "streaming decoder EOF output did not match emitted prefix".to_string(),
+                )
+            })
+    }
 }
 
 impl std::fmt::Display for TokenizerError {
@@ -104,12 +203,23 @@ impl TokenizerHandle {
         }
     }
 
-    /// Decode token ids back to text (the Sequence decoder: Replace ▁→space, ByteFallback,
-    /// Fuse). For the SPM no-space streaming detokenizer (decode parity), defer to a
-    /// follow-up slice.
+    /// Decode a complete token-ID buffer back to text while omitting added
+    /// special tokens. Incremental callers use [`Self::streaming_decoder`].
     #[must_use]
     pub fn decode(&self, ids: &[u32]) -> String {
         self.inner.decode(ids, true).unwrap_or_default()
+    }
+
+    /// Create one bounded incremental decoder for a generated response.
+    #[must_use]
+    pub fn streaming_decoder(&self, policy: SpecialTokenPolicy) -> StreamingDecoder {
+        StreamingDecoder {
+            tokenizer: self.inner.clone(),
+            skip_special_tokens: policy.skip_special_tokens(),
+            ids: Vec::new(),
+            prefix: String::new(),
+            prefix_index: 0,
+        }
     }
 
     /// The vocab size (incl. added tokens).
@@ -136,13 +246,181 @@ impl TokenizerHandle {
 
 #[cfg(test)]
 mod tests {
+    use tokenizers::AddedToken;
+    use tokenizers::decoders::byte_fallback::ByteFallback;
+    use tokenizers::models::bpe::{BPE, Vocab};
+    use tokenizers::models::wordlevel::WordLevel;
+
     use super::*;
+
+    fn handle(inner: Tokenizer) -> TokenizerHandle {
+        let vocab_size = inner.get_vocab_size(true);
+        TokenizerHandle {
+            inner: Arc::new(inner),
+            vocab_size,
+        }
+    }
+
+    fn word_level(tokens: &[(&str, u32)]) -> TokenizerHandle {
+        let vocab = tokens
+            .iter()
+            .map(|(token, id)| ((*token).to_string(), *id))
+            .chain(std::iter::once(("[UNK]".to_string(), 10_000)))
+            .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".to_string())
+            .build()
+            .expect("WordLevel model builds");
+        handle(Tokenizer::new(model))
+    }
+
+    fn byte_fallback(tokens: &[(&str, u32)]) -> TokenizerHandle {
+        let vocab = tokens
+            .iter()
+            .map(|(token, id)| ((*token).to_string(), *id))
+            .collect::<Vocab>();
+        let model = BPE::builder()
+            .vocab_and_merges(vocab, Vec::new())
+            .byte_fallback(true)
+            .build()
+            .expect("byte-fallback BPE builds");
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_decoder(Some(ByteFallback::default()));
+        handle(tokenizer)
+    }
+
+    fn collect_stream(
+        tokenizer: &TokenizerHandle,
+        ids: &[u32],
+        policy: SpecialTokenPolicy,
+    ) -> Result<String, TokenizerError> {
+        let mut decoder = tokenizer.streaming_decoder(policy);
+        let mut output = String::new();
+        for id in ids {
+            if let Some(fragment) = decoder.push(*id)? {
+                output.push_str(&fragment);
+            }
+        }
+        output.push_str(&decoder.finish()?);
+        Ok(output)
+    }
 
     #[test]
     fn request_path_has_no_python_backend() {
         let contract = contract();
         assert!(contract.in_process);
         assert!(!contract.python_request_path);
+    }
+
+    #[test]
+    fn streaming_matches_one_shot_multi_token_whitespace() {
+        let tokenizer = word_level(&[("hello", 2), ("world", 3)]);
+        let ids = [2, 3];
+        assert_eq!(tokenizer.inner.decode(&ids, true).unwrap(), "hello world");
+        assert_eq!(
+            collect_stream(&tokenizer, &ids, SpecialTokenPolicy::Skip).unwrap(),
+            tokenizer.inner.decode(&ids, true).unwrap()
+        );
+    }
+
+    #[test]
+    fn streaming_assembles_split_byte_fallback_scalar() {
+        let tokenizer = byte_fallback(&[("<0xE5>", 0), ("<0x8F>", 1), ("<0xAB>", 2)]);
+        let mut decoder = tokenizer.streaming_decoder(SpecialTokenPolicy::Skip);
+        assert_eq!(decoder.push(0).unwrap(), None);
+        assert_eq!(decoder.push(1).unwrap(), None);
+        assert_eq!(decoder.push(2).unwrap().as_deref(), Some("叫"));
+        assert_eq!(decoder.finish().unwrap(), "");
+        assert_eq!(tokenizer.inner.decode(&[0, 1, 2], true).unwrap(), "叫");
+    }
+
+    #[test]
+    fn special_token_policies_are_explicit_and_ordered() {
+        let tokenizer = word_level(&[
+            ("hello", 0),
+            ("<|tool_call>", 1),
+            ("<|\"|>", 2),
+            ("<tool_call|>", 3),
+            ("world", 4),
+        ]);
+        // Rebuild with the marked special-token vocabulary because the handle
+        // intentionally shares its tokenizer through Arc in production.
+        let mut inner = tokenizer.inner.as_ref().clone();
+        inner
+            .add_special_tokens([
+                AddedToken::from("<|tool_call>", true),
+                AddedToken::from("<|\"|>", true),
+                AddedToken::from("<tool_call|>", true),
+            ])
+            .expect("special tokens register");
+        let tokenizer = handle(inner);
+
+        let ids = [0, 1, 2, 3, 4];
+        assert_eq!(
+            collect_stream(&tokenizer, &ids, SpecialTokenPolicy::Preserve).unwrap(),
+            "hello <|tool_call> <|\"|> <tool_call|> world"
+        );
+        assert_eq!(
+            collect_stream(&tokenizer, &ids, SpecialTokenPolicy::Skip).unwrap(),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn finish_is_lossless_for_incomplete_fallback_and_empty_generation() {
+        let tokenizer = byte_fallback(&[("<0xE5>", 0), ("hello", 1)]);
+        let mut incomplete = tokenizer.streaming_decoder(SpecialTokenPolicy::Skip);
+        assert_eq!(incomplete.push(0).unwrap(), None);
+        assert_eq!(incomplete.finish().unwrap(), "�");
+
+        let empty = tokenizer.streaming_decoder(SpecialTokenPolicy::Skip);
+        assert_eq!(empty.finish().unwrap(), "");
+    }
+
+    #[test]
+    fn finish_does_not_duplicate_prior_fragments() {
+        let tokenizer = byte_fallback(&[("hello", 0), ("<0xE5>", 1)]);
+        let mut decoder = tokenizer.streaming_decoder(SpecialTokenPolicy::Skip);
+        assert_eq!(decoder.push(0).unwrap().as_deref(), Some("hello"));
+        assert_eq!(decoder.push(1).unwrap(), None);
+        assert_eq!(decoder.finish().unwrap(), "�");
+        // `finish` consumes the decoder, so a second finish is impossible.
+    }
+
+    #[test]
+    fn unresolved_token_state_stops_at_hard_limit() {
+        let tokenizer = byte_fallback(&[("<0xE5>", 0)]);
+        let mut decoder = tokenizer.streaming_decoder(SpecialTokenPolicy::Skip);
+        for _ in 0..MAX_RETAINED_TOKEN_IDS {
+            assert_eq!(decoder.push(0).unwrap(), None);
+        }
+        let error = decoder.push(0).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "decode error: streaming decoder retained token limit exceeded (maximum 256)"
+        );
+        assert_eq!(decoder.ids.len(), MAX_RETAINED_TOKEN_IDS);
+    }
+
+    #[test]
+    fn retained_text_state_stops_at_hard_limit() {
+        let at_limit = "x".repeat(MAX_RETAINED_TEXT_BYTES);
+        let over_limit = "y".repeat(MAX_RETAINED_TEXT_BYTES + 1);
+        let tokenizer = word_level(&[(&at_limit, 0), (&over_limit, 1)]);
+
+        let mut exact = tokenizer.streaming_decoder(SpecialTokenPolicy::Skip);
+        assert_eq!(exact.push(0).unwrap().as_deref(), Some(at_limit.as_str()));
+        assert_eq!(exact.prefix.len(), MAX_RETAINED_TEXT_BYTES);
+
+        let mut over = tokenizer.streaming_decoder(SpecialTokenPolicy::Skip);
+        let error = over.push(1).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "decode error: streaming decoder retained text limit exceeded (maximum 65536 bytes)"
+        );
+        assert!(over.ids.is_empty());
+        assert!(over.prefix.is_empty());
     }
 
     /// The in-process tokenizer parity seal against the REAL 12B (M5-gated). The 12B's

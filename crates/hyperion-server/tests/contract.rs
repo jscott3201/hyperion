@@ -107,6 +107,23 @@ fn fresh_control() -> ControlState {
     c
 }
 
+fn streamed_text(body: &str, dialect: &str) -> String {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .filter_map(|value| match dialect {
+            "anthropic" if value["type"] == "content_block_delta" => {
+                value["delta"]["text"].as_str().map(str::to_owned)
+            }
+            "openai" => value["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(str::to_owned),
+            _ => None,
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn bind_gate_refuses_non_loopback_without_token() {
     let addr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
@@ -650,6 +667,126 @@ async fn streaming_emits_raw_sse_bytes_openai_done() {
     assert!(
         body.contains("\"delta\":{\"content\""),
         "OpenAI delta chunk: {body}"
+    );
+}
+
+#[tokio::test]
+async fn streaming_and_non_streaming_share_incremental_decode_semantics() {
+    let control = fresh_control();
+    let srv = test_server(
+        StubEngine {
+            tokens: vec![2, 3],
+            block_after: None,
+        },
+        None,
+        4096,
+        &control,
+    );
+
+    let (status, non_streaming) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":false}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let response: serde_json::Value = serde_json::from_str(&non_streaming).unwrap();
+    let expected = response["content"][0]["text"].as_str().unwrap();
+    assert_eq!(expected, "hello world");
+
+    let (status, anthropic) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(streamed_text(&anthropic, "anthropic"), expected);
+
+    let (status, openai) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/chat/completions",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(streamed_text(&openai, "openai"), expected);
+}
+
+#[tokio::test]
+async fn streaming_decoder_failure_is_one_opaque_error_without_terminal_frame() {
+    let control = fresh_control();
+    let srv = test_server(
+        StubEngine {
+            // Unknown IDs decode to no text in the fixture tokenizer, creating
+            // an adversarial unresolved run that exceeds the 256-ID ceiling.
+            tokens: vec![99_999; 257],
+            block_after: None,
+        },
+        None,
+        4096,
+        &control,
+    );
+    let (status, body) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":300,"stream":true}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "SSE headers are already committed");
+    assert_eq!(body.matches("event: error\n").count(), 1, "{body}");
+    assert_eq!(body.matches("internal server error").count(), 1, "{body}");
+    assert!(
+        !body.contains("message_delta"),
+        "no successful terminal: {body}"
+    );
+    assert!(
+        !body.contains("message_stop"),
+        "no successful terminal: {body}"
+    );
+    assert!(
+        !body.contains("retained token limit"),
+        "details stay opaque: {body}"
+    );
+}
+
+#[tokio::test]
+async fn non_streaming_decoder_failure_uses_opaque_dialect_envelope() {
+    let control = fresh_control();
+    let srv = test_server(
+        StubEngine {
+            tokens: vec![99_999; 257],
+            block_after: None,
+        },
+        None,
+        4096,
+        &control,
+    );
+    let (status, body) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/chat/completions",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":300,"stream":false}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(response["error"]["type"], "internal_server_error");
+    assert_eq!(response["error"]["message"], "internal server error");
+    assert!(
+        !body.contains("retained token limit"),
+        "details stay opaque: {body}"
     );
 }
 

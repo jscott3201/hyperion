@@ -1,8 +1,9 @@
 //! B5: the pure dialect SSE framers (06 §Streaming). Real token-incremental
-//! SSE — one frame per decode step, flushed immediately (the spec bans Helios's
-//! 3-frame post-hoc "streaming"). Both framers are **pure functions**: given a
-//! [`StepEvent`] (or an error mid-stream), produce the exact SSE bytes for
-//! the dialect. The handler flushes each frame as the engine yields it.
+//! SSE — one frame per safely decoded text fragment, flushed immediately (the
+//! spec bans post-hoc "streaming"). Both framers are **pure functions**: given
+//! decoded text (or an error mid-stream), produce the exact SSE bytes for the
+//! dialect. The response decoder may briefly withhold an incomplete byte
+//! fallback sequence until it can emit valid text.
 //!
 //! - **Anthropic**: the event sequence `message_start` →
 //!   `content_block_start` → `content_block_delta` (text_delta per step) →
@@ -13,13 +14,13 @@
 //! - **529 mid-stream**: once headers are flushed (200 OK sent), a governor
 //!   rejection becomes an SSE `error` event, NOT an HTTP status change.
 //!
-//! The framers track just enough state (the content-block index, the
-//! running usage) to emit well-formed sequences. The handler owns the
-//! [`Framer`] and calls [`Framer::token`] per step + [`Framer::done`] (or
+//! The framers track just enough state (the content-block index and response
+//! metadata) to emit well-formed sequences. The handler owns the
+//! [`Framer`] and calls [`Framer::text`] for each safe decoded fragment + [`Framer::done`] (or
 //! [`Framer::error`]) at the end.
 
 use crate::dialect::Dialect;
-use crate::engine::{StepToken, Usage};
+use crate::engine::Usage;
 
 /// A stop reason for the terminal Anthropic `message_delta` / OpenAI `finish`
 /// field.
@@ -55,16 +56,14 @@ impl StopReason {
     }
 }
 
-/// The SSE framer state. Owns the dialect + the running token count + the
-/// content-block index. The handler drives it: `start` → `token` × n →
+/// The SSE framer state. Owns the dialect, model metadata, and content-block
+/// index. The handler drives it: `start` → `text` × n →
 /// `done`/`error`.
 pub struct Framer {
     dialect: Dialect,
     /// True after the opening frames (`message_start` / the first chunk's
     /// role) have been emitted.
     started: bool,
-    /// The running completion-token count (for the terminal usage frame).
-    completion_tokens: u32,
     /// The prompt token count (set at start, for the terminal usage frame).
     prompt_tokens: u32,
     /// A model id echoed in the frames (e.g. "gemma4-12b").
@@ -79,7 +78,6 @@ impl Framer {
         Self {
             dialect,
             started: false,
-            completion_tokens: 0,
             prompt_tokens,
             model: model.to_string(),
         }
@@ -119,15 +117,11 @@ impl Framer {
         }
     }
 
-    /// Emit one token delta. For Anthropic a `content_block_delta` (text_delta);
-    /// for OpenAI a `choices[0].delta.content` chunk. The token's **decoded
-    /// text** is passed in (`text`) — the engine emits token ids; the handler
-    /// decodes via the tokenizer it holds, then frames. Returns the SSE bytes
-    /// to flush. The `StepToken` is carried for telemetry (the logit) but the
-    /// frame content is the decoded text.
+    /// Emit one safe decoded-text fragment. For Anthropic this is a
+    /// `content_block_delta` (`text_delta`); for OpenAI it is a
+    /// `choices[0].delta.content` chunk.
     #[must_use]
-    pub fn token(&mut self, _token: StepToken, text: &str) -> String {
-        self.completion_tokens += 1;
+    pub fn text(&mut self, text: &str) -> String {
         match self.dialect {
             Dialect::Anthropic => {
                 let delta = serde_json::json!({
@@ -245,8 +239,8 @@ mod tests {
     fn anthropic_sequence_is_well_formed() {
         let mut f = Framer::new(Dialect::Anthropic, "gemma4-12b", 2);
         let mut out = f.start();
-        out.push_str(&f.token(StepToken { id: 7, logit: 0.0 }, "Hel"));
-        out.push_str(&f.token(StepToken { id: 3, logit: 0.0 }, "lo"));
+        out.push_str(&f.text("Hel"));
+        out.push_str(&f.text("lo"));
         out.push_str(&f.done(
             Usage {
                 prompt_tokens: 2,
@@ -275,7 +269,7 @@ mod tests {
         let mut f = Framer::new(Dialect::OpenAi, "gemma4-12b", 2);
         let mut out = f.start(); // empty for OpenAI
         assert!(out.is_empty(), "OpenAI emits no start frame");
-        out.push_str(&f.token(StepToken { id: 7, logit: 0.0 }, "Hi"));
+        out.push_str(&f.text("Hi"));
         out.push_str(&f.done(
             Usage {
                 prompt_tokens: 2,
@@ -321,7 +315,7 @@ mod tests {
     fn text_is_json_escaped() {
         // A token with a quote/newline must be escaped, not emitted raw.
         let mut f = Framer::new(Dialect::Anthropic, "m", 1);
-        let out = f.token(StepToken { id: 1, logit: 0.0 }, "a\"b\n");
+        let out = f.text("a\"b\n");
         assert!(
             out.contains("\"text\":\"a\\\"b\\n\""),
             "raw quote/newline must be escaped: {out}"

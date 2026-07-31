@@ -23,8 +23,8 @@ use axum::{Json, Router};
 use bytes::Bytes;
 use tokio::sync::Semaphore;
 
-use hyperion_tokenizer::TokenizerHandle;
 use hyperion_tokenizer::renderer::ChatTemplate;
+use hyperion_tokenizer::{SpecialTokenPolicy, TokenizerError, TokenizerHandle};
 
 use crate::auth::{AuthError, verify_bearer};
 use crate::control::{ControlState, ReloadVerdict};
@@ -93,7 +93,7 @@ pub struct ServerConfig {
     pub engine: Arc<dyn EngineDriver>,
     /// The compiled chat template (renders both dialects' messages).
     pub template: ChatTemplate,
-    /// The in-process tokenizer (encode the rendered prompt; decode each step).
+    /// The in-process tokenizer (encode the prompt; incrementally decode the response).
     pub tokenizer: TokenizerHandle,
     /// The ops state (health/stats/reload/shutdown counters).
     pub control: ControlState,
@@ -236,6 +236,13 @@ fn engine_error_response(err: EngineError, dialect: Dialect) -> Response {
     let body = ErrorEnvelope::new(status, message).to_json(dialect);
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (code, body).into_response()
+}
+
+/// Map a tokenizer failure to the dialect's opaque internal-error envelope.
+fn tokenizer_error_response(err: &TokenizerError, dialect: Dialect) -> Response {
+    eprintln!("response decoder failed: {err}");
+    let body = ErrorEnvelope::new(500, err.to_string()).to_json(dialect);
+    (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────
@@ -453,13 +460,26 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
             // empty for OpenAI). `start` is a complete SSE chunk.
             yield Ok::<Bytes, Infallible>(Bytes::from(framer.start()));
             let mut usage = Usage { prompt_tokens, completion_tokens: 0 };
+            let mut decoder = Some(tokenizer.streaming_decoder(SpecialTokenPolicy::Skip));
             let mut rx = rx;
             while let Some(event) = rx.recv().await {
                 match event {
                     StepEvent::Token(t) => {
-                        let piece = tokenizer.decode(&[t.id]);
-                        let frame = framer.token(t, &piece);
-                        yield Ok(Bytes::from(frame));
+                        if let Some(active_decoder) = decoder.as_mut() {
+                            match active_decoder.push(t.id) {
+                                Ok(Some(fragment)) if !fragment.is_empty() => {
+                                    let frame = framer.text(&fragment);
+                                    yield Ok(Bytes::from(frame));
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    eprintln!("response decoder failed: {error}");
+                                    decoder = None;
+                                    let frame = framer.error(500, "internal server error");
+                                    yield Ok(Bytes::from(frame));
+                                }
+                            }
+                        }
                     }
                     StepEvent::Done(u) => usage = u,
                 }
@@ -472,10 +492,24 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
                 },
             )));
             match result {
+                _ if decoder.is_none() => {}
                 Ok(_) => {
-                    let stop = stop_reason(&usage, &request_for_stream, false);
-                    let frame = framer.done(usage, stop);
-                    yield Ok(Bytes::from(frame));
+                    match decoder.take().expect("decoder checked as present").finish() {
+                        Ok(fragment) => {
+                            if !fragment.is_empty() {
+                                let frame = framer.text(&fragment);
+                                yield Ok(Bytes::from(frame));
+                            }
+                            let stop = stop_reason(&usage, &request_for_stream, false);
+                            let frame = framer.done(usage, stop);
+                            yield Ok(Bytes::from(frame));
+                        }
+                        Err(error) => {
+                            eprintln!("response decoder failed at EOF: {error}");
+                            let frame = framer.error(500, "internal server error");
+                            yield Ok(Bytes::from(frame));
+                        }
+                    }
                 }
                 Err(EngineError::Native(n)) if n.status.http_status_code() == 529 => {
                     // 529 mid-stream: an SSE error event, NOT an HTTP change
@@ -511,12 +545,22 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
         // Non-streaming: collect all tokens, then build a single JSON response.
         let mut text = String::new();
         let mut usage = Usage::default();
+        let mut decoder = Some(srv.tokenizer.streaming_decoder(SpecialTokenPolicy::Skip));
+        let mut decoder_error = None;
         let mut rx = rx;
         while let Some(event) = rx.recv().await {
             match event {
                 StepEvent::Token(t) => {
-                    let piece = srv.tokenizer.decode(&[t.id]);
-                    text.push_str(&piece);
+                    if let Some(active_decoder) = decoder.as_mut() {
+                        match active_decoder.push(t.id) {
+                            Ok(Some(fragment)) => text.push_str(&fragment),
+                            Ok(None) => {}
+                            Err(error) => {
+                                decoder = None;
+                                decoder_error = Some(error);
+                            }
+                        }
+                    }
                 }
                 StepEvent::Done(u) => usage = u,
             }
@@ -534,12 +578,22 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
                     status: hyperion_ffi::Status::Internal,
                     message: "engine task failed".into(),
                 })));
-        match engine_result {
-            Ok(_) => {
-                let stop = stop_reason(&usage, &request, false);
-                non_streaming_json(dialect, &srv.model_id, &text, usage, stop)
+        match (engine_result, decoder_error) {
+            (_, Some(error)) => tokenizer_error_response(&error, dialect),
+            (Ok(_), None) => {
+                match decoder
+                    .expect("decoder remains present without a decoder error")
+                    .finish()
+                {
+                    Ok(fragment) => {
+                        text.push_str(&fragment);
+                        let stop = stop_reason(&usage, &request, false);
+                        non_streaming_json(dialect, &srv.model_id, &text, usage, stop)
+                    }
+                    Err(error) => tokenizer_error_response(&error, dialect),
+                }
             }
-            Err(e) => engine_error_response(e, dialect),
+            (Err(error), None) => engine_error_response(error, dialect),
         }
     }
 }
