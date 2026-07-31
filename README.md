@@ -155,6 +155,7 @@ Real-model and benchmark gates are intentionally separate from ordinary pull-req
 | [`docs/decisions/`](docs/decisions/) | Numbered architectural decision records |
 | [`benchmarks/BENCHMARKS.md`](benchmarks/BENCHMARKS.md) | Append-only evidence ledger; only `MEASURED` rows support benchmark claims |
 | [`artifacts/models/MANIFEST.md`](artifacts/models/MANIFEST.md) | Pinned model revisions, hashes, conversion identity, sizes, and license reviews |
+| [`PROVENANCE.md`](PROVENANCE.md) | First-party lineage and file-specific fixture licensing |
 
 ## Contributing
 
@@ -171,7 +172,9 @@ Unless otherwise noted, Hyperion's project-authored source code and documentatio
 available under either the [MIT License](LICENSE-MIT) or the
 [Apache License 2.0](LICENSE-APACHE), at your option.
 
-This repository does not bundle or relicense Gemma model weights. Model artifacts and
-third-party dependencies remain governed by their own terms; review the pinned model card and
-preserve any applicable license or notice material before redistribution. Hyperion is not
-affiliated with or endorsed by Google, Apple, or the MLX project.
+This repository does not bundle or relicense Gemma model weights. The four small
+real-model-derived oracle fixtures are Apache-2.0-only and documented in
+[`PROVENANCE.md`](PROVENANCE.md); model artifacts and third-party dependencies remain governed
+by their own terms. Review the pinned model card and preserve applicable license or notice
+material before redistribution. Hyperion is not affiliated with or endorsed by Google, Apple,
+or the MLX project.

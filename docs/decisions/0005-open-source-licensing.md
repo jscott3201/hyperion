@@ -19,8 +19,9 @@ can actually license.
 
 ## Decision
 
-Unless a file says otherwise, Hyperion-authored source code and documentation are offered
-under either of these licenses, at the recipient's option:
+Unless a file says otherwise, first-party source code and documentation owned by Justin Scott
+are offered under either of these licenses, at the recipient's option. This includes material
+reused or adapted from his earlier Helios and mlx-bonsai prototypes:
 
 - the MIT License in `LICENSE-MIT`; or
 - the Apache License, Version 2.0, in `LICENSE-APACHE`.
@@ -33,17 +34,19 @@ workspace crate continues to inherit it.
 This project license does **not** relicense model checkpoints, converted weight artifacts,
 third-party dependencies, evaluation data, or future imported source. Those materials retain
 their own terms. Model payloads remain gitignored; the tracked artifact manifest records the
-reviewed license frontmatter and immutable revision for each checkpoint. Any future source-
-level adoption must preserve applicable copyright, license, attribution, and NOTICE material
-before it is merged or redistributed.
+reviewed license frontmatter and immutable revision for each checkpoint. Four committed
+real-model-derived oracle fixtures are Apache-2.0-only and identified in `PROVENANCE.md` and
+their directory-level notice. Any future source-level adoption must preserve applicable
+copyright, license, attribution, and NOTICE material before it is merged or redistributed.
 
 ## Consequences
 
 - The public README links both complete license texts and states the model/dependency boundary.
 - O-2 is closed as a ruled owner decision: public source, dual licensed at the user's option.
-- No project `NOTICE` file is created now because the repository does not currently carry
-  imported NOTICE content. If that changes, notice handling becomes part of the adopting
-  change's acceptance gate.
+- No project `NOTICE` file is created now because neither predecessor is third-party material
+  and the reviewed model snapshot does not include an upstream `NOTICE`. The narrower fixture
+  terms and attribution are recorded in `PROVENANCE.md` and the fixture-directory sidecar.
+  If imported NOTICE content appears later, notice handling becomes part of that change's gate.
 - Binary or packaged distributions need a fresh third-party license and notice audit; this
   ADR covers the repository's project-authored source and documentation, not a future bundle.
 
