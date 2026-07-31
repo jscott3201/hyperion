@@ -62,15 +62,14 @@ const BODY_LIMIT: usize = 32 * 1024 * 1024;
 /// each hold one reference, so single-flight cannot release until both the
 /// response lifetime and detached engine cleanup have ended.
 struct GenerationLease {
-    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
     control: ControlState,
 }
 
 impl Drop for GenerationLease {
     fn drop(&mut self) {
-        // Release the semaphore before advertising idle so a new request
-        // cannot observe `in_flight=false` while single-flight is still held.
-        drop(self.permit.take());
+        // Clear the old state while its permit still excludes a new request.
+        // The permit is released after this drop method returns.
         self.control.set_in_flight(false);
     }
 }
@@ -428,7 +427,7 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
     srv.control.set_in_flight(true);
     let cancel = CancelToken::new();
     let lease = Arc::new(GenerationLease {
-        permit: Some(permit),
+        _permit: permit,
         control: srv.control.clone(),
     });
     let guard = Guard {
