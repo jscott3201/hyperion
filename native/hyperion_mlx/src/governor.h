@@ -19,9 +19,8 @@ using hyperion::model::KvState;
 /// that MLX does not attribute to get_active_memory / get_cache_memory.
 inline constexpr std::uint64_t kWorkspaceReserveBytes = 512ULL * 1024ULL * 1024ULL;
 
-/// KV append growth per global token (bytes). The global cache stores K and V
-/// separately (M2-2.7 fix), each [num_kv_heads_global, head_dim_global] bf16 = 2 bytes.
-/// 16 KiB/token is the documented per-token global KV cost (05 §KV-and-memory).
+/// Planning/throughput global KV cost per logical token. Admission derives actual
+/// capacity-stepped allocation from the live cache geometry instead.
 inline constexpr std::uint64_t kGlobalKvBytesPerToken = 16 * 1024;
 
 /// Sentinel context lengths for the G4 peak-≤-budget gate (tokens).
@@ -71,18 +70,21 @@ struct GovernorDecision {
 ///
 /// ```text
 /// predicted_peak = settled_working_set
-///                + kv_append               [16 KiB/token global]
+///                + kv_reallocation_peak    [full replacement buffers on growth]
 ///                + attention_transient     [SDPA outputs + continuation scratch]
 ///                + workspace + 512 MiB reserve
 /// ```
 ///
 /// where:
 ///   settled_working_set = mx::get_active_memory() + mx::get_cache_memory()
-///   kv_append           = n_tokens * kGlobalKvBytesPerToken
+///   kv_reallocation_peak = full projected K+V bytes for each growing prefill cache,
+///       or the sum of every crossed replacement capacity for sequential decode
 ///   attention_transient = (sum over layers of
 ///       q * head_dim_local  * n_heads * dtype  [sliding]
 ///       q * head_dim_global * n_heads * dtype  [global]) * safety
 ///       + one assembled local K/V buffer for continuation prefill
+///   q = n_tokens for the one-shot prefill forward, or min(n_tokens, 1) for the
+///       peak of sequential q=1 decode forwards
 ///   (the transient is the fused-SDPA OUTPUT [B, n_heads, q, head_dim] per layer —
 ///    MLX's mx::fast::scaled_dot_product_attention is a FUSED kernel that does NOT
 ///    materialize the [q, ctx] scores matrix (it streams it), so the transient is the
@@ -128,13 +130,6 @@ class Governor {
 
     /// Current local KV bytes (sum of all LocalKvCache buffers, bf16).
     [[nodiscard]] std::uint64_t local_kv_bytes(const KvState& kvstate) const;
-    /// Current global KV bytes (sum of all GlobalKvCache buffers, bf16).
-    [[nodiscard]] std::uint64_t global_kv_bytes(const KvState& kvstate) const;
-    /// Predicted attention transient for one step of ``n_tokens`` at ``offset`` (bytes).
-    [[nodiscard]] std::uint64_t attention_transient(
-        std::uint32_t n_tokens,
-        std::uint32_t offset,
-        StepKind step_kind) const;
 };
 
 /// Compute the predicted peak for a step WITHOUT admission (for telemetry fill
