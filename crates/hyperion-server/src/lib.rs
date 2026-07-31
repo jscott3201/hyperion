@@ -14,6 +14,8 @@
 //!   OpenAI chunked + `[DONE]`) + the 529 mid-stream error event (B5).
 //! - [`control`] — the `/control` ops surface (health/stats/reload+409/
 //!   shutdown) (B6).
+//! - [`tool_call`] — transport-neutral incremental Gemma 4 tool-call parsing,
+//!   bounded dedupe, finite repair, and raw-fidelity telemetry.
 //! - [`server`] — the axum router, the single-flight `Semaphore(1)` → 429, the
 //!   streaming handler, cancel-on-client-drop, 503 not-ready (B5).
 
@@ -24,6 +26,7 @@ pub mod engine;
 pub mod prepare;
 pub mod server;
 pub mod sse;
+pub mod tool_call;
 
 use hyperion_core::EngineIdentity;
 

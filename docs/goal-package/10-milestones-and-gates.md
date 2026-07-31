@@ -57,8 +57,9 @@ chat_short; prefill and peak strictly improve vs M2 rows; decision records per k
 (including any "stock wins" outcome — that is a valid, recorded result).
 
 ## M5 — Agentic layer v1
-Thinking-mode policy (strip/retain/budget) + SSE thinking lane; parallel-call bounded
-support; constrained-JSON v1 (schema-mask automaton, O-4) vs post-hoc arm; **n-gram adaptive
+Thinking-mode policy (strip/retain/budget) + SSE thinking lane; schema-guided/constrained-output
+enhancement for the bounded parallel-call support first delivered post-hoc in M3;
+constrained-JSON v1 (schema-mask automaton, O-4) vs post-hoc arm; **n-gram adaptive
 prompt-lookup drafter (B1)** as a cheap second speculative lane (zero resident cost, tokenizer-
 exact, disable-to-zero policy; fits structured tool-call output — a natural partner to the
 constrained-JSON lane); agent-eval suite (09) live with sandbox network isolation; suite floor
