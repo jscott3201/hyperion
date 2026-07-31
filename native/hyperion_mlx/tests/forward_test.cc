@@ -409,9 +409,19 @@ void test_abi_load(const std::filesystem::path& fixture, const mx::Stream& gpu) 
     HypStepResultFields dc = hyperion::model::step_result_read(result);
     require(dc.token_id < g.vocab_size, "decode token within vocab");
 
+    // A multi-token decode block is a sequence of q=1 forwards, not a continuation
+    // prefill query. Exercise the public ABI shape so governor step-kind routing cannot
+    // silently regress back to charging continuation-prefill scratch.
+    require(
+        hyp_decode_block(model, kv, 2, result) == HYP_STATUS_OK,
+        "hyp_decode_block succeeds for a sequential multi-token block");
+    HypStepResultFields dc_block = hyperion::model::step_result_read(result);
+    require(dc_block.token_id < g.vocab_size, "multi-token decode token within vocab");
+
     std::cerr << "forward_test: ABI prefill+decode OK on the tiny fixture "
               << "(prefill token " << pf.token_id << " == ref " << ref_tok
               << "; decode token " << dc.token_id
+              << "; block decode token " << dc_block.token_id
               << "; near_tie_events=" << dc.near_tie_events << ")\n";
 
     require(hyp_step_result_free(&result) == HYP_STATUS_OK, "step result free");

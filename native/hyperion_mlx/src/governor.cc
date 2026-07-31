@@ -24,8 +24,9 @@ constexpr float kTransientSafety = 1.25F;
 std::uint64_t continuation_local_kv_scratch(
     const Geometry& geometry,
     std::uint32_t n_tokens,
-    std::uint32_t offset) {
-    if (offset == 0 || n_tokens <= 1 ||
+    std::uint32_t offset,
+    StepKind step_kind) {
+    if (step_kind != StepKind::Prefill || offset == 0 || n_tokens <= 1 ||
         std::find(geometry.layer_types.begin(), geometry.layer_types.end(),
             LayerType::Sliding) == geometry.layer_types.end()) {
         return 0;
@@ -79,7 +80,8 @@ std::uint64_t Governor::global_kv_bytes(const KvState& kvstate) const {
 
 std::uint64_t Governor::attention_transient(
     std::uint32_t n_tokens,
-    std::uint32_t offset) const {
+    std::uint32_t offset,
+    StepKind step_kind) const {
     // The attention transient is the peak SDPA buffer allocation during the step.
     // MLX's mx::fast::scaled_dot_product_attention is a FUSED kernel that does NOT
     // materialize the [B, n_heads, q, ctx] attention-SCORES matrix — it streams the
@@ -119,13 +121,15 @@ std::uint64_t Governor::attention_transient(
     // Sliding continuation prefill also materializes one bounded [prefix + q] K and V
     // assembly before SDPA. Charge the exact per-layer peak once; the 512 MiB workspace
     // reserve remains available for slice-update intermediates and graph buffers.
-    return scaled_sdpa + continuation_local_kv_scratch(geometry_, n_tokens, offset);
+    return scaled_sdpa +
+        continuation_local_kv_scratch(geometry_, n_tokens, offset, step_kind);
 }
 
 GovernorDecision Governor::evaluate(
     std::uint32_t n_tokens,
     std::uint32_t offset,
-    const KvState& kvstate) const {
+    const KvState& kvstate,
+    StepKind step_kind) const {
     // settled_working_set = active + cache (live MLX counters).
     const std::uint64_t active = mx::get_active_memory();
     const std::uint64_t cache = mx::get_cache_memory();
@@ -137,7 +141,7 @@ GovernorDecision Governor::evaluate(
         static_cast<std::uint64_t>(n_tokens) * kGlobalKvBytesPerToken;
 
     // attention_transient: peak SDPA buffer during the step.
-    const std::uint64_t transient = attention_transient(n_tokens, offset);
+    const std::uint64_t transient = attention_transient(n_tokens, offset, step_kind);
 
     // predicted_peak = settled + kv_append + transient + workspace reserve.
     const std::uint64_t predicted_peak =
@@ -177,7 +181,8 @@ std::uint64_t predict_peak(
     std::uint32_t n_tokens,
     std::uint32_t offset,
     const KvState& /*kvstate*/,
-    const Geometry& geometry) {
+    const Geometry& geometry,
+    StepKind step_kind) {
     // This is the standalone prediction for telemetry fill (no admission).
     // Uses the same formula as Governor::evaluate but without the budget check.
     const std::uint64_t active = mx::get_active_memory();
@@ -205,7 +210,8 @@ std::uint64_t predict_peak(
     }
     total_transient = static_cast<std::uint64_t>(
         static_cast<double>(total_transient) * kTransientSafety);
-    total_transient += continuation_local_kv_scratch(geometry, n_tokens, offset);
+    total_transient +=
+        continuation_local_kv_scratch(geometry, n_tokens, offset, step_kind);
 
     return settled + kv_append + total_transient + kWorkspaceReserveBytes;
 }

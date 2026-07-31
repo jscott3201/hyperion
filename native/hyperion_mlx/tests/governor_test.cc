@@ -19,6 +19,7 @@ using hyperion::model::KvState;
 using hyperion::governor::Admission;
 using hyperion::governor::Governor;
 using hyperion::governor::GovernorDecision;
+using hyperion::governor::StepKind;
 using hyperion::governor::kGlobalKvBytesPerToken;
 using hyperion::governor::kWorkspaceReserveBytes;
 using hyperion::governor::peak_within_budget;
@@ -135,28 +136,28 @@ int main() {
 
     // At offset 0 with 0 tokens, the predicted peak should be the settled working set
     // + workspace reserve (no KV growth, no transient).
-    auto decision = gov.evaluate(0, 0, kvstate);
+    auto decision = gov.evaluate(0, 0, kvstate, StepKind::Prefill);
     require(decision.admission == Admission::Accepted,
         "zero-token step at offset 0 must be accepted");
     require(decision.predicted_peak_bytes >= kWorkspaceReserveBytes,
         "predicted peak must include the workspace reserve");
 
     // A single decode token at offset 0 should be accepted (minimal growth).
-    decision = gov.evaluate(1, 0, kvstate);
+    decision = gov.evaluate(1, 0, kvstate, StepKind::Prefill);
     require(decision.admission == Admission::Accepted,
         "single decode token at offset 0 must be accepted");
 
     // The predicted peak must include the 16 KiB/token KV growth.
     const auto prev_peak = decision.predicted_peak_bytes;
-    decision = gov.evaluate(2, 0, kvstate);
+    decision = gov.evaluate(2, 0, kvstate, StepKind::Prefill);
     require(decision.predicted_peak_bytes >= prev_peak + kGlobalKvBytesPerToken,
         "predicted peak must grow by at least 16 KiB per token");
 
     // Multi-token continuation prefill assembles a bounded local K+V buffer from the
     // retained prefix plus the current chunk. At offset 8 the tiny fixture retains the
     // full window, so q=2 charges exactly 5 KiB once (not once per sliding layer).
-    const auto fresh_prefill = gov.evaluate(2, 0, kvstate);
-    const auto continuation_prefill = gov.evaluate(2, 8, kvstate);
+    const auto fresh_prefill = gov.evaluate(2, 0, kvstate, StepKind::Prefill);
+    const auto continuation_prefill = gov.evaluate(2, 8, kvstate, StepKind::Prefill);
     constexpr std::uint64_t kExpectedContinuationCharge =
         2ULL * (8 + 2) * 2 * 64 * 2; // K+V * len * kv_heads * dim * bf16
     require(
@@ -166,20 +167,24 @@ int main() {
     constexpr std::uint64_t kExpectedPartialPrefixCharge =
         2ULL * (4 + 2) * 2 * 64 * 2;
     require(
-        gov.evaluate(2, 4, kvstate).predicted_peak_bytes ==
+        gov.evaluate(2, 4, kvstate, StepKind::Prefill).predicted_peak_bytes ==
             fresh_prefill.predicted_peak_bytes + kExpectedPartialPrefixCharge,
         "continuation scratch must use the available prefix below the window");
     require(
-        gov.evaluate(1, 12, kvstate).predicted_peak_bytes ==
-            gov.evaluate(1, 0, kvstate).predicted_peak_bytes,
+        gov.evaluate(1, 12, kvstate, StepKind::Prefill).predicted_peak_bytes ==
+            gov.evaluate(1, 0, kvstate, StepKind::Prefill).predicted_peak_bytes,
         "single-token decode must not charge continuation-prefill scratch");
+    require(
+        gov.evaluate(2, 8, kvstate, StepKind::Decode).predicted_peak_bytes ==
+            fresh_prefill.predicted_peak_bytes,
+        "sequential multi-token decode must not charge continuation-prefill scratch");
 
     // ── Halve-chunk behavior ──────────────────────────────────────────────────
 
     // A very large prefill chunk should trigger SoftPaused (halve-chunk) or
     // HardRejected if even 1 token breaches the ceiling. For the tiny geometry
     // on the 12 GiB ceiling, a 1M-token chunk should at least SoftPause.
-    decision = gov.evaluate(1'000'000, 0, kvstate);
+    decision = gov.evaluate(1'000'000, 0, kvstate, StepKind::Prefill);
     require(decision.admission != Admission::Accepted ||
             decision.predicted_peak_bytes <= budget.soft_watermark_bytes,
         "a 1M-token chunk must not be accepted if it breaches the soft watermark");
@@ -198,7 +203,7 @@ int main() {
     }
 
     // Re-evaluate at offset 4 so the governor reads the populated KV state.
-    decision = gov.evaluate(1, 4, kvstate);
+    decision = gov.evaluate(1, 4, kvstate, StepKind::Decode);
 
     // The decision must report the budget ceiling + soft watermark.
     require(decision.budget_ceiling_bytes == budget.effective_bytes,
@@ -213,13 +218,15 @@ int main() {
     // ── predict_peak standalone ───────────────────────────────────────────────
 
     // predict_peak must match Governor::evaluate's predicted_peak_bytes.
-    const auto standalone = predict_peak(1, 0, kvstate, geometry);
-    decision = gov.evaluate(1, 0, kvstate);
+    const auto standalone = predict_peak(1, 0, kvstate, geometry, StepKind::Prefill);
+    decision = gov.evaluate(1, 0, kvstate, StepKind::Prefill);
     require(standalone == decision.predicted_peak_bytes,
         "predict_peak must match Governor::evaluate's predicted_peak_bytes");
 
-    const auto continuation_standalone = predict_peak(2, 8, kvstate, geometry);
-    const auto continuation_decision = gov.evaluate(2, 8, kvstate);
+    const auto continuation_standalone =
+        predict_peak(2, 8, kvstate, geometry, StepKind::Prefill);
+    const auto continuation_decision =
+        gov.evaluate(2, 8, kvstate, StepKind::Prefill);
     require(continuation_standalone == continuation_decision.predicted_peak_bytes,
         "predict_peak must include the same continuation-prefill scratch charge");
 

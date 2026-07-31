@@ -201,7 +201,9 @@ int main(int argc, char** argv) {
                 while (offset < ctx) {
                     const std::uint32_t take = std::min(kChunk, ctx - offset);
                     max_predicted = std::max(max_predicted,
-                        hyperion::governor::predict_peak(take, offset, kvstate, g));
+                        hyperion::governor::predict_peak(
+                            take, offset, kvstate, g,
+                            hyperion::governor::StepKind::Prefill));
                     const int off0 = static_cast<int>(offset);
                     const int off1 = static_cast<int>(offset + take);
                     mx::array chunk_ids = mx::slice(ids_ctx, {off0}, {off1}, {1}, gpu);
