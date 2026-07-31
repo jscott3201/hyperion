@@ -21,6 +21,7 @@
 #include "geometry.h"
 #include "kv_cache.h"
 #include "step_result_access.h"
+#include "test_fault.h"
 #include "weights_loader.h"
 
 #include "hyperion_mlx.h"
@@ -843,6 +844,127 @@ void test_abi_growth_transactions(const std::filesystem::path& fixture) {
         "growth ABI: model free");
 }
 
+void test_abi_direct_execution_poison(const std::filesystem::path& fixture) {
+    const Geometry g = make_tiny_geometry();
+    std::vector<HypLayerType> layer_types_abi = {
+        HYP_LAYER_SLIDING, HYP_LAYER_SLIDING, HYP_LAYER_SLIDING,
+        HYP_LAYER_SLIDING, HYP_LAYER_SLIDING, HYP_LAYER_FULL,
+    };
+    HypGeometryParams abi = make_tiny_abi_geometry(layer_types_abi);
+
+    HypModel model = nullptr;
+    require(hyp_model_create(&model) == HYP_STATUS_OK,
+        "poison ABI: model create");
+    require(hyp_model_load(model, &abi, fixture.string().c_str()) == HYP_STATUS_OK,
+        "poison ABI: model load");
+    HypStepResult result = nullptr;
+    require(hyp_step_result_create(&result) == HYP_STATUS_OK,
+        "poison ABI: step result create");
+
+    std::vector<std::uint32_t> prefix_255(255);
+    for (std::size_t i = 0; i < prefix_255.size(); ++i) {
+        prefix_255[i] = static_cast<std::uint32_t>((11 + i) % g.vocab_size);
+    }
+    HypTokenStream tokens_255{
+        prefix_255.data(), static_cast<std::uint32_t>(prefix_255.size()), 1};
+    std::vector<std::uint32_t> prefix_256 = prefix_255;
+    prefix_256.push_back(19);
+    HypTokenStream tokens_256{
+        prefix_256.data(), static_cast<std::uint32_t>(prefix_256.size()), 1};
+
+    HypSamplingConfig sampled{};
+    sampled.temperature = 1.0F;
+    sampled.top_k = 8;
+    sampled.top_p = 0.9F;
+    sampled.seed = 42;
+
+    auto fresh_kv = [&]() -> HypKvState {
+        HypKvState kv = nullptr;
+        require(hyp_kvstate_create(model, &kv) == HYP_STATUS_OK,
+            "poison ABI: kvstate create");
+        return kv;
+    };
+
+    // At offset 255, appending one token reaches capacity 256 without growing.
+    // The injected post-append failure therefore occurs while forward aliases
+    // the live state and must consume the handle.
+    {
+        HypKvState kv = fresh_kv();
+        require(hyp_prefill_chunk(model, kv, &tokens_255, result) == HYP_STATUS_OK,
+            "poison ABI: greedy direct-control prefill 255");
+        hyperion::model::test::arm_post_append_forward_fault();
+        require(hyp_decode_block(model, kv, 1, result) == HYP_STATUS_INTERNAL,
+            "poison ABI: greedy direct decode fault returns INTERNAL");
+
+        // All four step surfaces reject before touching the consumed state. A
+        // zero-token sampled decode proves validation precedes its no-op path.
+        require(hyp_prefill_chunk(model, kv, &tokens_255, result) == HYP_STATUS_INTERNAL,
+            "poison ABI: poisoned greedy prefill returns INTERNAL");
+        require(hyp_decode_block(model, kv, 1, result) == HYP_STATUS_INTERNAL,
+            "poison ABI: poisoned greedy decode returns INTERNAL");
+        require(
+            hyp_prefill_chunk_sampled(model, kv, &tokens_255, &sampled, result) ==
+                HYP_STATUS_INTERNAL,
+            "poison ABI: poisoned sampled prefill returns INTERNAL");
+        require(
+            hyp_decode_block_sampled(model, kv, 0, &sampled, result) ==
+                HYP_STATUS_INTERNAL,
+            "poison ABI: poisoned sampled zero-token decode returns INTERNAL");
+        char error[256]{};
+        require(hyp_last_error(error, sizeof(error)) == HYP_STATUS_OK,
+            "poison ABI: read poisoned-handle guidance");
+        require(std::string(error).find("free and recreate") != std::string::npos,
+            "poison ABI: validation guides callers to free and recreate");
+        require(hyp_kvstate_free(&kv) == HYP_STATUS_OK && kv == nullptr,
+            "poison ABI: consumed kvstate remains freeable");
+
+        kv = fresh_kv();
+        require(hyp_prefill_chunk(model, kv, &tokens_255, result) == HYP_STATUS_OK,
+            "poison ABI: recreated kvstate prefill succeeds");
+        require(hyp_decode_block(model, kv, 1, result) == HYP_STATUS_OK,
+            "poison ABI: recreated kvstate decode succeeds");
+        require(hyp_kvstate_free(&kv) == HYP_STATUS_OK,
+            "poison ABI: recreated kvstate free");
+    }
+
+    // Exercise the independent positive-temperature sampled decode catch path.
+    {
+        HypKvState kv = fresh_kv();
+        require(hyp_prefill_chunk(model, kv, &tokens_255, result) == HYP_STATUS_OK,
+            "poison ABI: sampled direct-control prefill 255");
+        hyperion::model::test::arm_post_append_forward_fault();
+        require(
+            hyp_decode_block_sampled(model, kv, 1, &sampled, result) ==
+                HYP_STATUS_INTERNAL,
+            "poison ABI: sampled direct decode fault returns INTERNAL");
+        require(hyp_decode_block(model, kv, 0, result) == HYP_STATUS_INTERNAL,
+            "poison ABI: sampled direct fault consumes the handle");
+        require(hyp_kvstate_free(&kv) == HYP_STATUS_OK,
+            "poison ABI: sampled-fault kvstate free");
+    }
+
+    // At offset 256, the next token crosses into a new global bucket. The same
+    // fault lands in the staged owner, so rollback preserves same-handle retry.
+    {
+        HypKvState kv = fresh_kv();
+        require(hyp_prefill_chunk(model, kv, &tokens_256, result) == HYP_STATUS_OK,
+            "poison ABI: growth-control prefill 256");
+        hyperion::model::test::arm_post_append_forward_fault();
+        require(hyp_decode_block(model, kv, 1, result) == HYP_STATUS_INTERNAL,
+            "poison ABI: transactional decode fault returns INTERNAL");
+        require(hyp_decode_block(model, kv, 1, result) == HYP_STATUS_OK,
+            "poison ABI: transactional failure permits same-handle retry");
+        require(hyp_kvstate_free(&kv) == HYP_STATUS_OK,
+            "poison ABI: growth-control kvstate free");
+    }
+
+    std::cerr << "forward_test: direct greedy/sampled faults poison; growth fault retries OK\n";
+    require(hyp_step_result_free(&result) == HYP_STATUS_OK,
+        "poison ABI: step result free");
+    require(hyp_model_free(&model) == HYP_STATUS_OK,
+        "poison ABI: model free");
+}
+
 void test_abi_chunked_prefill(const std::filesystem::path& fixture, const mx::Stream& /*gpu*/) {
     // M2-2.6a: the chunked hyp_prefill_chunk path + the rotation read on the tiny fixture
     // (window=8, cap=16). A >2048-token prompt crosses the 2048 chunk boundary AND rotates
@@ -962,6 +1084,7 @@ int main() {
             test_abi_load(fixture, gpu);
             test_abi_sampler_validation(fixture, gpu);
             test_abi_growth_transactions(fixture);
+            test_abi_direct_execution_poison(fixture);
             test_abi_chunked_prefill(fixture, gpu);
             test_mask_by_kind(make_tiny_geometry(), gpu);
         } catch (const std::exception& e) {
@@ -979,6 +1102,7 @@ int main() {
         test_abi_load(fixture, gpu);
         test_abi_sampler_validation(fixture, gpu);
         test_abi_growth_transactions(fixture);
+        test_abi_direct_execution_poison(fixture);
         test_abi_chunked_prefill(fixture, gpu);
         test_mask_by_kind(make_tiny_geometry(), gpu);
     } catch (const std::exception& e) {

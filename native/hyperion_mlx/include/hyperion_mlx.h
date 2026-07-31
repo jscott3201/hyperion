@@ -189,16 +189,23 @@ HypStatus hyp_model_load(HypModel model,
 /** Allocate a KV-state handle bound to the model (stub -> UNSUPPORTED at M2-1.3). */
 HypStatus hyp_kvstate_create(HypModel model, HypKvState* out_kvstate);
 
-/** Free a KV-state handle and set *kvstate to NULL. A NULL handle is a no-op. */
+/** Free a KV-state handle and set *kvstate to NULL. A NULL handle is a no-op.
+ *  This remains valid after a step returns ``HYP_STATUS_INTERNAL``. */
 HypStatus hyp_kvstate_free(HypKvState* kvstate);
 
-/** Prefill a prompt chunk into the KV state (stub -> UNSUPPORTED at M2-2.6). */
+/** Prefill a prompt chunk into the KV state (stub -> UNSUPPORTED at M2-2.6).
+ *  A KV state consumed by a prior direct-decode execution failure rejects this
+ *  call with ``HYP_STATUS_INTERNAL`` until it is freed and recreated. */
 HypStatus hyp_prefill_chunk(HypModel model,
                             HypKvState kvstate,
                             const HypTokenStream* tokens,
                             HypStepResult out_result);
 
-/** Decode n_tokens into the KV state (stub -> UNSUPPORTED at M2-2.6/2.7). */
+/** Decode n_tokens into the KV state (stub -> UNSUPPORTED at M2-2.6/2.7).
+ *  A direct/non-growth decode that fails after execution begins consumes its
+ *  KV state; the consumed state rejects later steps with ``HYP_STATUS_INTERNAL``
+ *  until freed and recreated. Capacity-growth execution is transactionally staged,
+ *  so a failed staged call leaves the live KV state reusable. */
 HypStatus hyp_decode_block(HypModel model,
                            HypKvState kvstate,
                            uint32_t n_tokens,

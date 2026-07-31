@@ -1,5 +1,9 @@
 #include "forward.h"
 
+#ifdef HYPERION_TEST_FAULTS
+#include "test_fault.h"
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -557,6 +561,9 @@ mx::array ForwardPass::forward(const mx::array& h, KvState& kvstate, std::uint32
         mx::array mask = build_mask(kind, q_len, kv_len, offset);
         state = decoder_layer(state, layer, mask, kvstate, offset);
     }
+#ifdef HYPERION_TEST_FAULTS
+    test::maybe_throw_post_append_forward_fault();
+#endif
     return final_norm(state);
 }
 

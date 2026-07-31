@@ -41,6 +41,7 @@ struct HypModelOpaque {
 
 struct HypKvStateOpaque {
     std::uint32_t magic;
+    bool poisoned = false;
     std::unique_ptr<hyperion::model::KvState> kv;
     std::optional<mx::Stream> stream;
     // M2-2.7 autoregressive cursor: the offset = committed prefix length (passed
@@ -71,6 +72,37 @@ constexpr std::uint32_t kStepResultMagic = 0x48505352U;  // "HPSR"
 constexpr int kLockedGroupSize = 64;
 constexpr int kLockedBits = 4;
 
+// A direct decode aliases the live KV state, cursor, and last token. Once its
+// first forward begins, an exception can therefore leave that handle partially
+// advanced. Growth transactions use a staged owner and remain retryable.
+class DirectKvExecutionGuard {
+  public:
+    DirectKvExecutionGuard(HypKvState kvstate, bool eligible) noexcept
+        : kvstate_(kvstate), eligible_(eligible) {}
+
+    DirectKvExecutionGuard(const DirectKvExecutionGuard&) = delete;
+    DirectKvExecutionGuard& operator=(const DirectKvExecutionGuard&) = delete;
+
+    ~DirectKvExecutionGuard() noexcept {
+        if (eligible_ && armed_) {
+            kvstate_->poisoned = true;
+        }
+    }
+
+    void arm() noexcept {
+        if (eligible_) {
+            armed_ = true;
+        }
+    }
+
+    void disarm() noexcept { armed_ = false; }
+
+  private:
+    HypKvState kvstate_;
+    bool eligible_;
+    bool armed_ = false;
+};
+
 } // namespace
 
 HypStatus fail(HypStatus status, const char* message) noexcept {
@@ -98,6 +130,11 @@ HypStatus validate_model(HypModel model, const char* /*operation*/) noexcept {
 HypStatus validate_kvstate(HypKvState kvstate) noexcept {
     if (kvstate == nullptr || kvstate->magic != kKvStateMagic) {
         return fail(HYP_STATUS_INVALID_ARGUMENT, "kvstate handle is invalid");
+    }
+    if (kvstate->poisoned) {
+        return fail(
+            HYP_STATUS_INTERNAL,
+            "KV state is unusable after an internal execution failure; free and recreate it");
     }
     return ok();
 }
@@ -619,6 +656,8 @@ HypStatus hyp_decode_block(HypModel model,
         hyperion::model::KvGrowthTransaction transaction(
             kvstate->kv, operation_plan);
         const bool transactional = transaction.active();
+        hyperion::model::DirectKvExecutionGuard execution_guard(
+            kvstate, !transactional);
         std::uint32_t near_tie_events = 0;
         hyperion::model::ForwardPass::GreedySample sample{0, 0.0F, false};
         std::uint32_t staged_offset = kvstate->offset;
@@ -634,6 +673,9 @@ HypStatus hyp_decode_block(HypModel model,
             int32_t id = static_cast<int32_t>(execution_last_token);
             mx::array ids = mx::array(&id, mx::Shape{1}, mx::int32);
             mx::array h = model->fwd->embed(ids);             // [1, 1, hidden]
+            if (step == 0) {
+                execution_guard.arm();
+            }
             h = model->fwd->forward(h, transaction.state(), execution_offset); // final-norm'd; appends 1 K/V
             h = transaction.root_forward_result(h);
             sample = hyperion::model::run_epilogue(*model->fwd, h, s);
@@ -654,6 +696,7 @@ HypStatus hyp_decode_block(HypModel model,
         hyperion::model::write_step_result(
             out_result, sample, near_tie_events,
             HYP_GOVERNOR_READY, telemetry.snapshot(*kvstate->kv));
+        execution_guard.disarm();
         return hyperion::model::ok();
     } catch (const std::bad_alloc&) {
         return hyperion::model::fail(
@@ -837,6 +880,8 @@ HypStatus hyp_decode_block_sampled(HypModel model,
         hyperion::model::KvGrowthTransaction transaction(
             kvstate->kv, operation_plan);
         const bool transactional = transaction.active();
+        hyperion::model::DirectKvExecutionGuard execution_guard(
+            kvstate, !transactional);
         hyperion::model::ForwardPass::StochasticSample sample{};
         // Per-request RNG: seed advances each step so a single seed yields a reproducible
         // stream (same seed → same tokens). std::mt19937_64 advanced by a per-step salt.
@@ -851,6 +896,9 @@ HypStatus hyp_decode_block_sampled(HypModel model,
             int32_t id = static_cast<int32_t>(execution_last_token);
             mx::array ids = mx::array(&id, mx::Shape{1}, mx::int32);
             mx::array h = model->fwd->embed(ids);
+            if (step == 0) {
+                execution_guard.arm();
+            }
             h = model->fwd->forward(h, transaction.state(), execution_offset);
             h = transaction.root_forward_result(h);
             sample = hyperion::model::run_epilogue_sampled(*model->fwd, h, s, config, rng_state);
@@ -868,6 +916,7 @@ HypStatus hyp_decode_block_sampled(HypModel model,
         // Successful decode telemetry reports the exact pre-step admission decision.
         hyperion::model::write_step_result_sampled(
             out_result, sample, HYP_GOVERNOR_READY, telemetry.snapshot(*kvstate->kv));
+        execution_guard.disarm();
         return hyperion::model::ok();
     } catch (const std::bad_alloc&) {
         return hyperion::model::fail(HYP_STATUS_INTERNAL, "native allocation failed outside predictive governor admission");

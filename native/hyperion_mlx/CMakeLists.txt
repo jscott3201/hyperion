@@ -62,6 +62,9 @@ target_compile_options(hyperion_mlx PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+    target_sources(hyperion_mlx PRIVATE src/test_fault.cc)
+    target_compile_definitions(hyperion_mlx PRIVATE HYPERION_TEST_FAULTS)
+
     add_library(hyperion_abi_c_header OBJECT tests/abi_c_header_test.c)
     target_include_directories(hyperion_abi_c_header PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     target_compile_options(hyperion_abi_c_header PRIVATE -Wall -Wextra -Wpedantic -Werror)
