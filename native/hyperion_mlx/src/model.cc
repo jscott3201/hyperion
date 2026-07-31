@@ -598,8 +598,8 @@ HypStatus hyp_decode_block(HypModel model,
 
     // Governor admission (2.6b): predict the peak for the full decode block at the
     // current offset. Decode is 1 token/step (q_len=1), so continuation-prefill scratch
-    // does not apply; the SDPA term remains conservatively block-width and global KV
-    // growth remains 16 KiB/token.
+    // does not apply and the attention transient is one q=1 forward; global KV
+    // admission sums every sequential capacity-bucket replacement in the block.
     auto decision = model->governor->evaluate(
         n_tokens, kvstate->offset, *kvstate->kv, hyperion::governor::StepKind::Decode);
     if (decision.admission == hyperion::governor::Admission::HardRejected) {
@@ -629,15 +629,11 @@ HypStatus hyp_decode_block(HypModel model,
             kvstate->last_token = sample.token_id;
             kvstate->offset += 1;
         }
-        // The StepResult captures the LAST step's token + cumulative near_tie_events
-        // across the block + governor telemetry (M2-2.6b): peak/active MLX bytes,
-        // KV byte counts, and governor_state = READY.
-        const std::uint64_t peak = hyperion::governor::predict_peak(
-            n_tokens, kvstate->offset - n_tokens, *kvstate->kv, *model->geometry,
-            hyperion::governor::StepKind::Decode);
+        // Preserve the pre-step admission prediction: recomputing after KV mutation
+        // would treat the just-allocated bucket as settled and charge it a second time.
         hyperion::model::write_step_result(
             out_result, sample, near_tie_events,
-            HYP_GOVERNOR_READY, peak, mx::get_active_memory(),
+            HYP_GOVERNOR_READY, decision.predicted_peak_bytes, mx::get_active_memory(),
             decision.local_kv_bytes, decision.global_kv_bytes);
         return hyperion::model::ok();
     } catch (const std::bad_alloc&) {
@@ -812,11 +808,10 @@ HypStatus hyp_decode_block_sampled(HypModel model,
             kvstate->last_token = sample.token_id;
             kvstate->offset += 1;
         }
-        const std::uint64_t peak = hyperion::governor::predict_peak(
-            n_tokens, kvstate->offset - n_tokens, *kvstate->kv, *model->geometry,
-            hyperion::governor::StepKind::Decode);
+        // Successful decode telemetry reports the exact pre-step admission decision.
         hyperion::model::write_step_result_sampled(
-            out_result, sample, HYP_GOVERNOR_READY, peak, mx::get_active_memory(),
+            out_result, sample, HYP_GOVERNOR_READY, decision.predicted_peak_bytes,
+            mx::get_active_memory(),
             decision.local_kv_bytes, decision.global_kv_bytes);
         return hyperion::model::ok();
     } catch (const std::bad_alloc&) {
