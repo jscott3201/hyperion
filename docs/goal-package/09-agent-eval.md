@@ -57,7 +57,8 @@ the M5 baseline run — baseline-then-gate, the floor is measured not invented).
 
 - **gemma-challenge/eval-prompts** (128 MMLU-Pro/GPQA-Diamond/AIME26 prompts, harness
   format): wired as the kernel-CI quality canary (the logit-saturation catch). License note:
-  fine for private eval; verify redistribution terms before bundling into a public repo (O-2).
+  keep the prompt payload out of the public repository until its redistribution terms have
+  been independently verified; O-2 does not relicense external evaluation data.
 - **Thinking-mode A/B:** suite runs thinking-on vs thinking-off arms; ledger records
   quality-vs-token-budget curves (feeds target workload profiles' budget defaults).
 - 12B-vs-E4B capability delta on the same suite (M8) — the tier-admission evidence the

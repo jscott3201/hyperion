@@ -69,7 +69,8 @@ License: Gemma 4 is Apache-2.0 (Google's first OSI-licensed Gemma release; confi
 Google open-source blog + ai.google.dev/gemma/apache_2). One open flag: whether a Prohibited
 Use Policy still binds Gemma 4 on top of Apache-2.0 was UNCONFIRMED at research time — check
 the license frontmatter of each checkpoint at download and record in the ledger before any
-redistribution decision (affects O-2, not v1 engineering).
+redistribution decision. O-2 licenses Hyperion-authored source only; model redistribution
+remains a separate decision and does not block v1 engineering.
 
 ## Tokenizer & template
 
