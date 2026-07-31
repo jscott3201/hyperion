@@ -469,6 +469,22 @@ HypStatus hyp_prefill_chunk(HypModel model,
 
     try {
         const mx::Stream s = *model->stream;
+        const auto operation_plan =
+            hyperion::model::plan_kv_growth(*kvstate->kv, tokens->count);
+        auto settled_staging_plan = operation_plan;
+        settled_staging_plan.requires_transaction = false;
+        if (!operation_plan.representable) {
+            const auto decision = model->governor->evaluate(
+                std::min<std::uint32_t>(2048, tokens->count), 0, *kvstate->kv,
+                hyperion::governor::StepKind::Prefill, &operation_plan);
+            hyperion::model::write_step_result(
+                out_result, hyperion::model::ForwardPass::GreedySample{0, 0.0F, false},
+                0u, HYP_GOVERNOR_HARD_REJECT, decision.predicted_peak_bytes,
+                mx::get_active_memory(), decision.local_kv_bytes, decision.global_kv_bytes);
+            return hyperion::model::fail(HYP_STATUS_OOM_GOVERNOR, decision.reason);
+        }
+        hyperion::model::KvGrowthTransaction transaction(
+            kvstate->kv, operation_plan);
         // Copy uint32 ids → int32 (MLX int32; ids < vocab < 2^31 so the cast is exact).
         std::vector<int32_t> host_ids;
         host_ids.reserve(tokens->count);
@@ -495,7 +511,9 @@ HypStatus hyp_prefill_chunk(HypModel model,
             std::uint32_t take = std::min(kPrefillChunkSize, total - offset);
             // Governor admission: predict the peak for this chunk at the current offset.
             auto decision = model->governor->evaluate(
-                take, offset, *kvstate->kv, hyperion::governor::StepKind::Prefill);
+                take, offset, transaction.state(),
+                hyperion::governor::StepKind::Prefill,
+                offset == 0 ? &operation_plan : &settled_staging_plan);
             if (decision.admission == hyperion::governor::Admission::HardRejected) {
                 // Even 1 token would breach the ceiling — reject the whole prefill.
                 hyperion::model::write_step_result(
@@ -509,7 +527,9 @@ HypStatus hyp_prefill_chunk(HypModel model,
                 // Halve the chunk and retry (down to 1 token; below that, hard reject).
                 take = std::max(std::uint32_t{1}, take / 2);
                 decision = model->governor->evaluate(
-                    take, offset, *kvstate->kv, hyperion::governor::StepKind::Prefill);
+                    take, offset, transaction.state(),
+                    hyperion::governor::StepKind::Prefill,
+                    offset == 0 ? &operation_plan : &settled_staging_plan);
                 if (decision.admission == hyperion::governor::Admission::HardRejected) {
                     hyperion::model::write_step_result(
                         out_result, sample, 0u, HYP_GOVERNOR_HARD_REJECT,
@@ -525,7 +545,8 @@ HypStatus hyp_prefill_chunk(HypModel model,
             const int off1 = static_cast<int>(offset + take);
             mx::array chunk_ids = mx::slice(ids, {off0}, {off1}, {1}, s); // [take]
             mx::array h = model->fwd->embed(chunk_ids);                   // [1, take, hidden]
-            h = model->fwd->forward(h, *kvstate->kv, offset);             // final-norm'd; appends K/V
+            h = model->fwd->forward(h, transaction.state(), offset);      // final-norm'd; appends K/V
+            h = transaction.root_forward_result(h);
             if (offset + take == total) {
                 sample = hyperion::model::run_epilogue(*model->fwd, h, s); // last chunk → token 1
             } else {
@@ -533,6 +554,8 @@ HypStatus hyp_prefill_chunk(HypModel model,
             }
             offset += take;
         }
+        transaction.materialize();
+        transaction.publish();
         kvstate->offset = total;            // advance the autoregressive cursor
         kvstate->last_token = sample.token_id;
         // Fill the step result with governor telemetry (M2-2.6b). The per-chunk
@@ -600,8 +623,11 @@ HypStatus hyp_decode_block(HypModel model,
     // current offset. Decode is 1 token/step (q_len=1), so continuation-prefill scratch
     // does not apply and the attention transient is one q=1 forward; global KV
     // admission sums every sequential capacity-bucket replacement in the block.
+    const auto operation_plan =
+        hyperion::model::plan_kv_growth(*kvstate->kv, n_tokens);
     auto decision = model->governor->evaluate(
-        n_tokens, kvstate->offset, *kvstate->kv, hyperion::governor::StepKind::Decode);
+        n_tokens, kvstate->offset, *kvstate->kv,
+        hyperion::governor::StepKind::Decode, &operation_plan);
     if (decision.admission == hyperion::governor::Admission::HardRejected) {
         hyperion::model::write_step_result(
             out_result, hyperion::model::ForwardPass::GreedySample{0, 0.0F, false}, 0u,
@@ -612,22 +638,38 @@ HypStatus hyp_decode_block(HypModel model,
 
     try {
         const mx::Stream s = *model->stream;
+        hyperion::model::KvGrowthTransaction transaction(
+            kvstate->kv, operation_plan);
+        const bool transactional = transaction.active();
         std::uint32_t near_tie_events = 0;
         hyperion::model::ForwardPass::GreedySample sample{0, 0.0F, false};
+        std::uint32_t staged_offset = kvstate->offset;
+        std::uint32_t staged_last_token = kvstate->last_token;
+        std::uint32_t& execution_offset =
+            transactional ? staged_offset : kvstate->offset;
+        std::uint32_t& execution_last_token =
+            transactional ? staged_last_token : kvstate->last_token;
         // Autoregressive loop: embed last_token → forward at the current offset (q_len=1,
         // cached-prefix read) → epilogue → advance cursor. For greedy M2 the caller uses
         // n_tokens=1 per call; n_tokens>1 is the speculative-verify block shape (M7).
         for (std::uint32_t step = 0; step < n_tokens; ++step) {
-            int32_t id = static_cast<int32_t>(kvstate->last_token);
+            int32_t id = static_cast<int32_t>(execution_last_token);
             mx::array ids = mx::array(&id, mx::Shape{1}, mx::int32);
             mx::array h = model->fwd->embed(ids);             // [1, 1, hidden]
-            h = model->fwd->forward(h, *kvstate->kv, kvstate->offset); // final-norm'd; appends 1 K/V
+            h = model->fwd->forward(h, transaction.state(), execution_offset); // final-norm'd; appends 1 K/V
+            h = transaction.root_forward_result(h);
             sample = hyperion::model::run_epilogue(*model->fwd, h, s);
             if (sample.near_tie) {
                 ++near_tie_events;
             }
-            kvstate->last_token = sample.token_id;
-            kvstate->offset += 1;
+            execution_last_token = sample.token_id;
+            execution_offset += 1;
+        }
+        transaction.materialize();
+        transaction.publish();
+        if (transactional) {
+            kvstate->offset = staged_offset;
+            kvstate->last_token = staged_last_token;
         }
         // Preserve the pre-step admission prediction: recomputing after KV mutation
         // would treat the just-allocated bucket as settled and charge it a second time.
@@ -684,6 +726,23 @@ HypStatus hyp_prefill_chunk_sampled(HypModel model,
     }
     try {
         const mx::Stream s = *model->stream;
+        const auto operation_plan =
+            hyperion::model::plan_kv_growth(*kvstate->kv, tokens->count);
+        auto settled_staging_plan = operation_plan;
+        settled_staging_plan.requires_transaction = false;
+        if (!operation_plan.representable) {
+            const auto decision = model->governor->evaluate(
+                std::min<std::uint32_t>(2048, tokens->count), 0, *kvstate->kv,
+                hyperion::governor::StepKind::Prefill, &operation_plan);
+            hyperion::model::ForwardPass::StochasticSample rejected{};
+            hyperion::model::write_step_result_sampled(
+                out_result, rejected, HYP_GOVERNOR_HARD_REJECT,
+                decision.predicted_peak_bytes, mx::get_active_memory(),
+                decision.local_kv_bytes, decision.global_kv_bytes);
+            return hyperion::model::fail(HYP_STATUS_OOM_GOVERNOR, decision.reason);
+        }
+        hyperion::model::KvGrowthTransaction transaction(
+            kvstate->kv, operation_plan);
         std::vector<int32_t> host_ids;
         host_ids.reserve(tokens->count);
         for (std::uint32_t i = 0; i < tokens->count; ++i) {
@@ -697,7 +756,9 @@ HypStatus hyp_prefill_chunk_sampled(HypModel model,
         while (offset < total) {
             std::uint32_t take = std::min(kPrefillChunkSize, total - offset);
             auto decision = model->governor->evaluate(
-                take, offset, *kvstate->kv, hyperion::governor::StepKind::Prefill);
+                take, offset, transaction.state(),
+                hyperion::governor::StepKind::Prefill,
+                offset == 0 ? &operation_plan : &settled_staging_plan);
             if (decision.admission == hyperion::governor::Admission::HardRejected) {
                 hyperion::model::write_step_result_sampled(
                     out_result, sample, HYP_GOVERNOR_HARD_REJECT,
@@ -708,7 +769,9 @@ HypStatus hyp_prefill_chunk_sampled(HypModel model,
             if (decision.admission == hyperion::governor::Admission::SoftPaused) {
                 take = std::max(std::uint32_t{1}, take / 2);
                 decision = model->governor->evaluate(
-                    take, offset, *kvstate->kv, hyperion::governor::StepKind::Prefill);
+                    take, offset, transaction.state(),
+                    hyperion::governor::StepKind::Prefill,
+                    offset == 0 ? &operation_plan : &settled_staging_plan);
                 if (decision.admission == hyperion::governor::Admission::HardRejected) {
                     hyperion::model::write_step_result_sampled(
                         out_result, sample, HYP_GOVERNOR_HARD_REJECT,
@@ -721,7 +784,8 @@ HypStatus hyp_prefill_chunk_sampled(HypModel model,
             const int off1 = static_cast<int>(offset + take);
             mx::array chunk_ids = mx::slice(ids, {off0}, {off1}, {1}, s);
             mx::array h = model->fwd->embed(chunk_ids);
-            h = model->fwd->forward(h, *kvstate->kv, offset);
+            h = model->fwd->forward(h, transaction.state(), offset);
+            h = transaction.root_forward_result(h);
             if (offset + take == total) {
                 // last chunk → the sampled epilogue. Seed advances per prefill (the request seed).
                 sample = hyperion::model::run_epilogue_sampled(*model->fwd, h, s, config, config->seed);
@@ -730,6 +794,8 @@ HypStatus hyp_prefill_chunk_sampled(HypModel model,
             }
             offset += take;
         }
+        transaction.materialize();
+        transaction.publish();
         kvstate->offset = total;
         kvstate->last_token = sample.token_id;
         const auto final_state = model->governor->evaluate(
@@ -782,8 +848,11 @@ HypStatus hyp_decode_block_sampled(HypModel model,
             out_result, sample, HYP_GOVERNOR_READY, 0, mx::get_active_memory(), 0, 0);
         return hyperion::model::ok();
     }
+    const auto operation_plan =
+        hyperion::model::plan_kv_growth(*kvstate->kv, n_tokens);
     auto decision = model->governor->evaluate(
-        n_tokens, kvstate->offset, *kvstate->kv, hyperion::governor::StepKind::Decode);
+        n_tokens, kvstate->offset, *kvstate->kv,
+        hyperion::governor::StepKind::Decode, &operation_plan);
     if (decision.admission == hyperion::governor::Admission::HardRejected) {
         hyperion::model::ForwardPass::StochasticSample sample{};
         hyperion::model::write_step_result_sampled(
@@ -793,20 +862,36 @@ HypStatus hyp_decode_block_sampled(HypModel model,
     }
     try {
         const mx::Stream s = *model->stream;
+        hyperion::model::KvGrowthTransaction transaction(
+            kvstate->kv, operation_plan);
+        const bool transactional = transaction.active();
         hyperion::model::ForwardPass::StochasticSample sample{};
         // Per-request RNG: seed advances each step so a single seed yields a reproducible
         // stream (same seed → same tokens). std::mt19937_64 advanced by a per-step salt.
         std::uint64_t rng_state = config->seed;
+        std::uint32_t staged_offset = kvstate->offset;
+        std::uint32_t staged_last_token = kvstate->last_token;
+        std::uint32_t& execution_offset =
+            transactional ? staged_offset : kvstate->offset;
+        std::uint32_t& execution_last_token =
+            transactional ? staged_last_token : kvstate->last_token;
         for (std::uint32_t step = 0; step < n_tokens; ++step) {
-            int32_t id = static_cast<int32_t>(kvstate->last_token);
+            int32_t id = static_cast<int32_t>(execution_last_token);
             mx::array ids = mx::array(&id, mx::Shape{1}, mx::int32);
             mx::array h = model->fwd->embed(ids);
-            h = model->fwd->forward(h, *kvstate->kv, kvstate->offset);
+            h = model->fwd->forward(h, transaction.state(), execution_offset);
+            h = transaction.root_forward_result(h);
             sample = hyperion::model::run_epilogue_sampled(*model->fwd, h, s, config, rng_state);
             // Advance the RNG state per step (a fixed salt — deterministic per-request).
             rng_state = rng_state * 6364136223846793005ULL + 1442695040888963407ULL;
-            kvstate->last_token = sample.token_id;
-            kvstate->offset += 1;
+            execution_last_token = sample.token_id;
+            execution_offset += 1;
+        }
+        transaction.materialize();
+        transaction.publish();
+        if (transactional) {
+            kvstate->offset = staged_offset;
+            kvstate->last_token = staged_last_token;
         }
         // Successful decode telemetry reports the exact pre-step admission decision.
         hyperion::model::write_step_result_sampled(
