@@ -42,7 +42,8 @@ greedy intent; interactive assistant workloads use sampled defaults — both are
 
 - Declarations rendered into the template's `<|tool|>declaration:` block from OpenAI
   `tools` / Anthropic `tools` schemas.
-- Model emits `<|tool_call|>call:name{args}` blocks (string literals `<|"|>`-delimited).
+- Model emits `<|tool_call>call:name{args}<tool_call|>` blocks (string literals
+  `<|"|>`-delimited).
   hyperion's incremental parser (adapt bonsai `tool_call.rs`): tolerant assembly from
   streamed fragments, schema validation, argument-JSON coercion **degrade-never-drop**
   (a malformed-but-recoverable call surfaces as a call + `repaired: true` telemetry, never

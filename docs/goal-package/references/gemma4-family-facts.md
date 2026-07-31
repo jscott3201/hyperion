@@ -68,7 +68,7 @@ speedup there — conflicting with vLLM's MoE result; unresolved).
   current turn**; 12B-it template includes an empty-thinking stabilization token
   (ghost-thought suppression). Community templates have known interleave bugs (HF #115) —
   trust Google docs + golden fixtures, not third-party templates.
-- Tools: `<|tool|>declaration:…`, `<|tool_call|>call:name{args}`,
+- Tools: `<|tool|>declaration:…`, `<|tool_call>call:name{args}<tool_call|>`,
   `<|tool_response|>response:name{data}`; string literals delimited `<|"|>`. Parallel calls
   emitted in practice; duplicate-identical-call bug reported in the wild (LM Studio
   tracker) — dedupe at the server.
