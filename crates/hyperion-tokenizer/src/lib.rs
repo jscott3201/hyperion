@@ -23,6 +23,8 @@ use tokenizers::tokenizer::step_decode_stream;
 
 const MAX_RETAINED_TOKEN_IDS: usize = 256;
 const MAX_RETAINED_TEXT_BYTES: usize = 64 * 1024;
+/// Maximum number of added-special IDs a selective decoder may retain.
+pub const MAX_PRESERVED_SPECIAL_IDS: usize = 8;
 
 /// Stable description of the tokenizer execution boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,6 +100,7 @@ pub struct StreamingDecoder {
     tokenizer: Arc<Tokenizer>,
     skip_special_tokens: bool,
     skipped_special_ids: Option<Arc<HashSet<u32>>>,
+    selective_special_ids: Option<(Arc<HashSet<u32>>, HashSet<u32>)>,
     ids: Vec<u32>,
     prefix: String,
     prefix_index: usize,
@@ -114,6 +117,13 @@ impl StreamingDecoder {
             .skipped_special_ids
             .as_ref()
             .is_some_and(|ids| ids.contains(&id))
+        {
+            return Ok(None);
+        }
+        if self
+            .selective_special_ids
+            .as_ref()
+            .is_some_and(|(all, allowed)| all.contains(&id) && !allowed.contains(&id))
         {
             return Ok(None);
         }
@@ -251,10 +261,40 @@ impl TokenizerHandle {
             tokenizer: self.inner.clone(),
             skip_special_tokens: policy.skip_special_tokens(),
             skipped_special_ids,
+            selective_special_ids: None,
             ids: Vec::new(),
             prefix: String::new(),
             prefix_index: 0,
         }
+    }
+
+    /// Create a bounded decoder which retains only the explicitly allowed
+    /// added-special token IDs. At most [`MAX_PRESERVED_SPECIAL_IDS`] IDs may
+    /// be supplied. Duplicate IDs are harmless, and ordinary (non-special)
+    /// IDs have no special effect. All other added specials (including EOS and
+    /// channel controls) are discarded before they can disturb decoder state.
+    ///
+    /// # Errors
+    /// Returns [`TokenizerError::Decode`] when `allowed` exceeds the bound.
+    pub fn streaming_decoder_preserving_special_ids(
+        &self,
+        allowed: &[u32],
+    ) -> Result<StreamingDecoder, TokenizerError> {
+        if allowed.len() > MAX_PRESERVED_SPECIAL_IDS {
+            return Err(TokenizerError::Decode(format!(
+                "selective decoder special-ID limit exceeded (maximum {MAX_PRESERVED_SPECIAL_IDS})"
+            )));
+        }
+        let allowed = allowed.iter().copied().collect();
+        Ok(StreamingDecoder {
+            tokenizer: self.inner.clone(),
+            skip_special_tokens: false,
+            skipped_special_ids: None,
+            selective_special_ids: Some((self.special_token_ids.clone(), allowed)),
+            ids: Vec::new(),
+            prefix: String::new(),
+            prefix_index: 0,
+        })
     }
 
     /// The vocab size (incl. added tokens).
@@ -402,6 +442,115 @@ mod tests {
             collect_stream(&tokenizer, &ids, SpecialTokenPolicy::Skip).unwrap(),
             "hello world"
         );
+    }
+
+    #[test]
+    fn selective_special_policy_keeps_only_native_tool_controls() {
+        let tokenizer = word_level(&[
+            ("hello", 0),
+            ("<|tool_call>", 1),
+            ("<|\"|>", 2),
+            ("<tool_call|>", 3),
+            ("<eos>", 4),
+            ("<|channel>", 5),
+            ("world", 6),
+        ]);
+        let mut inner = tokenizer.inner.as_ref().clone();
+        inner
+            .add_special_tokens([
+                AddedToken::from("<|tool_call>", true),
+                AddedToken::from("<|\"|>", true),
+                AddedToken::from("<tool_call|>", true),
+                AddedToken::from("<eos>", true),
+                AddedToken::from("<|channel>", true),
+            ])
+            .expect("special tokens register");
+        let tokenizer = handle(inner);
+        let allowed: Vec<_> = ["<|tool_call>", "<|\"|>", "<tool_call|>"]
+            .into_iter()
+            .filter_map(|text| tokenizer.token_to_id(text))
+            .collect();
+        let mut decoder = tokenizer
+            .streaming_decoder_preserving_special_ids(&allowed)
+            .unwrap();
+        let ids = [0, 1, 4, 2, 5, 3, 6];
+        let mut output = String::new();
+        for id in ids {
+            if let Some(fragment) = decoder.push(id).unwrap() {
+                output.push_str(&fragment);
+            }
+        }
+        output.push_str(&decoder.finish().unwrap());
+        assert_eq!(output, "hello <|tool_call> <|\"|> <tool_call|> world");
+        assert!(!output.contains("<eos>"));
+        assert!(!output.contains("<|channel>"));
+    }
+
+    #[test]
+    fn selective_special_policy_bounds_and_classifies_allowset() {
+        let tokenizer = word_level(&[("plain", 0), ("<eos>", 1)]);
+        let mut inner = tokenizer.inner.as_ref().clone();
+        inner
+            .add_special_tokens([AddedToken::from("<eos>", true)])
+            .expect("special token registers");
+        let tokenizer = handle(inner);
+        let eos = tokenizer.token_to_id("<eos>").unwrap();
+        let plain = tokenizer.token_to_id("plain").unwrap();
+
+        let mut empty = tokenizer
+            .streaming_decoder_preserving_special_ids(&[])
+            .unwrap();
+        assert_eq!(empty.push(eos).unwrap(), None);
+        assert_eq!(empty.finish().unwrap(), "");
+
+        let mut duplicate_and_ordinary = tokenizer
+            .streaming_decoder_preserving_special_ids(&[eos, eos, plain])
+            .unwrap();
+        assert!(duplicate_and_ordinary.push(eos).unwrap().is_some());
+        assert!(duplicate_and_ordinary.push(plain).unwrap().is_some());
+        let suffix = duplicate_and_ordinary.finish().unwrap();
+        assert!(suffix.is_empty());
+
+        let over_limit = [eos; MAX_PRESERVED_SPECIAL_IDS + 1];
+        let error = tokenizer
+            .streaming_decoder_preserving_special_ids(&over_limit)
+            .err()
+            .expect("over-limit input fails deterministically");
+        assert_eq!(
+            error.to_string(),
+            "decode error: selective decoder special-ID limit exceeded (maximum 8)"
+        );
+    }
+
+    #[test]
+    fn selective_special_suppression_preserves_split_utf8_and_eof_order() {
+        let tokenizer = byte_fallback(&[
+            ("<0xE5>", 0),
+            ("<0x8F>", 1),
+            ("<0xAB>", 2),
+            ("<eos>", 3),
+            ("<|tool_call>", 4),
+        ]);
+        let mut inner = tokenizer.inner.as_ref().clone();
+        inner
+            .add_special_tokens([
+                AddedToken::from("<eos>", true),
+                AddedToken::from("<|tool_call>", true),
+            ])
+            .expect("special tokens register");
+        let tokenizer = handle(inner);
+        let eos = tokenizer.token_to_id("<eos>").unwrap();
+        let opener = tokenizer.token_to_id("<|tool_call>").unwrap();
+        let mut decoder = tokenizer
+            .streaming_decoder_preserving_special_ids(&[opener])
+            .unwrap();
+        assert_eq!(decoder.push(0).unwrap(), None);
+        assert_eq!(decoder.push(eos).unwrap(), None);
+        assert_eq!(decoder.push(1).unwrap(), None);
+        assert_eq!(decoder.push(2).unwrap().as_deref(), Some("叫"));
+        let opener_fragment = decoder.push(opener).unwrap().unwrap_or_default();
+        let suffix = decoder.finish().unwrap();
+        assert_eq!(format!("{opener_fragment}{suffix}"), "<|tool_call>");
     }
 
     #[test]
