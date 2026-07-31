@@ -49,6 +49,35 @@ const MINIMAL_TOKENIZER_JSON: &str = r#"{
   }
 }"#;
 
+/// A model-free BPE/ByteFallback tokenizer whose generated `<0xE5>` token is
+/// unresolved by incremental `push` and becomes one replacement scalar only
+/// when the response decoder is finished at EOF.
+const EOF_FALLBACK_TOKENIZER_JSON: &str = r#"{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {"id": 0, "content": "<eos>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 1, "content": "<bos>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {"type": "ByteFallback"},
+  "model": {
+    "type": "BPE",
+    "dropout": null,
+    "unk_token": null,
+    "continuing_subword_prefix": null,
+    "end_of_word_suffix": null,
+    "fuse_unk": false,
+    "byte_fallback": true,
+    "ignore_merges": false,
+    "vocab": {"<eos>": 0, "<bos>": 1, "<0xE5>": 2},
+    "merges": []
+  }
+}"#;
+
 /// A trivial chat template that just concatenates the messages' content. It
 /// emits no special tokens (the contract tests don't need real gemma4 framing
 /// — they exercise the HTTP/taxonomy layer, not the template).
@@ -64,8 +93,18 @@ fn test_server(
     context: ContextWindow,
     control: &ControlState,
 ) -> Server {
-    let tokenizer = TokenizerHandle::from_bytes(MINIMAL_TOKENIZER_JSON.as_bytes())
-        .expect("minimal tokenizer loads");
+    test_server_with_tokenizer(stub, bearer, context, control, MINIMAL_TOKENIZER_JSON)
+}
+
+fn test_server_with_tokenizer(
+    stub: StubEngine,
+    bearer: Option<&str>,
+    context: ContextWindow,
+    control: &ControlState,
+    tokenizer_json: &str,
+) -> Server {
+    let tokenizer =
+        TokenizerHandle::from_bytes(tokenizer_json.as_bytes()).expect("model-free tokenizer loads");
     let template = ChatTemplate::from_source(TRIVIAL_TEMPLATE, "<bos>", "<eos>")
         .expect("trivial template compiles");
     Server::new(ServerConfig {
@@ -720,13 +759,97 @@ async fn streaming_and_non_streaming_share_incremental_decode_semantics() {
 }
 
 #[tokio::test]
+async fn eof_only_fallback_text_precedes_both_dialects_terminal_frames() {
+    let control = fresh_control();
+    let srv = test_server_with_tokenizer(
+        StubEngine {
+            tokens: vec![2],
+            block_after: None,
+        },
+        None,
+        4096,
+        &control,
+        EOF_FALLBACK_TOKENIZER_JSON,
+    );
+
+    let (status, anthropic_json) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":false}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let response: serde_json::Value = serde_json::from_str(&anthropic_json).unwrap();
+    let anthropic_expected = response["content"][0]["text"].as_str().unwrap();
+    assert_eq!(anthropic_expected, "�");
+
+    let (status, anthropic_sse) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        streamed_text(&anthropic_sse, "anthropic"),
+        anthropic_expected
+    );
+    assert_eq!(anthropic_sse.matches('�').count(), 1, "{anthropic_sse}");
+    let suffix = anthropic_sse.find("\"text\":\"�\"").unwrap();
+    let message_delta = anthropic_sse.find("event: message_delta\n").unwrap();
+    let message_stop = anthropic_sse.find("event: message_stop\n").unwrap();
+    assert!(suffix < message_delta, "EOF text precedes message_delta");
+    assert!(
+        message_delta < message_stop,
+        "message_delta precedes message_stop"
+    );
+
+    let (status, openai_json) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/chat/completions",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":false}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let response: serde_json::Value = serde_json::from_str(&openai_json).unwrap();
+    let openai_expected = response["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap();
+    assert_eq!(openai_expected, anthropic_expected);
+
+    let (status, openai_sse) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/chat/completions",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(streamed_text(&openai_sse, "openai"), openai_expected);
+    assert_eq!(openai_sse.matches('�').count(), 1, "{openai_sse}");
+    let suffix = openai_sse.find("\"content\":\"�\"").unwrap();
+    let terminal = openai_sse.find("\"finish_reason\":\"stop\"").unwrap();
+    let done = openai_sse.find("data: [DONE]\n\n").unwrap();
+    assert!(suffix < terminal, "EOF text precedes terminal chunk");
+    assert!(terminal < done, "terminal chunk precedes [DONE]");
+}
+
+#[tokio::test]
 async fn streaming_decoder_failure_is_one_opaque_error_without_terminal_frame() {
     let control = fresh_control();
     let srv = test_server(
         StubEngine {
             // Unknown IDs decode to no text in the fixture tokenizer, creating
-            // an adversarial unresolved run that exceeds the 256-ID ceiling.
-            tokens: vec![99_999; 257],
+            // an adversarial unresolved run with substantial generation left
+            // when the 257th ID exceeds the decoder ceiling.
+            tokens: vec![99_999; 10_000],
             block_after: None,
         },
         None,
@@ -757,6 +880,9 @@ async fn streaming_decoder_failure_is_one_opaque_error_without_terminal_frame() 
         !body.contains("retained token limit"),
         "details stay opaque: {body}"
     );
+    assert!(!control.is_in_flight(), "failed stream releases its permit");
+    let (reload, _) = send(srv.router(), Method::POST, "/control/reload", &[], "").await;
+    assert_eq!(reload, StatusCode::NOT_IMPLEMENTED, "permit is not stuck");
 }
 
 #[tokio::test]
@@ -764,7 +890,7 @@ async fn non_streaming_decoder_failure_uses_opaque_dialect_envelope() {
     let control = fresh_control();
     let srv = test_server(
         StubEngine {
-            tokens: vec![99_999; 257],
+            tokens: vec![99_999; 10_000],
             block_after: None,
         },
         None,
@@ -788,6 +914,12 @@ async fn non_streaming_decoder_failure_uses_opaque_dialect_envelope() {
         !body.contains("retained token limit"),
         "details stay opaque: {body}"
     );
+    assert!(
+        !control.is_in_flight(),
+        "failed request releases its permit"
+    );
+    let (reload, _) = send(srv.router(), Method::POST, "/control/reload", &[], "").await;
+    assert_eq!(reload, StatusCode::NOT_IMPLEMENTED, "permit is not stuck");
 }
 
 /// The in_flight flag clears when a stream is dropped (client disconnect).

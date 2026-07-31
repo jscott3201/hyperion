@@ -14,6 +14,7 @@
 
 pub mod renderer;
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -84,6 +85,7 @@ impl SpecialTokenPolicy {
 pub struct StreamingDecoder {
     tokenizer: Arc<Tokenizer>,
     skip_special_tokens: bool,
+    skipped_special_ids: HashSet<u32>,
     ids: Vec<u32>,
     prefix: String,
     prefix_index: usize,
@@ -92,6 +94,13 @@ pub struct StreamingDecoder {
 impl StreamingDecoder {
     /// Push one generated token ID, returning only newly safe decoded text.
     pub fn push(&mut self, id: u32) -> Result<Option<String>, TokenizerError> {
+        // The dependency's skip flag omits special-token text from decode, but
+        // its stream helper still retains the corresponding ID. Skip them at
+        // the boundary so controls cannot consume unresolved-state capacity or
+        // disturb an incomplete byte-fallback sequence.
+        if self.skipped_special_ids.contains(&id) {
+            return Ok(None);
+        }
         if self.ids.len() >= MAX_RETAINED_TOKEN_IDS {
             return Err(TokenizerError::Decode(format!(
                 "streaming decoder retained token limit exceeded (maximum {MAX_RETAINED_TOKEN_IDS})"
@@ -213,9 +222,20 @@ impl TokenizerHandle {
     /// Create one bounded incremental decoder for a generated response.
     #[must_use]
     pub fn streaming_decoder(&self, policy: SpecialTokenPolicy) -> StreamingDecoder {
+        let skipped_special_ids = if policy == SpecialTokenPolicy::Skip {
+            self.inner
+                .get_added_vocabulary()
+                .get_added_tokens_decoder()
+                .iter()
+                .filter_map(|(id, token)| token.special.then_some(*id))
+                .collect()
+        } else {
+            HashSet::new()
+        };
         StreamingDecoder {
             tokenizer: self.inner.clone(),
             skip_special_tokens: policy.skip_special_tokens(),
+            skipped_special_ids,
             ids: Vec::new(),
             prefix: String::new(),
             prefix_index: 0,
@@ -364,6 +384,34 @@ mod tests {
         assert_eq!(
             collect_stream(&tokenizer, &ids, SpecialTokenPolicy::Skip).unwrap(),
             "hello world"
+        );
+    }
+
+    #[test]
+    fn skipped_specials_do_not_consume_or_disturb_unresolved_state() {
+        let tokenizer = byte_fallback(&[("<0xE5>", 0), ("<0x8F>", 1), ("<0xAB>", 2), ("<eos>", 3)]);
+        let mut inner = tokenizer.inner.as_ref().clone();
+        inner
+            .add_special_tokens([AddedToken::from("<eos>", true)])
+            .expect("special token registers");
+        let tokenizer = handle(inner);
+        let special_id = tokenizer.token_to_id("<eos>").expect("special ID");
+
+        let mut decoder = tokenizer.streaming_decoder(SpecialTokenPolicy::Skip);
+        assert_eq!(decoder.push(0).unwrap(), None);
+        for _ in 0..(MAX_RETAINED_TOKEN_IDS + 1) {
+            assert_eq!(decoder.push(special_id).unwrap(), None);
+        }
+        assert_eq!(decoder.ids, vec![0], "skipped IDs never enter state");
+        assert_eq!(decoder.push(1).unwrap(), None);
+        assert_eq!(decoder.push(special_id).unwrap(), None);
+        assert_eq!(decoder.push(2).unwrap().as_deref(), Some("叫"));
+        assert_eq!(decoder.finish().unwrap(), "");
+
+        assert_eq!(
+            collect_stream(&tokenizer, &[0, 1, 2], SpecialTokenPolicy::Skip).unwrap(),
+            "叫",
+            "skipped controls leave fallback assembly equivalent to no controls"
         );
     }
 
