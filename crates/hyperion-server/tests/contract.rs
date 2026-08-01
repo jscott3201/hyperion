@@ -276,6 +276,36 @@ impl EngineDriver for ControlledFailureEngine {
     }
 }
 
+struct PrefixBarrierEngine {
+    release_tail: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl EngineDriver for PrefixBarrierEngine {
+    fn stream(
+        &self,
+        request: &EngineRequest,
+        _cancel: &CancelToken,
+        tx: tokio::sync::mpsc::Sender<StepEvent>,
+    ) -> Result<Usage, EngineError> {
+        tx.blocking_send(StepEvent::Token(StepToken { id: 3, logit: 0.0 }))
+            .map_err(|_| EngineError::Cancelled)?;
+        self.release_tail
+            .lock()
+            .expect("tail barrier mutex")
+            .recv()
+            .map_err(|_| EngineError::Cancelled)?;
+        tx.blocking_send(StepEvent::Token(StepToken { id: 2, logit: 0.0 }))
+            .map_err(|_| EngineError::Cancelled)?;
+        let usage = Usage {
+            prompt_tokens: u32::try_from(request.prompt_tokens.len()).unwrap_or(u32::MAX),
+            completion_tokens: 2,
+        };
+        tx.blocking_send(StepEvent::Done(usage))
+            .map_err(|_| EngineError::Cancelled)?;
+        Ok(usage)
+    }
+}
+
 struct ControlledDisconnectEngine {
     started: std::sync::mpsc::SyncSender<()>,
     cancelled_and_closed: std::sync::mpsc::SyncSender<()>,
@@ -412,6 +442,81 @@ fn sse_json_frames(body: &str) -> Vec<serde_json::Value> {
         .filter(|data| *data != "[DONE]")
         .map(|data| serde_json::from_str(data).expect("SSE data frame contains valid JSON"))
         .collect()
+}
+
+async fn observe_prefix_before_malformed_tail(
+    uri: &str,
+    request_body: &str,
+    dialect: &str,
+) -> (String, String) {
+    let control = fresh_control();
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let srv = test_server_with_engine(
+        Arc::new(PrefixBarrierEngine {
+            release_tail: Mutex::new(release_rx),
+        }),
+        None,
+        4096,
+        &control,
+        EOF_FALLBACK_TOKENIZER_JSON,
+    );
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(request_body.to_string()))
+        .expect("streaming request builds");
+    let response = match srv.router().oneshot(request).await {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = release_tx.send(());
+            panic!("streaming request failed before barrier release: {error}");
+        }
+    };
+    let status = response.status();
+    let mut body = response.into_body();
+    let mut pre_release_bytes = Vec::new();
+    let pre_release_result = loop {
+        let pre_release = String::from_utf8_lossy(&pre_release_bytes);
+        if streamed_text(&pre_release, dialect) == "hello" {
+            break Ok(());
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(2), body.frame()).await {
+            Ok(Some(Ok(frame))) => {
+                if let Ok(data) = frame.into_data() {
+                    pre_release_bytes.extend_from_slice(&data);
+                }
+            }
+            Ok(Some(Err(error))) => break Err(format!("body read failed: {error}")),
+            Ok(None) => break Err("body ended before the prefix arrived".to_string()),
+            Err(_) => break Err("timed out before the prefix arrived".to_string()),
+        }
+    };
+
+    let release_result = release_tx.send(());
+    let remaining_result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        axum::body::to_bytes(body, 1024 * 1024),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        release_result.is_ok(),
+        "engine dropped the malformed-tail barrier"
+    );
+    assert!(
+        pre_release_result.is_ok(),
+        "{}",
+        pre_release_result.unwrap_err()
+    );
+    let remaining = remaining_result
+        .expect("stream completes after malformed-tail release")
+        .expect("remaining SSE body is readable");
+    let pre_release = String::from_utf8_lossy(&pre_release_bytes).into_owned();
+    let mut full_body = pre_release.clone();
+    full_body.push_str(&String::from_utf8_lossy(&remaining));
+    (pre_release, full_body)
 }
 
 fn anthropic_stream_content(body: &str) -> serde_json::Value {
@@ -1779,20 +1884,29 @@ async fn mixed_256_token_stream_matches_one_shot_for_both_sse_dialects() {
             .all(|frame| frame["type"] != "error"),
         "successful stream has no error frame: {anthropic}"
     );
-    assert_eq!(
-        anthropic_frames
+    let content_delta_indices = anthropic_frames
+        .iter()
+        .enumerate()
+        .filter_map(|(index, frame)| (frame["type"] == "content_block_delta").then_some(index))
+        .collect::<Vec<_>>();
+    let message_delta_indices = anthropic_frames
+        .iter()
+        .enumerate()
+        .filter_map(|(index, frame)| (frame["type"] == "message_delta").then_some(index))
+        .collect::<Vec<_>>();
+    let message_stop_indices = anthropic_frames
+        .iter()
+        .enumerate()
+        .filter_map(|(index, frame)| (frame["type"] == "message_stop").then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(message_delta_indices.len(), 1);
+    assert_eq!(message_stop_indices.len(), 1);
+    assert!(
+        content_delta_indices
             .iter()
-            .filter(|frame| frame["type"] == "message_delta")
-            .count(),
-        1
+            .all(|index| *index < message_delta_indices[0])
     );
-    assert_eq!(
-        anthropic_frames
-            .iter()
-            .filter(|frame| frame["type"] == "message_stop")
-            .count(),
-        1
-    );
+    assert!(message_delta_indices[0] < message_stop_indices[0]);
 
     let (status, openai) = send(
         srv.router(),
@@ -1813,18 +1927,44 @@ async fn mixed_256_token_stream_matches_one_shot_for_both_sse_dialects() {
             .all(|frame| frame.get("error").is_none()),
         "successful stream has no error frame: {openai}"
     );
-    assert_eq!(
-        openai_frames
+    let finish_indices = openai_frames
+        .iter()
+        .enumerate()
+        .filter_map(|(index, frame)| {
+            frame["choices"][0]
+                .get("finish_reason")
+                .is_some_and(|reason| !reason.is_null())
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(finish_indices.len(), 1);
+    let content_indices = openai_frames
+        .iter()
+        .enumerate()
+        .filter_map(|(index, frame)| {
+            frame["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(|_| index)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        content_indices
             .iter()
-            .filter(|frame| {
-                frame["choices"][0]
-                    .get("finish_reason")
-                    .is_some_and(|reason| !reason.is_null())
-            })
+            .all(|index| *index < finish_indices[0])
+    );
+    assert_eq!(finish_indices[0], openai_frames.len() - 1);
+    let data_payloads = openai
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        data_payloads
+            .iter()
+            .filter(|payload| **payload == "[DONE]")
             .count(),
         1
     );
-    assert_eq!(openai.matches("data: [DONE]\n\n").count(), 1);
+    assert_eq!(data_payloads.last(), Some(&"[DONE]"));
 }
 
 #[tokio::test]
@@ -1950,27 +2090,21 @@ async fn malformed_eof_fallback_fails_closed_for_both_dialects() {
 
 #[tokio::test]
 async fn malformed_eof_after_valid_prefix_emits_prefix_then_one_opaque_error() {
-    let control = fresh_control();
-    let srv = test_server_with_tokenizer(
-        StubEngine {
-            tokens: vec![3, 2],
-            block_after: None,
-        },
-        None,
-        4096,
-        &control,
-        EOF_FALLBACK_TOKENIZER_JSON,
-    );
-
-    let (status, anthropic) = send(
-        srv.router(),
-        Method::POST,
+    let (anthropic_pre_release, anthropic) = observe_prefix_before_malformed_tail(
         "/v1/messages",
-        &[("content-type", "application/json")],
         r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":true}"#,
+        "anthropic",
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(streamed_text(&anthropic_pre_release, "anthropic"), "hello");
+    let pre_release_frames = sse_json_frames(&anthropic_pre_release);
+    assert!(
+        pre_release_frames
+            .iter()
+            .all(|frame| frame["type"] != "error")
+    );
+    assert!(!anthropic_pre_release.contains("message_delta"));
+    assert!(!anthropic_pre_release.contains("message_stop"));
     assert_eq!(streamed_text(&anthropic, "anthropic"), "hello");
     let anthropic_error = serde_json::json!({
         "type": "error",
@@ -2005,15 +2139,25 @@ async fn malformed_eof_after_valid_prefix_emits_prefix_then_one_opaque_error() {
     assert!(!anthropic.contains("message_delta"));
     assert!(!anthropic.contains("message_stop"));
 
-    let (status, openai) = send(
-        srv.router(),
-        Method::POST,
+    let (openai_pre_release, openai) = observe_prefix_before_malformed_tail(
         "/v1/chat/completions",
-        &[("content-type", "application/json")],
         r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":true}"#,
+        "openai",
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(streamed_text(&openai_pre_release, "openai"), "hello");
+    let pre_release_frames = sse_json_frames(&openai_pre_release);
+    assert!(
+        pre_release_frames
+            .iter()
+            .all(|frame| frame.get("error").is_none())
+    );
+    assert!(pre_release_frames.iter().all(|frame| {
+        frame["choices"][0]
+            .get("finish_reason")
+            .is_none_or(serde_json::Value::is_null)
+    }));
+    assert!(!openai_pre_release.contains("data: [DONE]"));
     assert_eq!(streamed_text(&openai, "openai"), "hello");
     let openai_error = serde_json::json!({
         "error": {
@@ -2051,6 +2195,67 @@ async fn malformed_eof_after_valid_prefix_emits_prefix_then_one_opaque_error() {
     assert!(!openai.contains('\u{FFFD}'));
     assert!(!openai.contains("replacement character"));
     assert!(!openai.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+async fn non_streaming_malformed_eof_discards_collected_prefix_for_both_dialects() {
+    let control = fresh_control();
+    let srv = test_server_with_tokenizer(
+        StubEngine {
+            tokens: vec![3, 2],
+            block_after: None,
+        },
+        None,
+        4096,
+        &control,
+        EOF_FALLBACK_TOKENIZER_JSON,
+    );
+
+    let (status, anthropic) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":false}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&anthropic).unwrap(),
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "internal_server_error",
+                "message": "internal server error"
+            }
+        })
+    );
+    assert!(!anthropic.contains("hello"));
+    assert!(!anthropic.contains('\u{FFFD}'));
+    assert!(!anthropic.contains("replacement character"));
+
+    let (status, openai) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/chat/completions",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":false}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&openai).unwrap(),
+        serde_json::json!({
+            "error": {
+                "message": "internal server error",
+                "type": "internal_server_error",
+                "code": null
+            }
+        })
+    );
+    assert!(!openai.contains("hello"));
+    assert!(!openai.contains('\u{FFFD}'));
+    assert!(!openai.contains("replacement character"));
 }
 
 #[tokio::test]
