@@ -988,7 +988,7 @@ fn validate_raw_key(key: &str, path: &str) -> Result<(), ToolSchemaError> {
                 )
         })
     {
-        return Err(error(path, "is unsafe for raw template emission"));
+        return Err(error(path, "is not safe for raw template emission"));
     }
     reject_reserved(key, path)
 }
