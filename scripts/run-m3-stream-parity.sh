@@ -870,6 +870,7 @@ m3_metal=$(m3_pinned_xcrun -sdk macosx metal -print-prog-name=metal)
 
 m3_identify_tools() {
     m3_pinned_python -I -S - "$@" <<'PY'
+# M3_TOOL_IDENTITY_PYTHON_BEGIN
 import hashlib
 import json
 import os
@@ -908,11 +909,8 @@ if not identities["cmake"]["canonical_path"].startswith(
     "/opt/homebrew/Cellar/cmake/"
 ):
     raise SystemExit("fixed CMake path does not resolve inside the M5 Homebrew cellar")
-if not identities["metal"]["canonical_path"].startswith(
-    "/private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-"
-):
-    raise SystemExit("metal compiler does not resolve inside the installed MobileAsset toolchain")
 print(json.dumps(identities, sort_keys=True, separators=(",", ":")))
+# M3_TOOL_IDENTITY_PYTHON_END
 PY
 }
 

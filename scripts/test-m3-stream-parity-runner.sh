@@ -1284,6 +1284,43 @@ printf '%s\n' '#!/bin/bash' 'exit 0' >"$m3_test_versioned_driver"
 m3_test_versioned_developer_canonical=$(cd "$m3_test_versioned_developer" && pwd -P)
 m3_test_versioned_driver_canonical=$(cd "${m3_test_versioned_driver%/*}" && pwd -P)/metal
 m3_test_versioned_driver_sha=$(m3_test_sha256 "$m3_test_versioned_driver")
+
+# Exercise the exact embedded tool-identity checker against an Xcode-native
+# actual Metal compiler path. Its absolute invocation, canonical executable,
+# and digest remain bound without requiring an Apple MobileAsset mount.
+m3_test_tool_identity_helper="$m3_test_scratch/tool-identity.py"
+/usr/bin/awk '
+    /^# M3_TOOL_IDENTITY_PYTHON_BEGIN$/ { capture=1; next }
+    /^# M3_TOOL_IDENTITY_PYTHON_END$/ { capture=0; found=1; exit }
+    capture { print }
+    END { if (!found) exit 1 }
+' scripts/run-m3-stream-parity.sh >"$m3_test_tool_identity_helper"
+if [[ ! -s "$m3_test_tool_identity_helper" ]]; then
+    echo "could not extract the runner tool-identity checker" >&2
+    exit 1
+fi
+m3_test_login_home=$(/usr/bin/python3 -I -S -c '
+import os
+import pwd
+
+print(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir))
+')
+m3_test_tool_identities=$(/usr/bin/python3 -I -S \
+    "$m3_test_tool_identity_helper" \
+    rustup "$m3_test_login_home/.cargo/bin/rustup" \
+    cargo "$m3_test_login_home/.cargo/bin/cargo" \
+    rustc "$m3_test_login_home/.cargo/bin/rustc" \
+    cmake /opt/homebrew/bin/cmake \
+    metal "$m3_test_versioned_driver")
+/usr/bin/jq -e \
+    --arg invocation "$m3_test_versioned_driver" \
+    --arg canonical "$m3_test_versioned_driver_canonical" \
+    --arg sha256 "$m3_test_versioned_driver_sha" '
+    .metal.invocation_path == $invocation and
+    .metal.canonical_path == $canonical and
+    .metal.sha256 == $sha256
+' <<<"$m3_test_tool_identities" >/dev/null
+
 m3_test_versioned_selection=$(/usr/bin/python3 -I -S \
     "$m3_test_xcode_binding_helper" \
     selection "$m3_test_versioned_developer")
