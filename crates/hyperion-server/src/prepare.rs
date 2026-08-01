@@ -3,12 +3,13 @@
 //! `/v1/messages` or OpenAI `/v1/chat/completions`) is parsed into a
 //! `ChatMessage` list + sampler config, rendered through the M3 chat template,
 //! tokenized, and packaged as a [`PreparedPrompt`] — the `EngineRequest` +
-//! stream flag + dialect the handler feeds to the engine.
+//! stream flag + dialect the handler feeds to the engine. Provider-shaped
+//! tool history is accepted only when generation is explicitly disabled.
 //!
 //! The 413 context-overflow check (`prompt_tokens + max_tokens > context`)
 //! lives here, distinct from the 32 MiB body-size 413 (B5's
-//! `DefaultBodyLimit`). Tools are rejected with 400 in PR B — the tool-call
-//! parser is a later M3 sub-slice.
+//! `DefaultBodyLimit`). Model-generated tool calls remain disabled until the
+//! response parser/framing slice lands.
 
 use hyperion_ffi::HypSamplingConfig;
 use hyperion_tokenizer::TokenizerHandle;
@@ -16,6 +17,10 @@ use hyperion_tokenizer::renderer::{ChatMessage, ChatTemplate, RenderError, Rende
 
 use crate::dialect::Dialect;
 use crate::engine::EngineRequest;
+use crate::history::{AnthropicHistoryInput, OpenAiHistoryInput, ToolHistoryError};
+use crate::tool_schema::{
+    AnthropicToolsInput, OpenAiToolsInput, ToolMode, ToolRegistry, ToolSchemaError,
+};
 
 /// The context window (tokens) used for the 413 overflow check. The 12B's
 /// `max_position_embeddings` (262_144); passed in from the loaded geometry so
@@ -44,9 +49,15 @@ pub struct PreparedPrompt {
 pub enum PrepareError {
     /// The JSON body was malformed or missing required fields → 400.
     MalformedBody(String),
-    /// The body carried `tools` / `tool_choice` — not supported in PR B (the
-    /// tool-call parser is a later slice) → 400.
+    /// The request enables model-generated tool calls before response parsing
+    /// and framing support is available → 400.
     ToolsUnsupported,
+    /// Tool declarations or controls failed bounded registry compilation →
+    /// 400. The public display text does not expose the source error.
+    ToolSchema(ToolSchemaError),
+    /// Provider history failed bounded normalization → 400. The public display
+    /// text does not expose the source error.
+    ToolHistory(ToolHistoryError),
     /// The chat template failed to render → 400 (a malformed input the
     /// template rejected, e.g. bad `tool_calls` arguments).
     Render(RenderError),
@@ -64,6 +75,8 @@ impl std::fmt::Display for PrepareError {
         match self {
             Self::MalformedBody(s) => write!(f, "malformed request body: {s}"),
             Self::ToolsUnsupported => f.write_str("tool calling is not yet supported"),
+            Self::ToolSchema(_) => f.write_str("invalid tool schema"),
+            Self::ToolHistory(_) => f.write_str("invalid tool history"),
             Self::Render(e) => write!(f, "template render error: {e}"),
             Self::ContextOverflow {
                 prompt_tokens,
@@ -77,14 +90,27 @@ impl std::fmt::Display for PrepareError {
     }
 }
 
-impl std::error::Error for PrepareError {}
+impl std::error::Error for PrepareError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ToolSchema(error) => Some(error),
+            Self::ToolHistory(error) => Some(error),
+            Self::Render(error) => Some(error),
+            Self::MalformedBody(_) | Self::ToolsUnsupported | Self::ContextOverflow { .. } => None,
+        }
+    }
+}
 
 impl PrepareError {
     /// The HTTP status code this error maps to (06 §Error taxonomy).
     #[must_use]
     pub fn http_status(&self) -> u16 {
         match self {
-            Self::MalformedBody(_) | Self::ToolsUnsupported | Self::Render(_) => 400,
+            Self::MalformedBody(_)
+            | Self::ToolsUnsupported
+            | Self::ToolSchema(_)
+            | Self::ToolHistory(_)
+            | Self::Render(_) => 400,
             Self::ContextOverflow { .. } => 413,
         }
     }
@@ -132,8 +158,8 @@ impl SamplerParams {
 /// fold into a leading system `ChatMessage`.
 #[derive(Deserialize)]
 pub struct AnthropicBody {
-    #[serde(default)]
-    pub messages: Vec<RawMessage>,
+    #[serde(default = "empty_messages")]
+    pub messages: serde_json::Value,
     #[serde(default)]
     pub system: Option<serde_json::Value>,
     /// Anthropic requires `max_tokens`.
@@ -146,7 +172,6 @@ pub struct AnthropicBody {
     pub top_k: Option<u32>,
     #[serde(default)]
     pub stream: Option<bool>,
-    /// Tools are rejected in PR B (later slice).
     #[serde(default)]
     pub tools: Option<serde_json::Value>,
     #[serde(default)]
@@ -156,8 +181,8 @@ pub struct AnthropicBody {
 /// The OpenAI `/v1/chat/completions` request body.
 #[derive(Deserialize)]
 pub struct OpenAiBody {
-    #[serde(default)]
-    pub messages: Vec<RawMessage>,
+    #[serde(default = "empty_messages")]
+    pub messages: serde_json::Value,
     #[serde(default)]
     pub max_tokens: Option<u32>,
     #[serde(default)]
@@ -176,83 +201,102 @@ pub struct OpenAiBody {
     pub tools: Option<serde_json::Value>,
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
-}
-
-/// A dialect-agnostic message: `role` + `content` (string or parts). Both
-/// dialects' message shapes deserialize into this (the `content` is kept as a
-/// `serde_json::Value` so the renderer's `ChatMessage` handles string-or-array).
-#[derive(Deserialize)]
-pub struct RawMessage {
-    pub role: String,
     #[serde(default)]
-    pub content: serde_json::Value,
+    pub parallel_tool_calls: Option<serde_json::Value>,
 }
 
-/// Normalize a parsed body into `ChatMessage`s + sampler params. Shared by both
-/// dialects; the dialect only changes which fields are read + how `system` is
-/// folded in.
-fn to_chat_messages(
-    messages: &[RawMessage],
-    system: Option<&serde_json::Value>,
-) -> Result<Vec<ChatMessage>, PrepareError> {
-    let mut out = Vec::with_capacity(messages.len() + 1);
-    if let Some(system) = system {
-        // A non-empty system (string or array of blocks) → a leading system
-        // message. The renderer handles string or content-parts via the Value.
-        if !system.is_null() {
-            out.push(ChatMessage {
-                role: "system".to_string(),
-                content: Some(system.clone()),
-                tool_calls: None,
-                tool_responses: None,
-                reasoning: None,
-                reasoning_content: None,
-                tool_call_id: None,
-                name: None,
-            });
-        }
-    }
-    for m in messages {
-        if m.role.is_empty() {
-            return Err(PrepareError::MalformedBody(
-                "message missing role".to_string(),
-            ));
-        }
-        out.push(ChatMessage {
-            role: m.role.clone(),
-            content: Some(m.content.clone()),
-            tool_calls: None,
-            tool_responses: None,
-            reasoning: None,
-            reasoning_content: None,
-            tool_call_id: None,
-            name: None,
-        });
-    }
-    Ok(out)
+fn empty_messages() -> serde_json::Value {
+    serde_json::Value::Array(Vec::new())
 }
 
-/// Reject tools (PR B scope: tool-calling is a later slice). `Some` tools or a
-/// non-`none` tool_choice → `ToolsUnsupported` (400).
-fn check_tools(
-    tools: &Option<serde_json::Value>,
-    tool_choice: &Option<serde_json::Value>,
+fn has_non_null_tools(tools: Option<&serde_json::Value>) -> bool {
+    tools.is_some_and(|tools| !tools.is_null())
+}
+
+fn require_history_only_generation(
+    registry: &ToolRegistry,
+    tools_present: bool,
+    explicit_none: bool,
 ) -> Result<(), PrepareError> {
-    if tools.is_some() {
-        return Err(PrepareError::ToolsUnsupported);
+    if registry.mode() == ToolMode::Auto || (tools_present && !explicit_none) {
+        Err(PrepareError::ToolsUnsupported)
+    } else {
+        Ok(())
     }
-    if let Some(choice) = tool_choice {
-        // `tool_choice: "none"` is allowed (no tools requested); anything else
-        // implies tool use, which is unsupported in PR B.
-        let is_none = match choice {
-            serde_json::Value::String(s) => s == "none",
-            _ => false,
-        };
-        if !is_none {
-            return Err(PrepareError::ToolsUnsupported);
-        }
-    }
-    Ok(())
+}
+
+/// Compile declarations, enforce OpenAI's explicit history-only generation
+/// boundary, then normalize the complete provider message value.
+fn normalize_openai_for_generation(body: &OpenAiBody) -> Result<Vec<ChatMessage>, PrepareError> {
+    let registry = ToolRegistry::from_openai(OpenAiToolsInput {
+        tools: body.tools.as_ref(),
+        tool_choice: body.tool_choice.as_ref(),
+        parallel_tool_calls: body.parallel_tool_calls.as_ref(),
+    })
+    .map_err(PrepareError::ToolSchema)?;
+    let explicit_none = body.tool_choice.as_ref().is_some_and(
+        |choice| matches!(choice, serde_json::Value::String(value) if value == "none"),
+    );
+    require_history_only_generation(
+        &registry,
+        has_non_null_tools(body.tools.as_ref()),
+        explicit_none,
+    )?;
+    registry
+        .normalize_openai_history(OpenAiHistoryInput {
+            messages: &body.messages,
+        })
+        .map_err(PrepareError::ToolHistory)
+}
+
+/// Compile declarations, enforce Anthropic's explicit history-only generation
+/// boundary, then normalize the complete provider system/messages values.
+fn normalize_anthropic_for_generation(
+    body: &AnthropicBody,
+) -> Result<Vec<ChatMessage>, PrepareError> {
+    let registry = ToolRegistry::from_anthropic(AnthropicToolsInput {
+        tools: body.tools.as_ref(),
+        tool_choice: body.tool_choice.as_ref(),
+    })
+    .map_err(PrepareError::ToolSchema)?;
+    let explicit_none = body.tool_choice.as_ref().is_some_and(|choice| {
+        choice
+            .as_object()
+            .and_then(|choice| choice.get("type"))
+            .and_then(serde_json::Value::as_str)
+            == Some("none")
+    });
+    require_history_only_generation(
+        &registry,
+        has_non_null_tools(body.tools.as_ref()),
+        explicit_none,
+    )?;
+    registry
+        .normalize_anthropic_history(AnthropicHistoryInput {
+            system: body.system.as_ref(),
+            messages: &body.messages,
+        })
+        .map_err(PrepareError::ToolHistory)
+}
+
+/// Compile and normalize Anthropic count-only input without applying the
+/// generation capability gate. `Auto` declarations are intentionally returned
+/// for prompt rendering; `None` declarations are hidden by the registry.
+fn normalize_anthropic_for_count(
+    body: &AnthropicBody,
+) -> Result<(Vec<ChatMessage>, Vec<serde_json::Value>), PrepareError> {
+    let registry = ToolRegistry::from_anthropic(AnthropicToolsInput {
+        tools: body.tools.as_ref(),
+        tool_choice: body.tool_choice.as_ref(),
+    })
+    .map_err(PrepareError::ToolSchema)?;
+    let messages = registry
+        .normalize_anthropic_history(AnthropicHistoryInput {
+            system: body.system.as_ref(),
+            messages: &body.messages,
+        })
+        .map_err(PrepareError::ToolHistory)?;
+    Ok((messages, registry.render_tools().to_vec()))
 }
 
 /// Prepare an Anthropic `/v1/messages` body into a `PreparedPrompt`.
@@ -260,8 +304,10 @@ fn check_tools(
 /// # Errors
 /// - `PrepareError::MalformedBody` — bad JSON or missing `max_tokens` (Anthropic
 ///   requires it).
-/// - `PrepareError::ToolsUnsupported` — body carries `tools`/non-`none`
-///   `tool_choice`.
+/// - `PrepareError::ToolsUnsupported` — the effective tool mode permits model
+///   generation, or declarations are present without an explicit `none`.
+/// - `PrepareError::ToolSchema` / `PrepareError::ToolHistory` — bounded tool
+///   declaration/history validation failed.
 /// - `PrepareError::Render` — the chat template rejected the conversation.
 /// - `PrepareError::ContextOverflow` — `prompt + max_tokens > context`.
 pub fn prepare_anthropic(
@@ -272,11 +318,10 @@ pub fn prepare_anthropic(
 ) -> Result<PreparedPrompt, PrepareError> {
     let parsed: AnthropicBody =
         serde_json::from_str(body).map_err(|e| PrepareError::MalformedBody(e.to_string()))?;
-    check_tools(&parsed.tools, &parsed.tool_choice)?;
     let max_tokens = parsed
         .max_tokens
         .ok_or_else(|| PrepareError::MalformedBody("Anthropic requires max_tokens".to_string()))?;
-    let messages = to_chat_messages(&parsed.messages, parsed.system.as_ref())?;
+    let messages = normalize_anthropic_for_generation(&parsed)?;
     let sampler = SamplerParams {
         temperature: parsed.temperature,
         top_p: parsed.top_p,
@@ -286,6 +331,7 @@ pub fn prepare_anthropic(
     };
     finalize(
         messages,
+        Vec::new(),
         max_tokens,
         parsed.stream.unwrap_or(false),
         sampler,
@@ -304,8 +350,8 @@ pub fn prepare_anthropic(
 /// [`prepare_anthropic`] — that one requires `max_tokens` for a generation.
 ///
 /// # Errors
-/// `PrepareError::MalformedBody` on bad JSON; `PrepareError::ToolsUnsupported`
-/// if the body carries tools; `PrepareError::Render` on a template failure.
+/// `PrepareError::MalformedBody` on bad JSON; registry/history errors on invalid
+/// bounded input; `PrepareError::Render` on a template failure.
 pub fn count_anthropic_tokens(
     body: &str,
     template: &ChatTemplate,
@@ -313,18 +359,8 @@ pub fn count_anthropic_tokens(
 ) -> Result<u32, PrepareError> {
     let parsed: AnthropicBody =
         serde_json::from_str(body).map_err(|e| PrepareError::MalformedBody(e.to_string()))?;
-    check_tools(&parsed.tools, &parsed.tool_choice)?;
-    let messages = to_chat_messages(&parsed.messages, parsed.system.as_ref())?;
-    let options = RenderOptions {
-        add_generation_prompt: true,
-        enable_thinking: None,
-        preserve_thinking: None,
-        tools: Vec::new(),
-    };
-    let rendered = template
-        .render(&messages, &options)
-        .map_err(PrepareError::Render)?;
-    let prompt_tokens = tokenizer.encode(&rendered, false);
+    let (messages, tools) = normalize_anthropic_for_count(&parsed)?;
+    let prompt_tokens = render_prompt_tokens(&messages, tools, template, tokenizer)?;
     Ok(u32::try_from(prompt_tokens.len()).unwrap_or(u32::MAX))
 }
 
@@ -344,9 +380,8 @@ pub fn prepare_openai(
 ) -> Result<PreparedPrompt, PrepareError> {
     let parsed: OpenAiBody =
         serde_json::from_str(body).map_err(|e| PrepareError::MalformedBody(e.to_string()))?;
-    check_tools(&parsed.tools, &parsed.tool_choice)?;
     let max_tokens = parsed.max_tokens.unwrap_or(default_max_tokens);
-    let messages = to_chat_messages(&parsed.messages, None)?;
+    let messages = normalize_openai_for_generation(&parsed)?;
     let sampler = SamplerParams {
         temperature: parsed.temperature,
         top_p: parsed.top_p,
@@ -356,6 +391,7 @@ pub fn prepare_openai(
     };
     finalize(
         messages,
+        Vec::new(),
         max_tokens,
         parsed.stream.unwrap_or(false),
         sampler,
@@ -382,25 +418,14 @@ pub struct PrepareEnv<'a> {
 /// `eos_token` (the gemma4 `<eos>`); `None` if absent (run to max_tokens).
 fn finalize(
     messages: Vec<ChatMessage>,
+    tools: Vec<serde_json::Value>,
     max_tokens: u32,
     stream: bool,
     sampler: SamplerParams,
     dialect: Dialect,
     env: PrepareEnv<'_>,
 ) -> Result<PreparedPrompt, PrepareError> {
-    let options = RenderOptions {
-        add_generation_prompt: true,
-        enable_thinking: None,   // model default
-        preserve_thinking: None, // template default (false)
-        tools: Vec::new(),
-    };
-    let rendered = env
-        .template
-        .render(&messages, &options)
-        .map_err(PrepareError::Render)?;
-    // add_special_tokens=false: the template emits its own BOS; the tokenizer's
-    // empty special-tokens post-processor means no auto-add anyway.
-    let prompt_tokens = env.tokenizer.encode(&rendered, false);
+    let prompt_tokens = render_prompt_tokens(&messages, tools, env.template, env.tokenizer)?;
     let prompt_tokens_len = u32::try_from(prompt_tokens.len()).unwrap_or(u32::MAX);
     if prompt_tokens_len.saturating_add(max_tokens) > env.context {
         return Err(PrepareError::ContextOverflow {
@@ -424,11 +449,82 @@ fn finalize(
     })
 }
 
+fn render_prompt_tokens(
+    messages: &[ChatMessage],
+    tools: Vec<serde_json::Value>,
+    template: &ChatTemplate,
+    tokenizer: &TokenizerHandle,
+) -> Result<Vec<u32>, PrepareError> {
+    let options = RenderOptions {
+        add_generation_prompt: true,
+        enable_thinking: None,   // model default
+        preserve_thinking: None, // template default (false)
+        tools,
+    };
+    let rendered = template
+        .render(messages, &options)
+        .map_err(PrepareError::Render)?;
+    // add_special_tokens=false: the template emits its own BOS; the tokenizer's
+    // empty special-tokens post-processor means no auto-add anyway.
+    Ok(tokenizer.encode(&rendered, false))
+}
+
 use serde::Deserialize;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    const COUNT_TOKENIZER_JSON: &str = r#"{
+      "version": "1.0",
+      "truncation": null,
+      "padding": null,
+      "added_tokens": [
+        {"id": 0, "content": "<eos>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+        {"id": 1, "content": "<bos>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+      ],
+      "normalizer": null,
+      "pre_tokenizer": {"type": "Whitespace"},
+      "post_processor": null,
+      "decoder": null,
+      "model": {
+        "type": "WordLevel",
+        "vocab": {"<eos>": 0, "<bos>": 1, "DECL": 2, "user": 3, "hi": 4, "[UNK]": 5},
+        "unk_token": "[UNK]"
+      }
+    }"#;
+
+    fn openai_tool() -> serde_json::Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "look something up",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                    "additionalProperties": false
+                },
+                "strict": false
+            }
+        })
+    }
+
+    fn anthropic_tool() -> serde_json::Value {
+        json!({
+            "name": "lookup",
+            "description": "look something up",
+            "input_schema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": false
+            },
+            "strict": false
+        })
+    }
 
     #[test]
     fn sampler_greedy_when_temperature_unset_or_zero() {
@@ -473,53 +569,143 @@ mod tests {
     }
 
     #[test]
-    fn check_tools_rejects_tools_array() {
-        let tools = Some(serde_json::json!([{"type": "function"}]));
+    fn openai_structured_history_survives_deserialization_and_normalizes_with_none() {
+        let body: OpenAiBody = serde_json::from_value(json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{\"query\":\"hi\"}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "world"}
+            ],
+            "tools": [openai_tool()],
+            "tool_choice": "none",
+            "parallel_tool_calls": true
+        }))
+        .unwrap();
+
+        assert!(body.messages[1].get("tool_calls").is_some());
+        let messages = normalize_openai_for_generation(&body).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert!(messages[1].tool_calls.is_some());
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(messages[2].name.as_deref(), Some("lookup"));
+    }
+
+    #[test]
+    fn anthropic_structured_history_survives_deserialization_and_normalizes_with_none() {
+        let body: AnthropicBody = serde_json::from_value(json!({
+            "system": "be concise",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "lookup",
+                    "input": {"query": "hi"}
+                }]},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": "world"
+                }]}
+            ],
+            "tools": [anthropic_tool()],
+            "tool_choice": {"type": "none"}
+        }))
+        .unwrap();
+
+        assert_eq!(body.messages[1]["content"][0]["type"], "tool_use");
+        let messages = normalize_anthropic_for_generation(&body).unwrap();
+        assert_eq!(messages[0].role, "system");
+        assert!(messages[2].tool_calls.is_some());
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some("toolu_1"));
+    }
+
+    #[test]
+    fn present_tools_require_explicit_none_even_when_registry_defaults_to_none() {
+        let body: OpenAiBody = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": []
+        }))
+        .unwrap();
         assert!(matches!(
-            check_tools(&tools, &None),
+            normalize_openai_for_generation(&body),
             Err(PrepareError::ToolsUnsupported)
         ));
     }
 
     #[test]
-    fn check_tools_rejects_non_none_tool_choice() {
-        let choice = Some(serde_json::json!("auto"));
+    fn effective_auto_is_rejected_before_generation_rendering() {
+        let body: AnthropicBody = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": {"type": "auto"}
+        }))
+        .unwrap();
         assert!(matches!(
-            check_tools(&None, &choice),
+            normalize_anthropic_for_generation(&body),
             Err(PrepareError::ToolsUnsupported)
         ));
     }
 
     #[test]
-    fn check_tools_allows_none_choice() {
-        let choice = Some(serde_json::json!("none"));
-        assert!(check_tools(&None, &choice).is_ok());
-        assert!(check_tools(&None, &None).is_ok());
+    fn missing_messages_still_defaults_to_an_empty_array() {
+        let openai: OpenAiBody = serde_json::from_str("{}").unwrap();
+        let anthropic: AnthropicBody = serde_json::from_str("{}").unwrap();
+        assert_eq!(openai.messages, json!([]));
+        assert_eq!(anthropic.messages, json!([]));
     }
 
     #[test]
-    fn to_chat_messages_folds_system_anthropic() {
-        let msgs = vec![RawMessage {
-            role: "user".to_string(),
-            content: serde_json::json!("hi"),
-        }];
-        let system = Some(serde_json::json!("you are helpful"));
-        let out = to_chat_messages(&msgs, system.as_ref()).unwrap();
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].role, "system");
-        assert_eq!(out[1].role, "user");
+    fn fixed_tool_error_displays_do_not_reflect_source_payloads() {
+        let schema_body: OpenAiBody = serde_json::from_value(json!({
+            "messages": [],
+            "tools": [{"SENTINEL_SCHEMA_KEY": true}],
+            "tool_choice": "none"
+        }))
+        .unwrap();
+        let schema_error = normalize_openai_for_generation(&schema_body).unwrap_err();
+        assert_eq!(schema_error.to_string(), "invalid tool schema");
+        assert!(!schema_error.to_string().contains("SENTINEL"));
+        assert_eq!(schema_error.http_status(), 400);
+
+        let history_body: OpenAiBody = serde_json::from_value(json!({
+            "messages": [{"role": "SENTINEL_HISTORY_ROLE", "content": "secret"}]
+        }))
+        .unwrap();
+        let history_error = normalize_openai_for_generation(&history_body).unwrap_err();
+        assert_eq!(history_error.to_string(), "invalid tool history");
+        assert!(!history_error.to_string().contains("SENTINEL"));
+        assert_eq!(history_error.http_status(), 400);
     }
 
     #[test]
-    fn to_chat_messages_rejects_empty_role() {
-        let msgs = vec![RawMessage {
-            role: String::new(),
-            content: serde_json::json!("hi"),
-        }];
-        assert!(matches!(
-            to_chat_messages(&msgs, None),
-            Err(PrepareError::MalformedBody(_))
-        ));
+    fn count_tokens_renders_auto_declarations_but_hides_none_without_max_tokens() {
+        let tokenizer = TokenizerHandle::from_bytes(COUNT_TOKENIZER_JSON.as_bytes()).unwrap();
+        let template = ChatTemplate::from_source(
+            "{% if tools | length > 0 %}DECL {% endif %}{% for message in messages %}{{ message.role }} {{ message.content }} {% endfor %}",
+            "<bos>",
+            "<eos>",
+        )
+        .unwrap();
+        let base = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [anthropic_tool()]
+        });
+        let mut auto = base.clone();
+        auto["tool_choice"] = json!({"type": "auto"});
+        let mut none = base;
+        none["tool_choice"] = json!({"type": "none"});
+
+        let auto_count = count_anthropic_tokens(&auto.to_string(), &template, &tokenizer).unwrap();
+        let none_count = count_anthropic_tokens(&none.to_string(), &template, &tokenizer).unwrap();
+        assert_eq!(auto_count, none_count + 1);
     }
 
     #[test]
@@ -534,11 +720,16 @@ mod tests {
     }
 
     #[test]
-    fn prepare_anthropic_rejects_tools_with_400() {
-        let body = r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":10,"tools":[]}"#;
-        let parsed: AnthropicBody = serde_json::from_str(body).unwrap();
+    fn prepare_anthropic_rejects_auto_tools_with_400() {
+        let parsed: AnthropicBody = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 10,
+            "tools": [anthropic_tool()],
+            "tool_choice": {"type": "auto"}
+        }))
+        .unwrap();
         assert!(matches!(
-            check_tools(&parsed.tools, &parsed.tool_choice),
+            normalize_anthropic_for_generation(&parsed),
             Err(PrepareError::ToolsUnsupported)
         ));
         assert_eq!(PrepareError::ToolsUnsupported.http_status(), 400);
