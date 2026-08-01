@@ -146,6 +146,7 @@ m3_clangxx=/usr/bin/clang++
 m3_ar=/usr/bin/ar
 m3_ranlib=/usr/bin/ranlib
 m3_xcrun=/usr/bin/xcrun
+m3_xcode_select=/usr/bin/xcode-select
 m3_make=/usr/bin/make
 m3_sh=/bin/sh
 m3_cc=/usr/bin/cc
@@ -253,6 +254,12 @@ if prohibited:
 '
 }
 
+m3_xcode_developer_dir=$("$m3_env" -i \
+    HOME="$m3_login_home" \
+    PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    TMPDIR="$m3_user_tmp" \
+    LANG=C LC_ALL=C \
+    "$m3_xcode_select" --print-path)
 m3_metal_driver=$("$m3_env" -i \
     HOME="$m3_login_home" \
     PATH=/usr/bin:/bin:/usr/sbin:/sbin \
@@ -297,6 +304,7 @@ m3_tool_identities_json=$("$m3_python" -I -S - \
     ar "$m3_ar" \
     ranlib "$m3_ranlib" \
     xcrun "$m3_xcrun" \
+    xcode_select "$m3_xcode_select" \
     make "$m3_make" \
     sh "$m3_sh" \
     cc "$m3_cc" \
@@ -343,15 +351,91 @@ if not identities["cmake"]["canonical_path"].startswith(
     "/opt/homebrew/Cellar/cmake/"
 ):
     raise SystemExit("fixed CMake path does not resolve inside the M5 Homebrew cellar")
-if not identities["metal_driver"]["canonical_path"].startswith(
-    "/Applications/Xcode.app/Contents/Developer/Toolchains/"
-):
-    raise SystemExit("xcrun metal driver does not resolve inside the fixed Xcode toolchain")
 if not identities["metal"]["canonical_path"].startswith(
     "/private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-"
 ):
     raise SystemExit("metal compiler does not resolve inside the installed MobileAsset toolchain")
 print(json.dumps(identities, sort_keys=True, separators=(",", ":")))
+PY
+)
+
+m3_xcode_binding_json=$("$m3_python" -I -S - \
+    "$m3_xcode_developer_dir" "$m3_metal_driver" <<'PY'
+# M3_XCODE_BINDING_PYTHON_BEGIN
+import json
+import os
+import stat
+import sys
+
+
+def fail(message):
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def canonical_path(path, description):
+    if not os.path.isabs(path) or os.path.normpath(path) != path:
+        fail(f"{description} is not normalized and absolute")
+    return os.path.realpath(path)
+
+
+selected_invocation, metal_driver_invocation = sys.argv[1:]
+selected_canonical = canonical_path(
+    selected_invocation, "selected Xcode developer directory"
+)
+try:
+    selected_metadata = os.stat(selected_canonical, follow_symlinks=False)
+except OSError as error:
+    fail(f"selected Xcode developer directory is unavailable: {error}")
+if not stat.S_ISDIR(selected_metadata.st_mode):
+    fail("selected Xcode developer directory is not a real directory")
+
+toolchains_root = os.path.join(selected_canonical, "Toolchains")
+try:
+    toolchains_metadata = os.stat(toolchains_root, follow_symlinks=False)
+except OSError as error:
+    fail(f"selected Xcode Toolchains directory is unavailable: {error}")
+if not stat.S_ISDIR(toolchains_metadata.st_mode):
+    fail("selected Xcode Toolchains path is not a real directory")
+
+metal_driver_canonical = canonical_path(
+    metal_driver_invocation, "xcrun metal driver"
+)
+try:
+    metal_driver_metadata = os.stat(metal_driver_canonical, follow_symlinks=False)
+except OSError as error:
+    fail(f"xcrun metal driver is unavailable: {error}")
+if not stat.S_ISREG(metal_driver_metadata.st_mode):
+    fail("xcrun metal driver is not a real regular file")
+if metal_driver_metadata.st_mode & 0o111 == 0:
+    fail("xcrun metal driver is not executable")
+try:
+    if (
+        os.path.commonpath((toolchains_root, metal_driver_canonical))
+        != toolchains_root
+        or metal_driver_canonical == toolchains_root
+    ):
+        fail("xcrun metal driver escapes the selected Xcode toolchain")
+except ValueError:
+    fail("xcrun metal driver is on a different path root")
+
+print(
+    json.dumps(
+        {
+            "developer_dir": {
+                "invocation_path": selected_invocation,
+                "canonical_path": selected_canonical,
+            },
+            "metal_driver": {
+                "invocation_path": metal_driver_invocation,
+                "canonical_path": metal_driver_canonical,
+            },
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+)
+# M3_XCODE_BINDING_PYTHON_END
 PY
 )
 
@@ -415,6 +499,7 @@ m3_write_manifest() {
         --arg hash_path "$m3_hash_path" \
         --arg user_tmp "$m3_user_tmp" \
         --argjson tools "$m3_tool_identities_json" \
+        --argjson xcode_binding "$m3_xcode_binding_json" \
         --arg preflight_sha "$m3_preflight_sha" \
         --arg identity_sha "$m3_identity_sha" \
         --arg build_sha "$m3_build_sha" \
@@ -558,6 +643,7 @@ m3_write_manifest() {
           },
           execution_identity: {
             controlled_path: $controlled_path,
+            xcode_binding: $xcode_binding,
             tools: $tools
           },
           trust_boundary: {

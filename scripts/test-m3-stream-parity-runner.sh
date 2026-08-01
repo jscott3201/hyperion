@@ -128,7 +128,7 @@ m3_test_fake_marker="$m3_test_scratch/fake-tool-executed"
 for m3_test_fake_name in \
     dirname date mkdir mv tee shasum awk jq python3 git sort head tail \
     uname sysctl sw_vers env mktemp getconf cargo rustc rustup cmake clang clang++ \
-    ar ranlib xcrun make
+    ar ranlib xcrun xcode-select make
 do
     # shellcheck disable=SC2016 # The generated shim expands at execution time.
     printf '%s\n' \
@@ -255,11 +255,22 @@ m3_test_assert_static_identity() {
         .execution_identity.tools as $tools |
         ($tools.shasum.invocation_path == "/usr/bin/shasum") and
         ($tools.perl.invocation_path == "/usr/bin/perl") and
+        ($tools.xcode_select.invocation_path == "/usr/bin/xcode-select") and
+        (.execution_identity.xcode_binding as $binding |
+          ($binding.developer_dir.invocation_path | startswith("/")) and
+          ($binding.developer_dir.canonical_path | startswith("/")) and
+          $binding.metal_driver.invocation_path ==
+            $tools.metal_driver.invocation_path and
+          $binding.metal_driver.canonical_path ==
+            $tools.metal_driver.canonical_path and
+          ($binding.metal_driver.canonical_path |
+            startswith($binding.developer_dir.canonical_path + "/Toolchains/"))) and
         ([
           "bash", "dirname", "date", "mkdir", "mv", "tee", "shasum",
           "perl", "awk", "jq", "python3", "git", "sort", "head", "tail",
           "uname", "sysctl", "sw_vers", "env", "mktemp", "getconf", "cargo", "rustc",
           "rustup", "cmake", "clang", "clangxx", "ar", "ranlib", "xcrun",
+          "xcode_select",
           "make", "sh", "cc", "ld", "libtool", "install_name_tool",
           "metal_driver", "metal"
         ] |
@@ -914,6 +925,95 @@ fi
 ' "$m3_test_owner_evidence/manifest.json" >/dev/null
 m3_test_assert_static_identity "$m3_test_owner_evidence"
 m3_test_assert_log_hashes "$m3_test_owner_evidence"
+
+# Exercise the exact embedded selected-Xcode binding helper without a model,
+# network, or mutation of the system developer-tool selection. Both a directly
+# selected versioned app and the unversioned symlink spelling must bind to the
+# same canonical developer directory. Prefix-boundary escape and cross-Xcode
+# substitution controls must fail closed.
+m3_test_xcode_binding_helper="$m3_test_scratch/xcode-binding.py"
+/usr/bin/awk '
+    /^# M3_XCODE_BINDING_PYTHON_BEGIN$/ { capture=1; next }
+    /^# M3_XCODE_BINDING_PYTHON_END$/ { capture=0; found=1; exit }
+    capture { print }
+    END { if (!found) exit 1 }
+' scripts/run-m3-stream-parity.sh >"$m3_test_xcode_binding_helper"
+if [[ ! -s "$m3_test_xcode_binding_helper" ]]; then
+    echo "could not extract the runner selected-Xcode binding helper" >&2
+    exit 1
+fi
+
+m3_test_xcode_layout="$m3_test_scratch/xcode-layout"
+m3_test_versioned_developer="$m3_test_xcode_layout/Xcode_26.2.app/Contents/Developer"
+m3_test_versioned_driver="$m3_test_versioned_developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/metal"
+/bin/mkdir -p "${m3_test_versioned_driver%/*}"
+printf '%s\n' '#!/bin/bash' 'exit 0' >"$m3_test_versioned_driver"
+/bin/chmod +x "$m3_test_versioned_driver"
+m3_test_versioned_developer_canonical=$(cd "$m3_test_versioned_developer" && pwd -P)
+m3_test_versioned_driver_canonical=$(cd "${m3_test_versioned_driver%/*}" && pwd -P)/metal
+m3_test_versioned_binding=$(/usr/bin/python3 -I -S \
+    "$m3_test_xcode_binding_helper" \
+    "$m3_test_versioned_developer" "$m3_test_versioned_driver")
+/usr/bin/jq -e \
+    --arg invocation "$m3_test_versioned_developer" \
+    --arg canonical "$m3_test_versioned_developer_canonical" \
+    --arg driver "$m3_test_versioned_driver_canonical" '
+    .developer_dir.invocation_path == $invocation and
+    .developer_dir.canonical_path == $canonical and
+    .metal_driver.canonical_path == $driver
+' <<<"$m3_test_versioned_binding" >/dev/null
+
+/bin/ln -s Xcode_26.2.app "$m3_test_xcode_layout/Xcode.app"
+m3_test_unversioned_developer="$m3_test_xcode_layout/Xcode.app/Contents/Developer"
+m3_test_unversioned_driver="$m3_test_unversioned_developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/metal"
+m3_test_unversioned_binding=$(/usr/bin/python3 -I -S \
+    "$m3_test_xcode_binding_helper" \
+    "$m3_test_unversioned_developer" "$m3_test_unversioned_driver")
+/usr/bin/jq -e \
+    --arg invocation "$m3_test_unversioned_developer" \
+    --arg canonical "$m3_test_versioned_developer_canonical" \
+    --arg driver "$m3_test_versioned_driver_canonical" '
+    .developer_dir.invocation_path == $invocation and
+    .developer_dir.canonical_path == $canonical and
+    .metal_driver.canonical_path == $driver
+' <<<"$m3_test_unversioned_binding" >/dev/null
+
+m3_test_boundary_driver="$m3_test_versioned_developer/Toolchains.evil/XcodeDefault.xctoolchain/usr/bin/metal"
+/bin/mkdir -p "${m3_test_boundary_driver%/*}"
+printf '%s\n' '#!/bin/bash' 'exit 0' >"$m3_test_boundary_driver"
+/bin/chmod +x "$m3_test_boundary_driver"
+if /usr/bin/python3 -I -S "$m3_test_xcode_binding_helper" \
+    "$m3_test_versioned_developer" "$m3_test_boundary_driver" \
+    >"$m3_test_scratch/xcode-boundary.out" 2>&1
+then
+    echo "selected-Xcode binding accepted a Toolchains prefix-boundary escape" >&2
+    exit 1
+fi
+if ! /usr/bin/grep -q 'escapes the selected Xcode toolchain' \
+    "$m3_test_scratch/xcode-boundary.out"
+then
+    echo "selected-Xcode boundary control did not report the escape" >&2
+    exit 1
+fi
+
+m3_test_substitute_developer="$m3_test_xcode_layout/Xcode_substitute.app/Contents/Developer"
+m3_test_substitute_driver="$m3_test_substitute_developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/metal"
+/bin/mkdir -p "${m3_test_substitute_driver%/*}"
+printf '%s\n' '#!/bin/bash' 'exit 0' >"$m3_test_substitute_driver"
+/bin/chmod +x "$m3_test_substitute_driver"
+if /usr/bin/python3 -I -S "$m3_test_xcode_binding_helper" \
+    "$m3_test_versioned_developer" "$m3_test_substitute_driver" \
+    >"$m3_test_scratch/xcode-substitution.out" 2>&1
+then
+    echo "selected-Xcode binding accepted a driver from another Xcode app" >&2
+    exit 1
+fi
+if ! /usr/bin/grep -q 'escapes the selected Xcode toolchain' \
+    "$m3_test_scratch/xcode-substitution.out"
+then
+    echo "selected-Xcode substitution control did not report the escape" >&2
+    exit 1
+fi
 
 # Exercise the exact embedded Cargo executable resolver without compiling.
 m3_test_resolver="$m3_test_scratch/contract-resolver.py"
