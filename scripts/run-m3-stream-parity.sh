@@ -122,6 +122,7 @@ m3_direct_test_exit_status=null
 m3_test_binary_sha256=
 m3_test_binary_receipt_path=
 m3_xcode_postflight_verified=false
+m3_rust_toolchain_postflight_verified=false
 m3_build_root=
 m3_build_root_parent=
 m3_build_root_dev=
@@ -868,6 +869,115 @@ m3_pinned_python() {
 m3_metal_driver=$(m3_pinned_xcrun --find metal)
 m3_metal=$(m3_pinned_xcrun -sdk macosx metal -print-prog-name=metal)
 
+m3_identify_effective_rust_tools() {
+    m3_pinned_python -I -S - "$@" <<'PY'
+# M3_EFFECTIVE_RUST_IDENTITY_PYTHON_BEGIN
+import hashlib
+import json
+import os
+import stat
+import sys
+
+
+def fail(message):
+    raise SystemExit(message)
+
+
+def canonical_directory(path, description):
+    if not os.path.isabs(path) or os.path.normpath(path) != path:
+        fail(f"{description} is not normalized and absolute")
+    canonical = os.path.realpath(path)
+    if canonical != path:
+        fail(f"{description} is not canonical")
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        fail(f"{description} is unavailable: {error}")
+    if not stat.S_ISDIR(metadata.st_mode):
+        fail(f"{description} is not a real directory")
+    return canonical
+
+
+def executable_identity(name, invocation_path, toolchains_root):
+    if not os.path.isabs(invocation_path) or os.path.normpath(invocation_path) != invocation_path:
+        fail(f"effective {name} path is not normalized and absolute")
+    if os.path.basename(invocation_path) != name:
+        fail(f"effective {name} path has an unexpected basename")
+    canonical_path = os.path.realpath(invocation_path)
+    if canonical_path != invocation_path:
+        fail(f"effective {name} path is not canonical (symlink or substitution rejected)")
+    try:
+        metadata = os.stat(canonical_path, follow_symlinks=False)
+    except OSError as error:
+        fail(f"effective {name} executable is unavailable: {error}")
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o111 == 0:
+        fail(f"effective {name} is not a regular executable")
+    try:
+        relative = os.path.relpath(canonical_path, toolchains_root)
+        inside_boundary = os.path.commonpath(
+            [toolchains_root, canonical_path]
+        ) == toolchains_root
+    except ValueError:
+        inside_boundary = False
+        relative = ""
+    parts = relative.split(os.sep)
+    if (
+        not inside_boundary
+        or relative.startswith(os.pardir + os.sep)
+        or len(parts) != 3
+        or not parts[0]
+        or parts[0] in (os.curdir, os.pardir)
+        or parts[1] != "bin"
+        or parts[2] != name
+    ):
+        fail(f"effective {name} escapes the canonical rustup toolchains boundary")
+    digest = hashlib.sha256()
+    try:
+        with open(canonical_path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as error:
+        fail(f"effective {name} executable is unreadable: {error}")
+    return parts[0], {
+        "invocation_path": invocation_path,
+        "canonical_path": canonical_path,
+        "sha256": digest.hexdigest(),
+    }
+
+
+if len(sys.argv) != 4:
+    fail("effective Rust identity requires rustup home, Cargo path, and rustc path")
+rustup_home = canonical_directory(sys.argv[1], "canonical rustup home")
+toolchains_root = canonical_directory(
+    os.path.join(rustup_home, "toolchains"),
+    "canonical rustup toolchains root",
+)
+cargo_toolchain, cargo_identity = executable_identity(
+    "cargo", sys.argv[2], toolchains_root
+)
+rustc_toolchain, rustc_identity = executable_identity(
+    "rustc", sys.argv[3], toolchains_root
+)
+if cargo_toolchain != rustc_toolchain:
+    fail("effective Cargo and rustc do not belong to one rustup toolchain")
+print(json.dumps(
+    {"cargo_actual": cargo_identity, "rustc_actual": rustc_identity},
+    sort_keys=True,
+    separators=(",", ":"),
+))
+# M3_EFFECTIVE_RUST_IDENTITY_PYTHON_END
+PY
+}
+
+m3_resolve_effective_rust_tools() {
+    local m3_resolved_cargo
+    local m3_resolved_rustc
+    m3_resolved_cargo=$(m3_toolchain_query "$m3_rustup" which cargo) || return $?
+    m3_resolved_rustc=$(m3_toolchain_query "$m3_rustup" which rustc) || return $?
+    m3_identify_effective_rust_tools \
+        "$m3_rustup_home" "$m3_resolved_cargo" "$m3_resolved_rustc"
+}
+
 m3_identify_tools() {
     m3_pinned_python -I -S - "$@" <<'PY'
 # M3_TOOL_IDENTITY_PYTHON_BEGIN
@@ -917,7 +1027,9 @@ PY
 m3_collect_tool_identities() {
     local m3_identity_metal_driver=$1
     local m3_identity_metal=$2
-    m3_identify_tools \
+    local m3_effective_rust_identities=$3
+    local m3_fixed_tool_identities
+    m3_fixed_tool_identities=$(m3_identify_tools \
         bash /bin/bash \
         dirname "$m3_dirname" \
         date "$m3_date" \
@@ -956,11 +1068,23 @@ m3_collect_tool_identities() {
         libtool "$m3_libtool" \
         install_name_tool "$m3_install_name_tool" \
         metal_driver "$m3_identity_metal_driver" \
-        metal "$m3_identity_metal"
+        metal "$m3_identity_metal") || return $?
+    "$m3_jq" -cn \
+        --argjson fixed "$m3_fixed_tool_identities" \
+        --argjson effective "$m3_effective_rust_identities" \
+        '$fixed + $effective'
 }
 
+m3_effective_rust_identities_json=$(m3_resolve_effective_rust_tools)
+m3_cargo_actual=$("$m3_jq" -er \
+    '.cargo_actual.canonical_path | select(type == "string" and startswith("/"))' \
+    <<<"$m3_effective_rust_identities_json")
+m3_rustc_actual=$("$m3_jq" -er \
+    '.rustc_actual.canonical_path | select(type == "string" and startswith("/"))' \
+    <<<"$m3_effective_rust_identities_json")
+m3_effective_rust_toolchain_root=${m3_cargo_actual%/bin/cargo}
 m3_tool_identities_json=$(m3_collect_tool_identities \
-    "$m3_metal_driver" "$m3_metal")
+    "$m3_metal_driver" "$m3_metal" "$m3_effective_rust_identities_json")
 m3_preflight_tool_identities_json=$m3_tool_identities_json
 
 m3_xcode_binding_json=$(m3_validate_xcode_binding \
@@ -974,6 +1098,7 @@ m3_verify_xcode_postflight() {
     local m3_post_metal_driver
     local m3_post_metal
     local m3_post_xcode_binding_json
+    local m3_post_effective_rust_identities_json
     local m3_post_tool_identities_json
 
     m3_post_xcode_developer_dir_invocation=$(m3_read_active_xcode_developer_dir) || return $?
@@ -989,13 +1114,21 @@ m3_verify_xcode_postflight() {
         echo "selected Xcode binding changed across the real-model test"
         return 1
     fi
+    m3_post_effective_rust_identities_json=$(m3_resolve_effective_rust_tools) || return $?
+    if [[ "$m3_post_effective_rust_identities_json" != \
+          "$m3_effective_rust_identities_json" ]]; then
+        echo "effective Rust toolchain resolution changed across the real-model test"
+        return 1
+    fi
     m3_post_tool_identities_json=$(m3_collect_tool_identities \
-        "$m3_post_metal_driver" "$m3_post_metal") || return $?
+        "$m3_post_metal_driver" "$m3_post_metal" \
+        "$m3_post_effective_rust_identities_json") || return $?
     if [[ "$m3_post_tool_identities_json" != "$m3_preflight_tool_identities_json" ]]; then
         echo "developer-tool identities changed across the real-model test"
         return 1
     fi
-    printf '%s\n' 'selected Xcode binding and developer-tool identities unchanged'
+    printf '%s\n' \
+        'selected Xcode binding and effective/fixed developer-tool identities unchanged'
 }
 
 m3_note() {
@@ -1058,9 +1191,15 @@ m3_write_manifest() {
         --arg hash_path "$m3_hash_path" \
         --arg user_tmp "$m3_user_tmp" \
         --arg xcode_developer_dir "$m3_xcode_developer_dir" \
+        --arg rustup_home "$m3_rustup_home" \
+        --arg cargo_actual "$m3_cargo_actual" \
+        --arg rustc_actual "$m3_rustc_actual" \
+        --arg effective_rust_toolchain_root "$m3_effective_rust_toolchain_root" \
         --argjson tools "$m3_tool_identities_json" \
         --argjson xcode_binding "$m3_xcode_binding_json" \
         --argjson xcode_postflight_verified "$m3_xcode_postflight_verified" \
+        --argjson rust_toolchain_postflight_verified \
+            "$m3_rust_toolchain_postflight_verified" \
         --arg preflight_sha "$m3_preflight_sha" \
         --arg identity_sha "$m3_identity_sha" \
         --arg build_sha "$m3_build_sha" \
@@ -1129,6 +1268,7 @@ m3_write_manifest() {
           started_at_utc: $started,
           finished_at_utc: (if $finished == "" then null else $finished end),
           command: {
+            build_executable: $cargo_actual,
             build_argv: [
               "cargo", "test", "--locked", "--offline",
               "-p", "hyperion-server", "--test", "contract",
@@ -1250,6 +1390,13 @@ m3_write_manifest() {
               LANG: "C",
               LC_ALL: "C"
             },
+            effective_rust_resolution: {
+              environment_launcher: "/usr/bin/env -i",
+              executable: "<canonical-login-home>/.cargo/bin/rustup",
+              cargo_argv: ["<canonical-login-home>/.cargo/bin/rustup", "which", "cargo"],
+              rustc_argv: ["<canonical-login-home>/.cargo/bin/rustup", "which", "rustc"],
+              policy: "both results must be canonical regular executables in one canonical RUSTUP_HOME/toolchains/<toolchain>/bin directory; symlinks, substitutions, and path escapes are rejected"
+            },
             build_environment: {
               CARGO_TARGET_DIR: "<fresh-runner-target-root>",
               HOME: "<fresh-runner-target-root>/build-home",
@@ -1260,6 +1407,7 @@ m3_write_manifest() {
               TMPDIR: $user_tmp,
               LANG: "C",
               LC_ALL: "C",
+              RUSTC: $rustc_actual,
               CC: "/usr/bin/clang",
               CXX: "/usr/bin/clang++",
               AR: "/usr/bin/ar",
@@ -1280,11 +1428,22 @@ m3_write_manifest() {
             xcode_binding: ($xcode_binding + {
               postflight_verified: $xcode_postflight_verified
             }),
+            rust_toolchain_binding: {
+              rustup_home: $rustup_home,
+              toolchain_root: $effective_rust_toolchain_root,
+              postflight_verified: $rust_toolchain_postflight_verified,
+              verification: "fixed rustup which cargo/rustc re-resolved and effective executable identities compared exactly after the real-model test"
+            },
             tools: $tools
           },
           trust_boundary: {
             active_same_uid_mutation_excluded: true,
-            statement: "This receipt does not attest against active same-UID mutation of source, artifacts, toolchain files, or running processes; external isolation or privilege separation is required."
+            preexisting_user_writable_rust_inputs_trusted: true,
+            preexisting_cargo_registry_cache_inputs_trusted: true,
+            rust_inputs: "Preexisting user-writable Rust installation and toolchain bytes are trusted inputs. The effective Cargo and rustc executable identities are recorded and compared postflight.",
+            cargo_inputs: "Preexisting user-writable Cargo registry/cache material is a trusted input. Cargo.lock plus any Cargo-performed checksum validation apply where applicable, but this receipt does not independently inventory or attest dependency-source bytes.",
+            stronger_guarantee: "A stronger provenance guarantee requires an owner-approved toolchain/cache or external isolation.",
+            statement: "This receipt does not attest against active same-UID mutation of source, artifacts, toolchain files, or running processes; external isolation or privilege separation is required. Preexisting user-writable Rust installation/toolchain bytes and Cargo registry/cache material remain trusted inputs."
           },
           execution: {
             build_exit_status: $build_exit_status,
@@ -1832,8 +1991,8 @@ if [[ "$m3_machine_architecture" != arm64 ]]; then
     m3_note "M3 stream parity requires Apple arm64; found $m3_machine_architecture"
     exit 1
 fi
-m3_rustc_version=$(m3_toolchain_query "$m3_rustc" --version --verbose)
-m3_cargo_version=$(m3_toolchain_query "$m3_cargo" --version)
+m3_rustc_version=$(m3_toolchain_query "$m3_rustc_actual" --version --verbose)
+m3_cargo_version=$(m3_toolchain_query "$m3_cargo_actual" --version)
 m3_cmake_version=$(m3_toolchain_query "$m3_cmake" --version | "$m3_head" -n 1)
 m3_clang_version=$(m3_toolchain_query "$m3_clang" --version | "$m3_head" -n 1)
 m3_python_version=$(m3_toolchain_query "$m3_python" --version 2>&1)
@@ -2026,9 +2185,10 @@ set +e
     PATH="$m3_controlled_path" \
     TMPDIR="$m3_user_tmp" \
     LANG=C LC_ALL=C \
+    RUSTC="$m3_rustc_actual" \
     CC="$m3_clang" CXX="$m3_clangxx" \
     AR="$m3_ar" RANLIB="$m3_ranlib" CMAKE="$m3_cmake" \
-    "$m3_cargo" "${m3_build_argv[@]:1}" 2>&1 \
+    "$m3_cargo_actual" "${m3_build_argv[@]:1}" 2>&1 \
     | "$m3_tee" "$m3_cargo_machine_output" \
     | m3_sanitize \
     | "$m3_tee" "$m3_build_log"
@@ -2178,6 +2338,7 @@ if (( m3_post_xcode_status != 0 )); then
     exit "$m3_post_xcode_status"
 fi
 m3_xcode_postflight_verified=true
+m3_rust_toolchain_postflight_verified=true
 
 set +e
 m3_post_identity_output=$(m3_verify_selected_artifact 2>&1)

@@ -187,6 +187,18 @@ m3_test_assert_static_identity() {
     /usr/bin/jq -e '
         .trust_boundary.active_same_uid_mutation_excluded == true and
         (.trust_boundary.statement | contains("active same-UID mutation")) and
+        .trust_boundary.preexisting_user_writable_rust_inputs_trusted == true and
+        .trust_boundary.preexisting_cargo_registry_cache_inputs_trusted == true and
+        (.trust_boundary.rust_inputs |
+          contains("user-writable Rust installation and toolchain bytes are trusted inputs")) and
+        (.trust_boundary.rust_inputs |
+          contains("effective Cargo and rustc executable identities are recorded")) and
+        (.trust_boundary.cargo_inputs |
+          contains("Cargo registry/cache material is a trusted input")) and
+        (.trust_boundary.cargo_inputs |
+          contains("does not independently inventory or attest dependency-source bytes")) and
+        (.trust_boundary.stronger_guarantee |
+          contains("owner-approved toolchain/cache or external isolation")) and
         .command.shell.interpreter == "/bin/bash" and
         .command.shell.invocation == "direct executable" and
         .command.shell.privileged_mode_required == true and
@@ -301,6 +313,15 @@ m3_test_assert_static_identity() {
           contains("MobileAsset/cryptex")) and
         .command.toolchain_query_environment.DEVELOPER_DIR ==
           .command.developer_tools.pin.canonical_value and
+        .command.effective_rust_resolution.environment_launcher == "/usr/bin/env -i" and
+        .command.effective_rust_resolution.executable ==
+          "<canonical-login-home>/.cargo/bin/rustup" and
+        .command.effective_rust_resolution.cargo_argv ==
+          ["<canonical-login-home>/.cargo/bin/rustup", "which", "cargo"] and
+        .command.effective_rust_resolution.rustc_argv ==
+          ["<canonical-login-home>/.cargo/bin/rustup", "which", "rustc"] and
+        (.command.effective_rust_resolution.policy |
+          contains("one canonical RUSTUP_HOME/toolchains/<toolchain>/bin directory")) and
         .command.build_environment.DEVELOPER_DIR ==
           .command.developer_tools.pin.canonical_value and
         .command.direct_test_environment.DEVELOPER_DIR ==
@@ -313,10 +334,35 @@ m3_test_assert_static_identity() {
           startswith("/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:"))
     ' "$m3_test_assert_evidence/manifest.json" >/dev/null
     /usr/bin/jq -e '
+        . as $receipt |
         .execution_identity.tools as $tools |
         ($tools.shasum.invocation_path == "/usr/bin/shasum") and
         ($tools.perl.invocation_path == "/usr/bin/perl") and
         ($tools.xcode_select.invocation_path == "/usr/bin/xcode-select") and
+        ($tools.cargo_actual as $cargo_actual |
+          ($cargo_actual.invocation_path == $cargo_actual.canonical_path) and
+          ($cargo_actual.canonical_path | endswith("/bin/cargo")) and
+          ($cargo_actual.canonical_path |
+            startswith($receipt.execution_identity.rust_toolchain_binding.rustup_home +
+              "/toolchains/")) and
+          ($cargo_actual.sha256 | test("^[0-9a-f]{64}$"))) and
+        ($tools.rustc_actual as $rustc_actual |
+          ($rustc_actual.invocation_path == $rustc_actual.canonical_path) and
+          ($rustc_actual.canonical_path | endswith("/bin/rustc")) and
+          ($rustc_actual.canonical_path |
+            startswith($receipt.execution_identity.rust_toolchain_binding.rustup_home +
+              "/toolchains/")) and
+          ($rustc_actual.sha256 | test("^[0-9a-f]{64}$"))) and
+        (($tools.cargo_actual.canonical_path | sub("/bin/cargo$"; "")) ==
+          ($tools.rustc_actual.canonical_path | sub("/bin/rustc$"; ""))) and
+        .execution_identity.rust_toolchain_binding.toolchain_root ==
+          ($tools.cargo_actual.canonical_path | sub("/bin/cargo$"; "")) and
+        (.execution_identity.rust_toolchain_binding.postflight_verified | type) ==
+          "boolean" and
+        (.execution_identity.rust_toolchain_binding.verification |
+          contains("re-resolved")) and
+        .command.build_executable == $tools.cargo_actual.canonical_path and
+        .command.build_environment.RUSTC == $tools.rustc_actual.canonical_path and
         (.execution_identity.xcode_binding as $binding |
           ($binding.developer_dir.invocation_path | startswith("/")) and
           ($binding.developer_dir.canonical_path | startswith("/")) and
@@ -337,6 +383,7 @@ m3_test_assert_static_identity() {
           "bash", "dirname", "date", "mkdir", "mv", "tee", "shasum",
           "perl", "awk", "jq", "python3", "git", "sort", "head", "tail",
           "uname", "sysctl", "sw_vers", "env", "mktemp", "getconf", "cargo", "rustc",
+          "cargo_actual", "rustc_actual",
           "rustup", "cmake", "clang", "clangxx", "ar", "ranlib", "xcrun",
           "xcode_select",
           "make", "sh", "cc", "ld", "libtool", "install_name_tool",
@@ -397,6 +444,7 @@ fi
     .artifact.identity == null and
     .command.developer_tools.pin.canonical_value != $hostile_developer_dir and
     .execution_identity.xcode_binding.postflight_verified == false and
+    .execution_identity.rust_toolchain_binding.postflight_verified == false and
     .command.build_argv == [
       "cargo", "test", "--locked", "--offline",
       "-p", "hyperion-server", "--test", "contract",
@@ -1320,6 +1368,137 @@ m3_test_tool_identities=$(/usr/bin/python3 -I -S \
     .metal.canonical_path == $canonical and
     .metal.sha256 == $sha256
 ' <<<"$m3_test_tool_identities" >/dev/null
+
+# Exercise the exact embedded effective-Rust resolver with the live fixed
+# rustup query environment used by production, then compare its identities to
+# the receipt. Hostile outside-root, symlink, and cross-toolchain substitution
+# results must all fail closed without running a model.
+m3_test_effective_rust_helper="$m3_test_scratch/effective-rust-identity.py"
+/usr/bin/awk '
+    /^# M3_EFFECTIVE_RUST_IDENTITY_PYTHON_BEGIN$/ { capture=1; next }
+    /^# M3_EFFECTIVE_RUST_IDENTITY_PYTHON_END$/ { capture=0; found=1; exit }
+    capture { print }
+    END { if (!found) exit 1 }
+' scripts/run-m3-stream-parity.sh >"$m3_test_effective_rust_helper"
+if [[ ! -s "$m3_test_effective_rust_helper" ]]; then
+    echo "could not extract the runner effective-Rust identity resolver" >&2
+    exit 1
+fi
+m3_test_rustup_home="$m3_test_login_home/.rustup"
+m3_test_cargo_home="$m3_test_login_home/.cargo"
+m3_test_xcode_developer_dir=$(/usr/bin/jq -er \
+    '.command.developer_tools.pin.canonical_value' \
+    "$m3_test_evidence/manifest.json")
+m3_test_user_tmp=$(/usr/bin/jq -er \
+    '.command.toolchain_query_environment.TMPDIR' \
+    "$m3_test_evidence/manifest.json")
+m3_test_controlled_path="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:$m3_test_cargo_home/bin"
+m3_test_effective_cargo=$(/usr/bin/env -i \
+    HOME="$m3_test_login_home" \
+    CARGO_HOME="$m3_test_cargo_home" \
+    RUSTUP_HOME="$m3_test_rustup_home" \
+    DEVELOPER_DIR="$m3_test_xcode_developer_dir" \
+    PATH="$m3_test_controlled_path" \
+    TMPDIR="$m3_test_user_tmp" \
+    LANG=C LC_ALL=C \
+    "$m3_test_cargo_home/bin/rustup" which cargo)
+m3_test_effective_rustc=$(/usr/bin/env -i \
+    HOME="$m3_test_login_home" \
+    CARGO_HOME="$m3_test_cargo_home" \
+    RUSTUP_HOME="$m3_test_rustup_home" \
+    DEVELOPER_DIR="$m3_test_xcode_developer_dir" \
+    PATH="$m3_test_controlled_path" \
+    TMPDIR="$m3_test_user_tmp" \
+    LANG=C LC_ALL=C \
+    "$m3_test_cargo_home/bin/rustup" which rustc)
+m3_test_effective_rust_identities=$(/usr/bin/python3 -I -S \
+    "$m3_test_effective_rust_helper" \
+    "$m3_test_rustup_home" \
+    "$m3_test_effective_cargo" \
+    "$m3_test_effective_rustc")
+/usr/bin/jq -e \
+    --argjson expected "$(/usr/bin/jq \
+      '.execution_identity.tools | {cargo_actual, rustc_actual}' \
+      "$m3_test_evidence/manifest.json")" '
+    . == $expected and
+    ((.cargo_actual.canonical_path | sub("/bin/cargo$"; "")) ==
+      (.rustc_actual.canonical_path | sub("/bin/rustc$"; "")))
+' <<<"$m3_test_effective_rust_identities" >/dev/null
+
+m3_test_fake_rustup_home="$m3_test_scratch/fake-rustup"
+/bin/mkdir -p \
+    "$m3_test_fake_rustup_home/toolchains/live/bin" \
+    "$m3_test_fake_rustup_home/toolchains/substitute/bin" \
+    "$m3_test_scratch/outside-rust/bin"
+m3_test_fake_rustup_home=$(/usr/bin/python3 -I -S -c \
+    'import os, sys; print(os.path.realpath(sys.argv[1]))' \
+    "$m3_test_fake_rustup_home")
+m3_test_outside_rust=$(/usr/bin/python3 -I -S -c \
+    'import os, sys; print(os.path.realpath(sys.argv[1]))' \
+    "$m3_test_scratch/outside-rust")
+for m3_test_effective_tool in \
+    "$m3_test_fake_rustup_home/toolchains/live/bin/cargo" \
+    "$m3_test_fake_rustup_home/toolchains/live/bin/rustc" \
+    "$m3_test_fake_rustup_home/toolchains/substitute/bin/cargo" \
+    "$m3_test_fake_rustup_home/toolchains/substitute/bin/rustc" \
+    "$m3_test_outside_rust/bin/cargo"
+do
+    printf '%s\n' '#!/bin/bash' 'exit 0' >"$m3_test_effective_tool"
+    /bin/chmod +x "$m3_test_effective_tool"
+done
+/usr/bin/python3 -I -S "$m3_test_effective_rust_helper" \
+    "$m3_test_fake_rustup_home" \
+    "$m3_test_fake_rustup_home/toolchains/live/bin/cargo" \
+    "$m3_test_fake_rustup_home/toolchains/live/bin/rustc" \
+    >"$m3_test_scratch/effective-rust-good.out"
+if /usr/bin/python3 -I -S "$m3_test_effective_rust_helper" \
+    "$m3_test_fake_rustup_home" \
+    "$m3_test_outside_rust/bin/cargo" \
+    "$m3_test_fake_rustup_home/toolchains/live/bin/rustc" \
+    >"$m3_test_scratch/effective-rust-outside.out" 2>&1
+then
+    echo "effective-Rust resolver accepted Cargo outside RUSTUP_HOME/toolchains" >&2
+    exit 1
+fi
+if ! /usr/bin/grep -q 'escapes the canonical rustup toolchains boundary' \
+    "$m3_test_scratch/effective-rust-outside.out"; then
+    echo "outside-root effective Cargo rejection was not reported" >&2
+    exit 1
+fi
+/bin/mkdir -p "$m3_test_fake_rustup_home/toolchains/symlinked/bin"
+/bin/ln -s ../../live/bin/cargo \
+    "$m3_test_fake_rustup_home/toolchains/symlinked/bin/cargo"
+printf '%s\n' '#!/bin/bash' 'exit 0' \
+    >"$m3_test_fake_rustup_home/toolchains/symlinked/bin/rustc"
+/bin/chmod +x "$m3_test_fake_rustup_home/toolchains/symlinked/bin/rustc"
+if /usr/bin/python3 -I -S "$m3_test_effective_rust_helper" \
+    "$m3_test_fake_rustup_home" \
+    "$m3_test_fake_rustup_home/toolchains/symlinked/bin/cargo" \
+    "$m3_test_fake_rustup_home/toolchains/symlinked/bin/rustc" \
+    >"$m3_test_scratch/effective-rust-symlink.out" 2>&1
+then
+    echo "effective-Rust resolver accepted a symlinked Cargo substitution" >&2
+    exit 1
+fi
+if ! /usr/bin/grep -q 'symlink or substitution rejected' \
+    "$m3_test_scratch/effective-rust-symlink.out"; then
+    echo "symlinked effective Cargo rejection was not reported" >&2
+    exit 1
+fi
+if /usr/bin/python3 -I -S "$m3_test_effective_rust_helper" \
+    "$m3_test_fake_rustup_home" \
+    "$m3_test_fake_rustup_home/toolchains/substitute/bin/cargo" \
+    "$m3_test_fake_rustup_home/toolchains/live/bin/rustc" \
+    >"$m3_test_scratch/effective-rust-substitution.out" 2>&1
+then
+    echo "effective-Rust resolver accepted cross-toolchain substitution" >&2
+    exit 1
+fi
+if ! /usr/bin/grep -q 'do not belong to one rustup toolchain' \
+    "$m3_test_scratch/effective-rust-substitution.out"; then
+    echo "cross-toolchain effective Rust rejection was not reported" >&2
+    exit 1
+fi
 
 m3_test_versioned_selection=$(/usr/bin/python3 -I -S \
     "$m3_test_xcode_binding_helper" \
