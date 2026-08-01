@@ -18,6 +18,7 @@ const MAX_RAW_ARGUMENT_BYTES: usize = 64 * 1024;
 const MAX_COMPACT_ARGUMENT_BYTES: usize = 64 * 1024;
 const MAX_AGGREGATE_ARGUMENT_BYTES: usize = 512 * 1024;
 const MAX_AGGREGATE_TEXT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_AGGREGATE_TEXT_BLOCKS: usize = 4_096;
 
 /// Borrowed OpenAI-compatible history input.
 pub struct OpenAiHistoryInput<'a> {
@@ -54,6 +55,7 @@ struct HistoryLimits {
     compact_argument_bytes: usize,
     aggregate_argument_bytes: usize,
     aggregate_text_bytes: usize,
+    aggregate_text_blocks: usize,
 }
 
 const PRODUCTION_LIMITS: HistoryLimits = HistoryLimits {
@@ -64,6 +66,7 @@ const PRODUCTION_LIMITS: HistoryLimits = HistoryLimits {
     compact_argument_bytes: MAX_COMPACT_ARGUMENT_BYTES,
     aggregate_argument_bytes: MAX_AGGREGATE_ARGUMENT_BYTES,
     aggregate_text_bytes: MAX_AGGREGATE_TEXT_BYTES,
+    aggregate_text_blocks: MAX_AGGREGATE_TEXT_BLOCKS,
 };
 
 #[derive(Clone, Copy)]
@@ -92,6 +95,7 @@ struct Normalizer<'a> {
     provider: Provider,
     limits: HistoryLimits,
     text_bytes: usize,
+    text_blocks: usize,
     argument_bytes: usize,
     seen_call_ids: HashSet<String>,
 }
@@ -139,6 +143,7 @@ impl<'a> Normalizer<'a> {
             provider,
             limits,
             text_bytes: 0,
+            text_blocks: 0,
             argument_bytes: 0,
             seen_call_ids: HashSet::new(),
         }
@@ -256,7 +261,11 @@ impl<'a> Normalizer<'a> {
                     index += 1;
                 }
                 "user" => {
-                    if has_block_type(content, "tool_result") {
+                    if self.anthropic_has_block_type(
+                        content,
+                        "tool_result",
+                        &format!("{path}.content"),
+                    )? {
                         return Err(self.error(
                             &format!("{path}.content"),
                             "tool_result has no pending assistant tool-use batch",
@@ -437,6 +446,7 @@ impl<'a> Normalizer<'a> {
         let Value::Array(blocks) = content else {
             return Ok(false);
         };
+        self.precheck_anthropic_content_array(blocks, path)?;
         let tool_uses = blocks
             .iter()
             .filter(|block| {
@@ -451,6 +461,55 @@ impl<'a> Normalizer<'a> {
             return Err(self.error(path, "must not mix tool_use and non-tool_use blocks"));
         }
         Ok(tool_uses > 0)
+    }
+
+    fn anthropic_has_block_type(
+        &self,
+        content: &Value,
+        expected: &str,
+        path: &str,
+    ) -> Result<bool, ToolHistoryError> {
+        let Value::Array(blocks) = content else {
+            return Ok(false);
+        };
+        self.precheck_anthropic_content_array(blocks, path)?;
+        Ok(blocks.iter().any(|block| {
+            block
+                .as_object()
+                .and_then(|object| object.get("type"))
+                .and_then(Value::as_str)
+                == Some(expected)
+        }))
+    }
+
+    fn precheck_anthropic_content_array(
+        &self,
+        blocks: &[Value],
+        path: &str,
+    ) -> Result<(), ToolHistoryError> {
+        let remaining_text_blocks = self
+            .limits
+            .aggregate_text_blocks
+            .checked_sub(self.text_blocks)
+            .ok_or_else(|| self.error(path, "text-block accounting underflow"))?;
+        let first_is_tool_block = blocks
+            .first()
+            .and_then(Value::as_object)
+            .and_then(|block| block.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(|kind| matches!(kind, "tool_use" | "tool_result"));
+        let scan_limit = if first_is_tool_block {
+            self.limits.calls_per_turn
+        } else {
+            remaining_text_blocks
+        };
+        if blocks.len() > scan_limit {
+            return Err(self.error(
+                path,
+                "exceeds the remaining text-block or tool-use scan budget",
+            ));
+        }
+        Ok(())
     }
 
     fn anthropic_calls(
@@ -615,33 +674,41 @@ impl<'a> Normalizer<'a> {
     ) -> Result<String, ToolHistoryError> {
         match value {
             Value::String(text) => {
+                let next_text_bytes = self.checked_text_bytes(text.len(), path)?;
                 self.inspect_text(text, path)?;
-                self.add_text_bytes(text.len(), path)?;
+                self.text_bytes = next_text_bytes;
                 Ok(text.clone())
             }
             Value::Array(blocks) => {
+                let next_text_blocks = self.checked_text_blocks(blocks.len(), path)?;
                 if require_nonempty_blocks && blocks.is_empty() {
                     return Err(self.error(path, "must be a string or nonempty text-block array"));
                 }
                 let mut total = 0usize;
-                let mut fragments = Vec::with_capacity(blocks.len());
                 for (index, value) in blocks.iter().enumerate() {
                     let block_path = format!("{path}[{index}]");
                     let block = self.object(value, &block_path)?;
                     self.ensure_fields(block, &["type", "text"], &block_path)?;
                     self.require_exact_string(block, "type", "text", &block_path)?;
                     let text = self.required_string(block, "text", &block_path)?;
-                    self.inspect_text(text, &format!("{block_path}.text"))?;
                     total = total
                         .checked_add(text.len())
                         .ok_or_else(|| self.error(path, "text byte accounting overflow"))?;
-                    fragments.push(text);
+                    self.checked_text_bytes(total, path)?;
                 }
-                self.add_text_bytes(total, path)?;
+                let next_text_bytes = self.checked_text_bytes(total, path)?;
                 let mut normalized = String::with_capacity(total);
-                for fragment in fragments {
-                    normalized.push_str(fragment);
+                for (index, value) in blocks.iter().enumerate() {
+                    let text = value
+                        .as_object()
+                        .and_then(|block| block.get("text"))
+                        .and_then(Value::as_str)
+                        .expect("the first pass validated every canonical text block");
+                    self.inspect_text(text, &format!("{path}[{index}].text"))?;
+                    normalized.push_str(text);
                 }
+                self.text_bytes = next_text_bytes;
+                self.text_blocks = next_text_blocks;
                 Ok(normalized)
             }
             _ => Err(self.error(path, "must be a string or canonical text-block array")),
@@ -655,7 +722,7 @@ impl<'a> Normalizer<'a> {
         Ok(())
     }
 
-    fn add_text_bytes(&mut self, amount: usize, path: &str) -> Result<(), ToolHistoryError> {
+    fn checked_text_bytes(&self, amount: usize, path: &str) -> Result<usize, ToolHistoryError> {
         let total = self
             .text_bytes
             .checked_add(amount)
@@ -669,8 +736,24 @@ impl<'a> Normalizer<'a> {
                 ),
             ));
         }
-        self.text_bytes = total;
-        Ok(())
+        Ok(total)
+    }
+
+    fn checked_text_blocks(&self, amount: usize, path: &str) -> Result<usize, ToolHistoryError> {
+        let total = self
+            .text_blocks
+            .checked_add(amount)
+            .ok_or_else(|| self.error(path, "aggregate text-block accounting overflow"))?;
+        if total > self.limits.aggregate_text_blocks {
+            return Err(self.error(
+                path,
+                format_args!(
+                    "exceeds the aggregate maximum of {} text blocks",
+                    self.limits.aggregate_text_blocks
+                ),
+            ));
+        }
+        Ok(total)
     }
 
     fn register_call_id(&mut self, id: &str, path: &str) -> Result<(), ToolHistoryError> {
@@ -709,26 +792,38 @@ impl<'a> Normalizer<'a> {
         arguments: &Value,
         path: &str,
     ) -> Result<(), ToolHistoryError> {
-        self.registry
-            .validate_call_arguments(name, arguments)
-            .map_err(|_| {
-                self.error(
+        let remaining_aggregate = self
+            .limits
+            .aggregate_argument_bytes
+            .checked_sub(self.argument_bytes)
+            .ok_or_else(|| self.error(path, "aggregate argument byte accounting underflow"))?;
+        let sizing_limit = self.limits.compact_argument_bytes.min(remaining_aggregate);
+        let compact_bytes = match bounded_compact_json_bytes(arguments, sizing_limit) {
+            Ok(bytes) => bytes,
+            Err(CompactJsonSizeError::LimitExceeded)
+                if remaining_aggregate < self.limits.compact_argument_bytes =>
+            {
+                return Err(self.error(
                     path,
-                    "must satisfy the schema of a declared tool without unsafe content",
-                )
-            })?;
-
-        let compact_bytes = compact_json_bytes(arguments)
-            .map_err(|_| self.error(path, "compact JSON byte accounting failed"))?;
-        if compact_bytes > self.limits.compact_argument_bytes {
-            return Err(self.error(
-                path,
-                format_args!(
-                    "compact JSON exceeds the maximum of {} bytes",
-                    self.limits.compact_argument_bytes
-                ),
-            ));
-        }
+                    format_args!(
+                        "exceeds the aggregate maximum of {} compact argument bytes",
+                        self.limits.aggregate_argument_bytes
+                    ),
+                ));
+            }
+            Err(CompactJsonSizeError::LimitExceeded) => {
+                return Err(self.error(
+                    path,
+                    format_args!(
+                        "compact JSON exceeds the maximum of {} bytes",
+                        self.limits.compact_argument_bytes
+                    ),
+                ));
+            }
+            Err(CompactJsonSizeError::Encoding) => {
+                return Err(self.error(path, "compact JSON byte accounting failed"));
+            }
+        };
         let aggregate = self
             .argument_bytes
             .checked_add(compact_bytes)
@@ -742,6 +837,14 @@ impl<'a> Normalizer<'a> {
                 ),
             ));
         }
+        self.registry
+            .validate_call_arguments(name, arguments)
+            .map_err(|_| {
+                self.error(
+                    path,
+                    "must satisfy the schema of a declared tool without unsafe content",
+                )
+            })?;
         self.argument_bytes = aggregate;
         Ok(())
     }
@@ -803,19 +906,6 @@ impl<'a> Normalizer<'a> {
     }
 }
 
-fn has_block_type(content: &Value, expected: &str) -> bool {
-    let Value::Array(blocks) = content else {
-        return false;
-    };
-    blocks.iter().any(|block| {
-        block
-            .as_object()
-            .and_then(|object| object.get("type"))
-            .and_then(Value::as_str)
-            == Some(expected)
-    })
-}
-
 fn canonical_message(role: &str, content: Option<String>) -> ChatMessage {
     ChatMessage {
         role: role.to_owned(),
@@ -865,17 +955,23 @@ fn canonical_batch(
     (assistant, tool_rows)
 }
 
-#[derive(Default)]
-struct JsonByteCounter {
+struct BoundedJsonByteCounter {
     bytes: usize,
+    maximum: usize,
+    exceeded: bool,
 }
 
-impl Write for JsonByteCounter {
+impl Write for BoundedJsonByteCounter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.bytes = self
-            .bytes
-            .checked_add(buffer.len())
-            .ok_or_else(|| io::Error::other("compact JSON size overflow"))?;
+        let Some(total) = self.bytes.checked_add(buffer.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::other("compact JSON size overflow"));
+        };
+        if total > self.maximum {
+            self.exceeded = true;
+            return Err(io::Error::other("compact JSON exceeds byte budget"));
+        }
+        self.bytes = total;
         Ok(buffer.len())
     }
 
@@ -884,10 +980,26 @@ impl Write for JsonByteCounter {
     }
 }
 
-fn compact_json_bytes(value: &Value) -> serde_json::Result<usize> {
-    let mut counter = JsonByteCounter::default();
-    serde_json::to_writer(&mut counter, value)?;
-    Ok(counter.bytes)
+#[derive(Debug, Eq, PartialEq)]
+enum CompactJsonSizeError {
+    LimitExceeded,
+    Encoding,
+}
+
+fn bounded_compact_json_bytes(
+    value: &Value,
+    maximum: usize,
+) -> Result<usize, CompactJsonSizeError> {
+    let mut counter = BoundedJsonByteCounter {
+        bytes: 0,
+        maximum,
+        exceeded: false,
+    };
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => Ok(counter.bytes),
+        Err(_) if counter.exceeded => Err(CompactJsonSizeError::LimitExceeded),
+        Err(_) => Err(CompactJsonSizeError::Encoding),
+    }
 }
 
 #[cfg(test)]
@@ -1540,7 +1652,11 @@ mod tests {
             vec![openai_call("call-1", "echo", "{}")],
             vec![openai_result("call-1", json!(""))],
         );
-        assert_eq!(compact_json_bytes(&json!({})).unwrap(), 2);
+        assert_eq!(bounded_compact_json_bytes(&json!({}), 2).unwrap(), 2);
+        assert_eq!(
+            bounded_compact_json_bytes(&json!({}), 1),
+            Err(CompactJsonSizeError::LimitExceeded)
+        );
         for (field, maximum, succeeds) in [
             ("raw", 2, true),
             ("raw", 1, false),
@@ -1599,6 +1715,23 @@ mod tests {
             assert_eq!(result.is_ok(), succeeds);
         }
 
+        let two_text_blocks = json!([
+            {"role": "user", "content": [{"type": "text", "text": ""}]},
+            {"role": "assistant", "content": [{"type": "text", "text": ""}]},
+        ]);
+        for (maximum, succeeds) in [(2, true), (1, false)] {
+            let result = no_tools.normalize_openai_history_with_limits(
+                OpenAiHistoryInput {
+                    messages: &two_text_blocks,
+                },
+                HistoryLimits {
+                    aggregate_text_blocks: maximum,
+                    ..PRODUCTION_LIMITS
+                },
+            );
+            assert_eq!(result.is_ok(), succeeds);
+        }
+
         let anthropic_two_calls = anthropic_batch(
             vec![
                 anthropic_call("a", "echo", json!({})),
@@ -1618,6 +1751,83 @@ mod tests {
                 },
             );
             assert_eq!(result.is_ok(), succeeds);
+        }
+    }
+
+    #[test]
+    fn text_budgets_precede_scans_and_failed_validation_is_transactional() {
+        let registry = permissive_registry(&[]);
+        let mut normalizer = Normalizer::new(
+            &registry,
+            Provider::OpenAi,
+            HistoryLimits {
+                aggregate_text_bytes: 1,
+                ..PRODUCTION_LIMITS
+            },
+        );
+        let error = normalizer
+            .text_content(&json!("oversized <|turn>"), "$.content", false)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("aggregate maximum of 1 text bytes")
+        );
+        assert!(!error.to_string().contains("reserved"));
+        assert_eq!(normalizer.text_bytes, 0);
+        assert_eq!(normalizer.text_blocks, 0);
+
+        let mut normalizer = Normalizer::new(
+            &registry,
+            Provider::OpenAi,
+            HistoryLimits {
+                aggregate_text_bytes: 64,
+                aggregate_text_blocks: 2,
+                ..PRODUCTION_LIMITS
+            },
+        );
+        let content = json!([
+            {"type": "text", "text": "accepted first"},
+            {"type": "text", "text": "rejected <|turn> second"},
+        ]);
+        let error = normalizer
+            .text_content(&content, "$.content", false)
+            .unwrap_err();
+        assert!(error.to_string().contains("reserved"));
+        assert_eq!(normalizer.text_bytes, 0);
+        assert_eq!(normalizer.text_blocks, 0);
+
+        let many_empty_blocks = Value::Array(
+            (0..=MAX_AGGREGATE_TEXT_BLOCKS)
+                .map(|_| json!({"type": "text", "text": ""}))
+                .collect(),
+        );
+        let history = json!([{"role": "user", "content": many_empty_blocks}]);
+        let error = normalize_anthropic(&registry, None, &history).unwrap_err();
+        assert!(error.to_string().contains("scan budget"));
+    }
+
+    #[test]
+    fn compact_argument_limit_precedes_schema_traversal() {
+        let registry = permissive_registry(&["echo"]);
+        let mut keyed = Map::new();
+        keyed.insert(
+            "x".repeat(MAX_COMPACT_ARGUMENT_BYTES + 1),
+            Value::Bool(true),
+        );
+        let oversized_value = "x".repeat(MAX_COMPACT_ARGUMENT_BYTES + 1);
+
+        for arguments in [Value::Object(keyed), json!({"value": oversized_value})] {
+            let history = anthropic_batch(
+                vec![anthropic_call("call-1", "echo", arguments)],
+                vec![anthropic_result("call-1", None)],
+            );
+            let error = normalize_anthropic(&registry, None, &history).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("compact JSON exceeds the maximum of 65536 bytes")
+            );
         }
     }
 
