@@ -134,6 +134,56 @@ const EOF_FALLBACK_TOKENIZER_JSON: &str = r#"{
   }
 }"#;
 
+/// A deterministic Gemma-like decoder fixture: ByteFallback assembles UTF-8
+/// runs before SentencePiece-style Metaspace converts `▁` boundaries to spaces.
+/// The IDs include multilingual text, split emoji bytes, and added specials.
+const GEMMA_LIKE_TOKENIZER_JSON: &str = r#"{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {"id": 0, "content": "<eos>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 1, "content": "<bos>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 28, "content": "<tool>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {"type": "ByteFallback"},
+      {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "always", "split": true}
+    ]
+  },
+  "model": {
+    "type": "BPE",
+    "dropout": null,
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": null,
+    "end_of_word_suffix": null,
+    "fuse_unk": false,
+    "byte_fallback": true,
+    "ignore_merges": false,
+    "vocab": {
+      "<eos>": 0, "<bos>": 1, "▁Hello": 2, "▁world": 3,
+      "▁SentencePiece": 4, "▁spacing": 5, "▁こんにちは": 6,
+      "▁世界": 7, "▁مرحبا": 8, "ASCII": 9,
+      "<0xF0>": 10, "<0x9F>": 11, "<0x98>": 12, "<0x80>": 13,
+      "▁bytes": 14, "<0x62>": 15, "<0x79>": 16, "<0x74>": 17,
+      "<0x65>": 18, "<0x73>": 19, "<0xC3>": 20, "<0xA9>": 21,
+      "<0xE7>": 22, "<0x95>": 23, "<0x8C>": 24, "<0xE2>": 25,
+      "<0x96>": 26, "<0x81>": 27, "<tool>": 28, "[UNK]": 29
+    },
+    "merges": []
+  }
+}"#;
+
+fn mixed_256_ids() -> Vec<u32> {
+    let pattern = [2, 3, 6, 7, 8, 10, 11, 12, 13, 15, 16, 17, 20, 21, 28, 9];
+    pattern.repeat(16)
+}
+
 /// A trivial chat template that just concatenates the messages' content. It
 /// emits no special tokens (the contract tests don't need real gemma4 framing
 /// — they exercise the HTTP/taxonomy layer, not the template).
@@ -1679,7 +1729,64 @@ async fn streaming_and_non_streaming_share_incremental_decode_semantics() {
 }
 
 #[tokio::test]
-async fn eof_only_fallback_text_precedes_both_dialects_terminal_frames() {
+async fn mixed_256_token_stream_matches_one_shot_for_both_sse_dialects() {
+    let ids = mixed_256_ids();
+    assert_eq!(ids.len(), 256, "fixture must exercise exactly 256 IDs");
+    assert!(
+        !ids[..ids.len() - 1].contains(&0),
+        "fixture must not terminate on EOS"
+    );
+    let tokenizer = TokenizerHandle::from_bytes(GEMMA_LIKE_TOKENIZER_JSON.as_bytes())
+        .expect("Gemma-like tokenizer loads");
+    let expected = tokenizer.decode(&ids);
+    assert!(
+        !expected.contains('\u{FFFD}'),
+        "one-shot reference is valid"
+    );
+
+    let control = fresh_control();
+    let srv = test_server_with_tokenizer(
+        StubEngine {
+            tokens: ids,
+            block_after: None,
+        },
+        None,
+        8192,
+        &control,
+        GEMMA_LIKE_TOKENIZER_JSON,
+    );
+
+    let (status, anthropic) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":256,"stream":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{anthropic}");
+    let anthropic_text = streamed_text(&anthropic, "anthropic");
+    assert_eq!(anthropic_text, expected);
+    assert!(!anthropic_text.contains('\u{FFFD}'));
+    assert!(anthropic.contains("event: message_stop\n"));
+
+    let (status, openai) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/chat/completions",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":256,"stream":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{openai}");
+    let openai_text = streamed_text(&openai, "openai");
+    assert_eq!(openai_text, expected);
+    assert!(!openai_text.contains('\u{FFFD}'));
+    assert!(openai.contains("data: [DONE]\n\n"));
+}
+
+#[tokio::test]
+async fn malformed_eof_fallback_fails_closed_for_both_dialects() {
     let control = fresh_control();
     let srv = test_server_with_tokenizer(
         StubEngine {
@@ -1700,10 +1807,11 @@ async fn eof_only_fallback_text_precedes_both_dialects_terminal_frames() {
         r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":false}"#,
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     let response: serde_json::Value = serde_json::from_str(&anthropic_json).unwrap();
-    let anthropic_expected = response["content"][0]["text"].as_str().unwrap();
-    assert_eq!(anthropic_expected, "�");
+    assert_eq!(response["error"]["message"], "internal server error");
+    assert!(!anthropic_json.contains('\u{FFFD}'));
+    assert!(!anthropic_json.contains("replacement character"));
 
     let (status, anthropic_sse) = send(
         srv.router(),
@@ -1714,19 +1822,13 @@ async fn eof_only_fallback_text_precedes_both_dialects_terminal_frames() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        streamed_text(&anthropic_sse, "anthropic"),
-        anthropic_expected
-    );
-    assert_eq!(anthropic_sse.matches('�').count(), 1, "{anthropic_sse}");
-    let suffix = anthropic_sse.find("\"text\":\"�\"").unwrap();
-    let message_delta = anthropic_sse.find("event: message_delta\n").unwrap();
-    let message_stop = anthropic_sse.find("event: message_stop\n").unwrap();
-    assert!(suffix < message_delta, "EOF text precedes message_delta");
-    assert!(
-        message_delta < message_stop,
-        "message_delta precedes message_stop"
-    );
+    assert_eq!(anthropic_sse.matches("event: error\n").count(), 1);
+    assert_eq!(anthropic_sse.matches("internal server error").count(), 1);
+    assert!(anthropic_sse.contains("\"type\":\"internal_server_error\""));
+    assert!(!anthropic_sse.contains('\u{FFFD}'));
+    assert!(!anthropic_sse.contains("replacement character"));
+    assert!(!anthropic_sse.contains("message_delta"));
+    assert!(!anthropic_sse.contains("message_stop"));
 
     let (status, openai_json) = send(
         srv.router(),
@@ -1736,12 +1838,11 @@ async fn eof_only_fallback_text_precedes_both_dialects_terminal_frames() {
         r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":false}"#,
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     let response: serde_json::Value = serde_json::from_str(&openai_json).unwrap();
-    let openai_expected = response["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap();
-    assert_eq!(openai_expected, anthropic_expected);
+    assert_eq!(response["error"]["message"], "internal server error");
+    assert!(!openai_json.contains('\u{FFFD}'));
+    assert!(!openai_json.contains("replacement character"));
 
     let (status, openai_sse) = send(
         srv.router(),
@@ -1752,13 +1853,18 @@ async fn eof_only_fallback_text_precedes_both_dialects_terminal_frames() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(streamed_text(&openai_sse, "openai"), openai_expected);
-    assert_eq!(openai_sse.matches('�').count(), 1, "{openai_sse}");
-    let suffix = openai_sse.find("\"content\":\"�\"").unwrap();
-    let terminal = openai_sse.find("\"finish_reason\":\"stop\"").unwrap();
-    let done = openai_sse.find("data: [DONE]\n\n").unwrap();
-    assert!(suffix < terminal, "EOF text precedes terminal chunk");
-    assert!(terminal < done, "terminal chunk precedes [DONE]");
+    assert_eq!(openai_sse.matches("internal server error").count(), 1);
+    assert_eq!(openai_sse.matches("\"code\":500").count(), 1);
+    assert_eq!(
+        openai_sse
+            .matches("\"type\":\"internal_server_error\"")
+            .count(),
+        1
+    );
+    assert!(!openai_sse.contains('\u{FFFD}'));
+    assert!(!openai_sse.contains("replacement character"));
+    assert!(!openai_sse.contains("finish_reason"));
+    assert!(!openai_sse.contains("data: [DONE]"));
 }
 
 #[tokio::test]
