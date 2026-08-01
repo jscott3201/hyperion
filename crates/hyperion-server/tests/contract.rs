@@ -361,6 +361,36 @@ async fn send(
     (status, String::from_utf8_lossy(&bytes).to_string())
 }
 
+/// Send a request through the router without lossy response decoding. The
+/// real-model parity gate uses this so invalid transport bytes cannot be
+/// replaced before comparison.
+async fn send_exact(
+    router: axum::Router,
+    method: Method,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    for (key, value) in headers {
+        builder = builder.header(*key, *value);
+    }
+    let request = builder
+        .body(Body::from(body.to_string()))
+        .expect("exact-body request builds");
+    let response = router
+        .oneshot(request)
+        .await
+        .expect("exact-body router responds");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("exact-body response is readable");
+    let body = String::from_utf8(bytes.to_vec()).expect("response body is valid UTF-8");
+    (status, headers, body)
+}
+
 fn fresh_control() -> ControlState {
     let c = ControlState::new("test-model");
     c.set_ready(true);
@@ -2519,156 +2549,736 @@ async fn disconnect_holds_lease_until_engine_cleanup_exits() {
 }
 
 // ── The self-hosted M5 real-model gate (#[ignore]) ──────────────────────
-//
-// The M3 gate line "streamed greedy run byte-identical to M2 CLI on fixtures"
-// is sealed by the NATIVE forward_12b_test (token-exact vs the committed
-// `12b_greedy_golden.safetensors`). PR B's job is the transport: prove the
-// Rust engine + SSE layer doesn't corrupt the token stream. This #[ignore]
-// test loads the real 12B, runs a streamed greedy, and asserts:
-//   1. the stream is non-empty + every token in-vocab,
-//   2. greedy is deterministic across two runs (a streaming regression guard),
-//   3. the STREAMED tokens equal the NON-STREAMED tokens for the same prompt
-//      (the SSE layer doesn't drop/dup/reorder — the load-bearing PR B invariant).
-// Run on the M5: `HYPERION_12B_ARTIFACT=$repo/artifacts/models/gemma4-12b-qat-mlx-g64-b4 \
-//   cargo test -p hyperion-server --test contract -- --ignored streamed_greedy`.
 
-#[tokio::test]
-#[ignore = "requires the 12B artifact + a Metal device (self-hosted M5)"]
-async fn streamed_greedy_preserves_token_stream() {
-    use hyperion_server::engine::{Engine, EngineRequest};
-    use hyperion_tokenizer::renderer::{ChatMessage, RenderOptions};
+#[derive(Debug)]
+struct GreedyGolden {
+    prompt_ids: Vec<u32>,
+    greedy_tokens: Vec<u32>,
+}
 
-    let dir = std::env::var("HYPERION_12B_ARTIFACT").unwrap_or_else(|_| {
-        // Default to the canonical git-ignored path.
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../artifacts/models/gemma4-12b-qat-mlx-g64-b4"
-        )
-        .to_string()
-    });
-    let artifact = std::path::Path::new(&dir);
-    let config =
-        std::fs::read_to_string(artifact.join("config.json")).expect("12B config.json readable");
-    let geometry = hyperion_model::geometry::Geometry::from_text_config_str(&config)
-        .expect("12B geometry parses");
+/// Read one I32 vector from a safetensors file without adding a test-only
+/// dependency. Offsets are relative to the byte immediately after the padded
+/// JSON header, as defined by the safetensors format.
+fn read_greedy_golden(path: &std::path::Path) -> Result<GreedyGolden, String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    if bytes.len() < 8 {
+        return Err("header is shorter than the 8-byte length prefix".to_string());
+    }
+    let mut length_bytes = [0_u8; 8];
+    length_bytes.copy_from_slice(&bytes[..8]);
+    let header_len = usize::try_from(u64::from_le_bytes(length_bytes))
+        .map_err(|_| "header length does not fit usize".to_string())?;
+    if header_len == 0 {
+        return Err("header length is empty".to_string());
+    }
+    let data_start = 8_usize
+        .checked_add(header_len)
+        .ok_or_else(|| "header byte range overflows usize".to_string())?;
+    let header_bytes = bytes
+        .get(8..data_start)
+        .ok_or_else(|| "header byte range exceeds fixture length".to_string())?;
+    let header_text = std::str::from_utf8(header_bytes)
+        .map_err(|error| format!("header is not UTF-8: {error}"))?;
+    let header: serde_json::Value = serde_json::from_str(header_text)
+        .map_err(|error| format!("header is not valid JSON: {error}"))?;
+    let tensors = header
+        .as_object()
+        .ok_or_else(|| "header root is not an object".to_string())?;
 
-    let tokenizer =
-        TokenizerHandle::from_file(&artifact.join("tokenizer.json")).expect("tokenizer loads");
-    let template =
-        ChatTemplate::from_artifact(artifact, Some(&tokenizer)).expect("chat template loads");
+    let read_vector = |name: &str| -> Result<Vec<u32>, String> {
+        let descriptor = tensors
+            .get(name)
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| format!("missing tensor descriptor {name:?}"))?;
+        if descriptor.get("dtype").and_then(serde_json::Value::as_str) != Some("I32") {
+            return Err(format!("tensor {name:?} is not I32"));
+        }
+        let shape = descriptor
+            .get("shape")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("tensor {name:?} has no shape array"))?;
+        if shape.len() != 1 {
+            return Err(format!("tensor {name:?} is not one-dimensional"));
+        }
+        let element_count = shape[0]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| format!("tensor {name:?} has an invalid element count"))?;
+        let offsets = descriptor
+            .get("data_offsets")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("tensor {name:?} has no data_offsets array"))?;
+        if offsets.len() != 2 {
+            return Err(format!(
+                "tensor {name:?} data_offsets does not have two entries"
+            ));
+        }
+        let start = offsets[0]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| format!("tensor {name:?} has an invalid start offset"))?;
+        let end = offsets[1]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| format!("tensor {name:?} has an invalid end offset"))?;
+        if start > end || start % std::mem::size_of::<i32>() != 0 {
+            return Err(format!("tensor {name:?} has invalid or unaligned offsets"));
+        }
+        let expected_bytes = element_count
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| format!("tensor {name:?} byte length overflows usize"))?;
+        if end - start != expected_bytes {
+            return Err(format!(
+                "tensor {name:?} byte length {} does not match shape byte length {expected_bytes}",
+                end - start
+            ));
+        }
+        let absolute_start = data_start
+            .checked_add(start)
+            .ok_or_else(|| format!("tensor {name:?} start offset overflows usize"))?;
+        let absolute_end = data_start
+            .checked_add(end)
+            .ok_or_else(|| format!("tensor {name:?} end offset overflows usize"))?;
+        let tensor_bytes = bytes
+            .get(absolute_start..absolute_end)
+            .ok_or_else(|| format!("tensor {name:?} byte range exceeds fixture length"))?;
+        tensor_bytes
+            .chunks_exact(std::mem::size_of::<i32>())
+            .enumerate()
+            .map(|(index, chunk)| {
+                let mut value_bytes = [0_u8; 4];
+                value_bytes.copy_from_slice(chunk);
+                let value = i32::from_le_bytes(value_bytes);
+                u32::try_from(value).map_err(|_| {
+                    format!("tensor {name:?} contains negative ID {value} at index {index}")
+                })
+            })
+            .collect()
+    };
 
-    // A templated prompt (raw-prompt greedy is degenerate per the chat-template
-    // discipline; the templated prompt produces coherent tokens).
-    let messages = vec![ChatMessage {
-        role: "user".to_string(),
-        content: Some(serde_json::json!("Say hello in one word.")),
-        tool_calls: None,
-        tool_responses: None,
-        reasoning: None,
-        reasoning_content: None,
-        tool_call_id: None,
-        name: None,
-    }];
-    let rendered = template
-        .render(
-            &messages,
-            &RenderOptions {
-                add_generation_prompt: true,
-                enable_thinking: Some(false),
-                preserve_thinking: None,
-                tools: Vec::new(),
-            },
-        )
-        .expect("render");
-    let prompt = tokenizer.encode(&rendered, false);
-    assert!(!prompt.is_empty(), "prompt tokenizes to a non-empty vec");
+    Ok(GreedyGolden {
+        prompt_ids: read_vector("ids")?,
+        greedy_tokens: read_vector("greedy_tokens")?,
+    })
+}
 
-    // The `!Send` `Engine` must be loaded + driven on one dedicated thread.
-    // Spawn that thread, load the 12B there, and run both the non-streaming
-    // (drive, twice for determinism) + streaming (stream) paths there. The
-    // results come back over a oneshot.
-    let (tx_tokens, rx_tokens) =
-        std::sync::mpsc::channel::<(Vec<u32>, Vec<u32>, Vec<u32>, String)>();
-    let engine_geometry = geometry.clone();
-    let engine_dir = dir.clone();
-    let engine_prompt = prompt.clone();
-    let engine_eos = tokenizer.token_to_id("<eos>");
-    let _engine_thread = std::thread::Builder::new()
-        .name("test-engine".into())
-        .spawn(move || {
-            let engine = match Engine::load(&engine_geometry, &engine_dir) {
-                Ok(e) => e,
-                Err(e) => {
-                    let _ =
-                        tx_tokens.send((Vec::new(), Vec::new(), Vec::new(), format!("load: {e}")));
-                    return;
-                }
-            };
-            let request = EngineRequest {
-                prompt_tokens: engine_prompt.clone(),
-                max_tokens: 16,
-                eos_token_id: engine_eos,
-                sampling: None, // greedy
-            };
-            let cancel = hyperion_server::engine::CancelToken::new();
-            // 1+2: non-streaming, twice (non-empty + deterministic).
-            let first = match engine.drive(&request, &cancel) {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ =
-                        tx_tokens.send((Vec::new(), Vec::new(), Vec::new(), format!("drive: {e}")));
-                    return;
-                }
-            };
-            let second = match engine.drive(&request, &cancel) {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = tx_tokens.send((
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        format!("drive2: {e}"),
-                    ));
-                    return;
-                }
-            };
-            // 3: streaming — `engine.stream` runs INLINE on this engine thread
-            // (the `!Send` engine can't move to another thread), sending to a
-            // channel a DRAINER thread collects concurrently. Two threads → no
-            // deadlock (the engine sends, the drainer receives).
-            let (step_tx, mut step_rx) = tokio::sync::mpsc::channel(8);
-            let drainer = std::thread::spawn(move || {
-                let mut out = Vec::new();
-                while let Some(event) = step_rx.blocking_recv() {
-                    if let hyperion_server::engine::StepEvent::Token(t) = event {
-                        out.push(t.id);
+fn command_failure(label: &str, output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    format!(
+        "{label} failed with status {}: stdout={stdout:?} stderr={stderr:?}",
+        output.status
+    )
+}
+
+/// Independently reject unknown/bad artifact identity when the ignored test is
+/// selected directly. The evidence runner performs the same checks before and
+/// after the test; keeping this guard here prevents a direct cargo invocation
+/// from bypassing C4/C6.
+fn verify_test_artifact_identity(
+    artifact: &std::path::Path,
+    manifest_name: &str,
+) -> Result<(), String> {
+    const HISTORICAL_MANIFEST_SHA256: &str =
+        "9fa3c7f6c49305f621ed1f96edbb34c6402b6229701041db4e607df70e9b4144";
+    const OWNER_PAYLOAD_MANIFEST_SHA256: &str =
+        "3cee7e9c21051eb6e6857ef485b355b4a2e847901930d64620348cbc7f56c806";
+
+    if manifest_name == "SHA256SUMS" {
+        let verifier =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../oracle/model_identity.py");
+        let output = std::process::Command::new("python3")
+            .args(["-I", "-S"])
+            .arg(verifier)
+            .args(["--model"])
+            .arg(artifact)
+            .args(["--manifest-sha256", HISTORICAL_MANIFEST_SHA256])
+            .output()
+            .map_err(|error| format!("historical identity verifier did not start: {error}"))?;
+        if !output.status.success() {
+            return Err(command_failure("historical artifact identity", &output));
+        }
+        return Ok(());
+    }
+
+    let manifest = artifact.join("PAYLOAD_SHA256SUMS");
+    let digest_output = std::process::Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(&manifest)
+        .output()
+        .map_err(|error| format!("owner manifest digest command did not start: {error}"))?;
+    if !digest_output.status.success() {
+        return Err(command_failure("owner manifest digest", &digest_output));
+    }
+    let digest_stdout = std::str::from_utf8(&digest_output.stdout)
+        .map_err(|error| format!("owner manifest digest is not UTF-8: {error}"))?;
+    let actual_digest = digest_stdout
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "owner manifest digest output is empty".to_string())?;
+    if actual_digest != OWNER_PAYLOAD_MANIFEST_SHA256 {
+        return Err(format!(
+            "owner manifest digest mismatch: expected {OWNER_PAYLOAD_MANIFEST_SHA256}, found {actual_digest}"
+        ));
+    }
+
+    let expected_names: std::collections::BTreeSet<_> = [
+        "chat_template.jinja",
+        "config.json",
+        "generation_config.json",
+        "model-00001-of-00002.safetensors",
+        "model-00002-of-00002.safetensors",
+        "model.safetensors.index.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let manifest_text = std::fs::read_to_string(&manifest)
+        .map_err(|error| format!("owner manifest is not readable UTF-8: {error}"))?;
+    let mut actual_names = std::collections::BTreeSet::new();
+    for (index, line) in manifest_text.lines().enumerate() {
+        let (digest, raw_name) = line
+            .split_once("  ")
+            .ok_or_else(|| format!("owner manifest line {} is malformed", index + 1))?;
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!(
+                "owner manifest line {} has an invalid SHA-256",
+                index + 1
+            ));
+        }
+        let without_binary_marker = raw_name.strip_prefix('*').unwrap_or(raw_name);
+        let name = without_binary_marker
+            .strip_prefix("./")
+            .unwrap_or(without_binary_marker);
+        let relative = std::path::Path::new(name);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            || !actual_names.insert(name.to_string())
+        {
+            return Err(format!(
+                "owner manifest line {} has a non-normal or duplicate path",
+                index + 1
+            ));
+        }
+    }
+    if actual_names != expected_names {
+        return Err(format!(
+            "owner manifest must bind exactly the eight runtime files: {actual_names:?}"
+        ));
+    }
+    for name in &actual_names {
+        let path = artifact.join(name);
+        if !path.is_file() || path.is_symlink() {
+            return Err(format!(
+                "owner payload file is missing, special, or symlinked: {name}"
+            ));
+        }
+    }
+    let checksum_output = std::process::Command::new("shasum")
+        .args(["-a", "256", "-c", "PAYLOAD_SHA256SUMS"])
+        .current_dir(artifact)
+        .output()
+        .map_err(|error| format!("owner payload checksum command did not start: {error}"))?;
+    if !checksum_output.status.success() {
+        return Err(command_failure("owner payload checksum", &checksum_output));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct RecordedHttpRun {
+    prompt_ids: Vec<u32>,
+    token_ids: Vec<u32>,
+    max_tokens: u32,
+    greedy: bool,
+    done_usage: Option<Usage>,
+    done_events: usize,
+    done_was_last: bool,
+    returned_usage: Option<Usage>,
+    forwarded_all_events: bool,
+}
+
+/// Test-only observation seam around the real mailbox. The one-slot relay
+/// forwards every event synchronously and in order; if the router-side bounded
+/// channel closes, forwarding cancels the same request and the relay receiver
+/// closes so the native engine observes backpressure/cancellation normally.
+struct RecordingMailboxEngine {
+    inner: hyperion_server::engine::MailboxEngine,
+    runs: Arc<Mutex<Vec<RecordedHttpRun>>>,
+}
+
+struct RealServerHarness {
+    server: Option<Server>,
+    engine_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RealServerHarness {
+    fn router(&self) -> axum::Router {
+        self.server
+            .as_ref()
+            .expect("lifecycle: real server is present")
+            .router()
+    }
+
+    fn shutdown(mut self) -> Result<(), String> {
+        self.server.take();
+        let engine_thread = self
+            .engine_thread
+            .take()
+            .ok_or_else(|| "lifecycle: real engine thread handle is missing".to_string())?;
+        engine_thread
+            .join()
+            .map_err(|_| "lifecycle: real engine thread panicked".to_string())
+    }
+}
+
+impl Drop for RealServerHarness {
+    fn drop(&mut self) {
+        self.server.take();
+        if let Some(engine_thread) = self.engine_thread.take() {
+            let _ = engine_thread.join();
+        }
+    }
+}
+
+impl EngineDriver for RecordingMailboxEngine {
+    fn stream(
+        &self,
+        request: &EngineRequest,
+        cancel: &CancelToken,
+        tx: tokio::sync::mpsc::Sender<StepEvent>,
+    ) -> Result<Usage, EngineError> {
+        let (relay_tx, mut relay_rx) = tokio::sync::mpsc::channel::<StepEvent>(1);
+        let relay_cancel = cancel.clone();
+        let relay = std::thread::Builder::new()
+            .name("m3-recording-relay".to_string())
+            .spawn(move || {
+                let mut token_ids = Vec::new();
+                let mut done_usage = None;
+                let mut done_events = 0_usize;
+                let mut done_was_last = false;
+                while let Some(event) = relay_rx.blocking_recv() {
+                    match event {
+                        StepEvent::Token(token) => {
+                            token_ids.push(token.id);
+                            done_was_last = false;
+                        }
+                        StepEvent::Done(usage) => {
+                            done_usage = Some(usage);
+                            done_events = done_events.saturating_add(1);
+                            done_was_last = true;
+                        }
+                    }
+                    if tx.blocking_send(event).is_err() {
+                        relay_cancel.cancel();
+                        return (token_ids, done_usage, done_events, done_was_last, false);
                     }
                 }
-                out
-            });
-            let stream_result = engine.stream(&request, &cancel, step_tx);
-            let drained = drainer.join().unwrap_or_default();
-            match stream_result {
-                Ok(_) => {
-                    let _ = tx_tokens.send((first, second, drained, String::new()));
-                }
-                Err(e) => {
-                    let _ = tx_tokens.send((first, second, drained, format!("stream: {e}")));
-                }
-            }
-        })
-        .expect("spawn engine thread");
+                (token_ids, done_usage, done_events, done_was_last, true)
+            })
+            .expect("lifecycle: recording relay thread spawns");
 
-    let (first, second, streamed, err) = rx_tokens.recv().expect("engine thread reported");
-    assert!(err.is_empty(), "engine error: {err}");
-    assert!(!first.is_empty(), "greedy produced tokens");
+        let result = self.inner.stream(request, cancel, relay_tx);
+        let returned_usage = result.as_ref().ok().copied();
+        let (token_ids, done_usage, done_events, done_was_last, forwarded_all_events) = relay
+            .join()
+            .expect("lifecycle: recording relay thread joins cleanly");
+        self.runs
+            .lock()
+            .expect("lifecycle: recording mutex is not poisoned")
+            .push(RecordedHttpRun {
+                prompt_ids: request.prompt_tokens.clone(),
+                token_ids,
+                max_tokens: request.max_tokens,
+                greedy: request.sampling.is_none(),
+                done_usage,
+                done_events,
+                done_was_last,
+                returned_usage,
+                forwarded_all_events,
+            });
+        if !forwarded_all_events {
+            return Err(EngineError::Cancelled);
+        }
+        result
+    }
+}
+
+// Run only through scripts/run-m3-stream-parity.sh on the self-hosted M5. The
+// runner binds the complete artifact inventory before selecting this exact
+// ignored test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the exact 12B artifact + a Metal device (self-hosted M5)"]
+async fn real_http_sse_matches_m2_golden() {
+    use hyperion_server::engine::{MailboxEngine, engine_thread_loop};
+
+    const PROMPT: &str = "The capital of France is";
+    const COMPLETION_TOKENS: usize = 24;
+    const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+    let artifact_os = std::env::var_os("HYPERION_12B_ARTIFACT")
+        .filter(|value| !value.is_empty())
+        .expect("artifact identity: HYPERION_12B_ARTIFACT must name the pinned real artifact");
+    let artifact = std::path::PathBuf::from(artifact_os);
     assert!(
-        first.iter().all(|t| (*t as usize) < tokenizer.vocab_size()),
-        "every token in-vocab"
+        artifact.is_dir() && !artifact.is_symlink(),
+        "artifact identity: root must be a real directory, not a symlink: {}",
+        artifact.display()
     );
-    assert_eq!(first, second, "greedy is deterministic across runs");
+    let historical_manifest = artifact.join("SHA256SUMS");
+    let owner_payload_manifest = artifact.join("PAYLOAD_SHA256SUMS");
+    let has_historical_manifest = historical_manifest.exists() || historical_manifest.is_symlink();
+    let has_owner_payload_manifest =
+        owner_payload_manifest.exists() || owner_payload_manifest.is_symlink();
+    assert_ne!(
+        has_historical_manifest, has_owner_payload_manifest,
+        "artifact identity: exactly one recognized manifest must exist"
+    );
+    let selected_manifest = if has_historical_manifest {
+        historical_manifest
+    } else {
+        owner_payload_manifest
+    };
+    assert!(
+        selected_manifest.is_file() && !selected_manifest.is_symlink(),
+        "artifact identity: selected manifest must be a real regular file"
+    );
+    let selected_manifest_name = selected_manifest
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .expect("artifact identity: selected manifest filename is UTF-8");
+    verify_test_artifact_identity(&artifact, selected_manifest_name)
+        .unwrap_or_else(|error| panic!("artifact identity: {error}"));
+    for required in [
+        "config.json",
+        "chat_template.jinja",
+        "generation_config.json",
+        "model.safetensors.index.json",
+        "model-00001-of-00002.safetensors",
+        "model-00002-of-00002.safetensors",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ] {
+        let path = artifact.join(required);
+        assert!(
+            path.is_file() && !path.is_symlink(),
+            "artifact identity: required regular file is missing or a symlink: {}",
+            path.display()
+        );
+    }
+
+    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../native/hyperion_mlx/tests/fixtures/12b_greedy_golden.safetensors");
+    assert!(
+        fixture_path.is_file() && !fixture_path.is_symlink(),
+        "fixture: committed M2 golden is missing or a symlink: {}",
+        fixture_path.display()
+    );
+    let golden = read_greedy_golden(&fixture_path)
+        .unwrap_or_else(|error| panic!("fixture: invalid M2 safetensors golden: {error}"));
     assert_eq!(
-        streamed, first,
-        "the streamed tokens must equal the non-streamed tokens (no SSE corruption)"
+        golden.prompt_ids.len(),
+        21,
+        "fixture: expected the frozen 21-ID prompt"
+    );
+    assert_eq!(
+        golden.greedy_tokens.len(),
+        COMPLETION_TOKENS,
+        "fixture: expected the frozen 24-token completion"
+    );
+
+    let config = std::fs::read_to_string(artifact.join("config.json"))
+        .expect("artifact identity: 12B config.json is readable");
+    let geometry = hyperion_model::geometry::Geometry::from_config_str(&config)
+        .expect("artifact identity: 12B geometry parses");
+    let tokenizer = TokenizerHandle::from_file(&artifact.join("tokenizer.json"))
+        .expect("artifact identity: tokenizer loads");
+    let template = ChatTemplate::from_artifact(&artifact, Some(&tokenizer))
+        .expect("artifact identity: chat template loads");
+    let expected_text = tokenizer.decode(&golden.greedy_tokens);
+    assert!(
+        !expected_text.is_empty(),
+        "fixture: golden completion must decode to non-empty text"
+    );
+    let artifact_string = artifact
+        .to_str()
+        .expect("artifact identity: artifact path is valid UTF-8")
+        .to_string();
+    let context = geometry.max_position_embeddings;
+
+    let (mailbox, mailbox_rx) = MailboxEngine::channel();
+    let (loaded_tx, loaded_rx) = std::sync::mpsc::channel();
+    let engine_thread = std::thread::Builder::new()
+        .name("m3-real-engine".to_string())
+        .spawn(move || engine_thread_loop(geometry, artifact_string, mailbox_rx, loaded_tx))
+        .expect("lifecycle: real engine thread spawns");
+    match loaded_rx.recv_timeout(std::time::Duration::from_secs(300)) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            drop(mailbox);
+            engine_thread
+                .join()
+                .expect("lifecycle: failed engine load thread joins");
+            panic!("artifact identity/model loading: real engine failed to load: {error}");
+        }
+        Err(error) => {
+            drop(mailbox);
+            engine_thread
+                .join()
+                .expect("lifecycle: timed-out engine load thread joins");
+            panic!("lifecycle: real engine load did not report before timeout: {error}");
+        }
+    }
+
+    let runs = Arc::new(Mutex::new(Vec::new()));
+    let control = fresh_control();
+    let harness = RealServerHarness {
+        server: Some(Server::new(ServerConfig {
+            engine: Arc::new(RecordingMailboxEngine {
+                inner: mailbox,
+                runs: runs.clone(),
+            }),
+            template,
+            tokenizer: tokenizer.clone(),
+            control,
+            bearer: None,
+            context,
+            model_id: "gemma4-12b".to_string(),
+            default_max_tokens: COMPLETION_TOKENS as u32,
+        })),
+        engine_thread: Some(engine_thread),
+    };
+
+    let non_streaming_request = serde_json::json!({
+        "model": "gemma4-12b",
+        "messages": [{"role": "user", "content": PROMPT}],
+        "max_tokens": COMPLETION_TOKENS,
+        "temperature": 0,
+        "stream": false
+    })
+    .to_string();
+    let non_streaming_result = tokio::time::timeout(
+        HTTP_TIMEOUT,
+        send_exact(
+            harness.router(),
+            Method::POST,
+            "/v1/chat/completions",
+            &[("content-type", "application/json")],
+            &non_streaming_request,
+        ),
+    )
+    .await;
+
+    let streaming_request = serde_json::json!({
+        "model": "gemma4-12b",
+        "messages": [{"role": "user", "content": PROMPT}],
+        "max_tokens": COMPLETION_TOKENS,
+        "temperature": 0,
+        "stream": true
+    })
+    .to_string();
+    let streaming_result = if non_streaming_result.is_ok() {
+        Some(
+            tokio::time::timeout(
+                HTTP_TIMEOUT,
+                send_exact(
+                    harness.router(),
+                    Method::POST,
+                    "/v1/chat/completions",
+                    &[("content-type", "application/json")],
+                    &streaming_request,
+                ),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+
+    harness.shutdown().unwrap_or_else(|error| panic!("{error}"));
+    let non_streaming = non_streaming_result
+        .expect("lifecycle: non-streaming HTTP request completes before timeout");
+    let streaming = streaming_result
+        .expect("lifecycle: streaming HTTP request skipped after non-streaming timeout")
+        .expect("lifecycle: streaming HTTP request completes before timeout");
+
+    let recorded = runs
+        .lock()
+        .expect("lifecycle: recording mutex is not poisoned")
+        .clone();
+    assert_eq!(
+        recorded.len(),
+        2,
+        "lifecycle: exactly two HTTP generations reach the real mailbox"
+    );
+    for (index, run) in recorded.iter().enumerate() {
+        assert_eq!(
+            run.prompt_ids, golden.prompt_ids,
+            "prompt: HTTP run {index} request IDs differ from the M2 golden"
+        );
+        assert!(
+            run.greedy,
+            "prompt: HTTP run {index} was not explicit greedy"
+        );
+        assert_eq!(
+            run.max_tokens, COMPLETION_TOKENS as u32,
+            "prompt: HTTP run {index} max_tokens differs from the M2 golden"
+        );
+        assert_eq!(
+            run.token_ids, golden.greedy_tokens,
+            "token: HTTP run {index} generated IDs differ from the M2 golden"
+        );
+        assert!(
+            run.forwarded_all_events,
+            "lifecycle: HTTP run {index} did not forward every real engine event"
+        );
+        let expected_usage = Usage {
+            prompt_tokens: golden.prompt_ids.len() as u32,
+            completion_tokens: COMPLETION_TOKENS as u32,
+        };
+        assert_eq!(
+            run.done_usage,
+            Some(expected_usage),
+            "token: HTTP run {index} terminal StepEvent usage differs"
+        );
+        assert_eq!(
+            run.done_events, 1,
+            "token: HTTP run {index} must emit exactly one terminal StepEvent"
+        );
+        assert!(
+            run.done_was_last,
+            "token: HTTP run {index} terminal StepEvent must be last"
+        );
+        assert_eq!(
+            run.returned_usage,
+            Some(expected_usage),
+            "token: HTTP run {index} returned usage differs"
+        );
+    }
+
+    let (json_status, json_headers, json_body) = non_streaming;
+    assert_eq!(json_status, StatusCode::OK, "JSON: {json_body}");
+    assert_eq!(
+        json_headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json"),
+        "JSON: response content type"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&json_body).expect("JSON: response body is valid JSON");
+    assert!(
+        json["error"].is_null(),
+        "JSON: response contains an error: {json}"
+    );
+    assert_eq!(
+        json["choices"][0]["message"]["content"].as_str(),
+        Some(expected_text.as_str()),
+        "JSON: assistant content differs from decoding the M2 golden tokens"
+    );
+    assert_eq!(
+        json["choices"][0]["finish_reason"], "length",
+        "JSON: terminal reason"
+    );
+    assert_eq!(
+        json["usage"]["prompt_tokens"],
+        golden.prompt_ids.len(),
+        "JSON: prompt usage differs"
+    );
+    assert_eq!(
+        json["usage"]["completion_tokens"], COMPLETION_TOKENS,
+        "JSON: completion usage differs"
+    );
+    assert_eq!(
+        json["usage"]["total_tokens"],
+        golden.prompt_ids.len() + COMPLETION_TOKENS,
+        "JSON: total usage differs"
+    );
+
+    let (sse_status, sse_headers, sse_body) = streaming;
+    assert_eq!(sse_status, StatusCode::OK, "SSE: {sse_body}");
+    assert_eq!(
+        sse_headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream"),
+        "SSE: response content type"
+    );
+    assert!(
+        !sse_body.contains("event: error"),
+        "SSE: response contains an error event: {sse_body}"
+    );
+    assert_eq!(
+        sse_body.matches("data: [DONE]\n\n").count(),
+        1,
+        "SSE: terminal [DONE] framing must occur exactly once"
+    );
+    assert!(
+        sse_body.ends_with("data: [DONE]\n\n"),
+        "SSE: [DONE] must be the final bytes"
+    );
+    for block in sse_body.split("\n\n").filter(|block| !block.is_empty()) {
+        assert_eq!(
+            block.lines().count(),
+            1,
+            "SSE: every OpenAI block must contain exactly one data line: {block:?}"
+        );
+        assert!(
+            block.starts_with("data: "),
+            "SSE: every OpenAI block must be a data line: {block:?}"
+        );
+    }
+    let frames = sse_json_frames(&sse_body);
+    assert!(
+        frames.iter().all(|frame| frame["error"].is_null()),
+        "SSE: JSON data frames contain an error"
+    );
+    let terminal_frames: Vec<_> = frames
+        .iter()
+        .filter(|frame| !frame["choices"][0]["finish_reason"].is_null())
+        .collect();
+    assert_eq!(
+        terminal_frames.len(),
+        1,
+        "SSE: exactly one terminal usage frame is required"
+    );
+    let terminal = terminal_frames[0];
+    assert!(
+        std::ptr::eq(terminal, frames.last().expect("SSE: terminal frame exists")),
+        "SSE: usage/finish frame must be the final JSON frame"
+    );
+    assert_eq!(
+        terminal["choices"][0]["finish_reason"], "length",
+        "SSE: terminal reason"
+    );
+    assert_eq!(
+        terminal["usage"]["prompt_tokens"],
+        golden.prompt_ids.len(),
+        "SSE: prompt usage differs"
+    );
+    assert_eq!(
+        terminal["usage"]["completion_tokens"], COMPLETION_TOKENS,
+        "SSE: completion usage differs"
+    );
+    assert_eq!(
+        terminal["usage"]["total_tokens"],
+        golden.prompt_ids.len() + COMPLETION_TOKENS,
+        "SSE: total usage differs"
+    );
+    let sse_text = streamed_text(&sse_body, "openai");
+    assert_eq!(
+        sse_text, expected_text,
+        "SSE: concatenated content differs from decoding the M2 golden tokens"
+    );
+    assert_eq!(
+        sse_text,
+        json["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("JSON: assistant content is text"),
+        "SSE: concatenated content is not byte-identical to JSON assistant content"
     );
 }

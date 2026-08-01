@@ -69,7 +69,7 @@ fn run() -> Result<(), String> {
     let config_path = std::path::Path::new(&model_dir).join("config.json");
     let config_str =
         std::fs::read_to_string(&config_path).map_err(|e| format!("read {config_path:?}: {e}"))?;
-    let geometry = hyperion_model::geometry::Geometry::from_text_config_str(&config_str)
+    let geometry = hyperion_model::geometry::Geometry::from_config_str(&config_str)
         .map_err(|e| format!("parse geometry: {e}"))?;
     let context: ContextWindow = geometry.max_position_embeddings;
 

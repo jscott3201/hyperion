@@ -4,13 +4,14 @@
 //! Architecture (02 §Threading model): one dedicated engine thread owns all
 //! MLX/native state — `Model` and `KvState` are `!Send`, so they cannot cross
 //! threads. This module is the **synchronous core** that runs on that thread:
-//! [`Engine::stream`] prefills the prompt, then decodes one token at a time,
-//! reading each sampled `token_id` back through the M3 `hyp_step_result_fields`
-//! accessor (ADR 0003) and yielding a [`StepEvent`] per step until `max_tokens`
-//! or EOS. [`Engine::drive`] is the non-streaming collector wrapper.
+//! [`Engine::stream`] prefills the prompt to produce completion token 1, then
+//! decodes subsequent tokens one at a time. Each sampled `token_id` is read back
+//! through the M3 `hyp_step_result_fields` accessor (ADR 0003) and yielded as a
+//! [`StepEvent`] until the total `max_tokens` budget or EOS. [`Engine::drive`] is
+//! the non-streaming collector wrapper.
 //!
 //! The axum/SSE transport (PR B) owns an `Engine` on a dedicated thread and
-//! feeds it `EngineRequest`s; [`Engine::stream`] sends each decoded token over
+//! feeds it `EngineRequest`s; [`Engine::stream`] sends each completion token over
 //! a bounded `tokio::sync::mpsc` channel (cap 8, 06 §Concurrency) that the
 //! handler converts to SSE frames. Cancel propagates two ways: an explicit
 //! [`CancelToken`] polled between steps, and the dropped-receiver path — when
@@ -35,6 +36,27 @@ use hyperion_model::geometry::Geometry;
 /// slicing.
 pub const PREFILL_CHUNK: usize = 2048;
 
+// `hyp_decode_block_sampled` resets its local RNG state from `config.seed` on
+// every FFI call, then advances it with this LCG once per decoded token. The
+// Rust engine calls native with `n_tokens=1`, so it must carry the same state
+// across calls: prefill consumes the request seed, decode token 2 consumes the
+// first successor, and so on. Keep these constants identical to model.cc's
+// native per-step sampling contract.
+const NATIVE_SAMPLING_LCG_MULTIPLIER: u64 = 6_364_136_223_846_793_005;
+const NATIVE_SAMPLING_LCG_INCREMENT: u64 = 1_442_695_040_888_963_407;
+
+#[must_use]
+fn next_sampling_seed(seed: u64) -> u64 {
+    seed.wrapping_mul(NATIVE_SAMPLING_LCG_MULTIPLIER)
+        .wrapping_add(NATIVE_SAMPLING_LCG_INCREMENT)
+}
+
+fn advance_sampling_seed(sampling: &mut Option<HypSamplingConfig>) {
+    if let Some(config) = sampling {
+        config.seed = next_sampling_seed(config.seed);
+    }
+}
+
 /// A single-flight generation is busy — the second concurrent request is
 /// rejected with HTTP 429 (06 §Concurrency). This guard is the model-free
 /// primitive the axum layer will sit a `Semaphore(1)` on top of.
@@ -50,7 +72,7 @@ impl std::fmt::Display for SingleFlightBusy {
 impl std::error::Error for SingleFlightBusy {}
 
 /// A cooperative cancel flag. The engine loop polls [`CancelToken::is_cancelled`]
-/// between prefill chunks and decode steps; a cancelled run stops cleanly and
+/// before and after prefill and decode steps; a cancelled run stops cleanly and
 /// surfaces [`EngineError::Cancelled`]. `CancelToken` is `Clone + Send + Sync`
 /// so the axum response future can fire it on client-drop (PR B).
 #[derive(Clone, Debug)]
@@ -121,7 +143,7 @@ impl std::fmt::Debug for EngineRequest {
     }
 }
 
-/// The sampled token id for one decode step.
+/// The sampled token id from a prefill epilogue or decode step.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StepToken {
     pub id: u32,
@@ -141,11 +163,11 @@ pub struct Usage {
 
 /// One step of a streaming generation, sent over the bounded channel from the
 /// engine thread to the axum handler (06 §Streaming: "token-incremental real
-/// SSE"). `Token` is one decoded token; `Done` is the terminal frame carrying
+/// SSE"). `Token` is one completion token; `Done` is the terminal frame carrying
 /// [`Usage`]. The handler converts each into the dialect's SSE frame.
 #[derive(Clone, Copy, Debug)]
 pub enum StepEvent {
-    /// One decoded token (id + logit).
+    /// One completion token (id + logit).
     Token(StepToken),
     /// The terminal frame — generation finished at `max_tokens` or EOS, with
     /// usage accounting. Always the last event on a successful run.
@@ -216,7 +238,7 @@ impl From<SingleFlightBusy> for EngineError {
 /// inside [`Engine::stream`].
 pub trait EngineDriver: Send + Sync {
     /// Stream one generation. Yields [`StepEvent`]s on `tx` (one `Token` per
-    /// decode step, then `Done`), returns the [`Usage`] on success. The engine
+    /// completion token, then `Done`), returns the [`Usage`] on success. The engine
     /// thread calls `tx.blocking_send` (sync; it runs in a plain thread, not a
     /// tokio runtime) — a dropped receiver surfaces as
     /// [`EngineError::Cancelled`].
@@ -337,8 +359,8 @@ pub fn engine_thread_loop(
 /// makes the intent loud at compile time.
 pub struct Engine {
     model: Model,
-    /// Reused across decode steps (the ABI handle is caller-owned, reused at
-    /// 2.x). Each step's `fields()` read copies out, so reuse is safe.
+    /// Reused across prefill and decode steps (the ABI handle is caller-owned,
+    /// reused at 2.x). Each step's `fields()` read copies out, so reuse is safe.
     step: StepResult,
     /// `!Send + !Sync` marker (raw pointers are neither). Never read.
     _not_send: std::marker::PhantomData<*const ()>,
@@ -368,16 +390,9 @@ impl Engine {
     }
 
     /// Drive a greedy (or sampled) generation to completion, returning the
-    /// generated token ids (excluding the prompt). Checks `cancel` between
-    /// prefill chunks and decode steps.
-    ///
-    /// Runs synchronously on the calling thread — in the server this is the
-    /// dedicated engine thread. Single-flight is the caller's responsibility
-    /// (the axum layer acquires a `Semaphore(1)` permit; PR B).
-    /// Drive a greedy (or sampled) generation to completion, returning the
     /// generated token ids (excluding the prompt). The non-streaming collector
-    /// over [`Engine::stream`]: it streams into a channel and collects the
-    /// `Token` events into a `Vec`. Checks `cancel` between prefill and decode
+    /// uses the prefill epilogue as completion token 1, then collects at most
+    /// `max_tokens - 1` decode tokens. Checks `cancel` before and after native
     /// steps.
     ///
     /// Runs synchronously on the calling thread — in the server this is the
@@ -403,17 +418,44 @@ impl Engine {
                 message: "prompt_tokens is empty".into(),
             }));
         }
+        // A zero completion budget is a successful no-op. Return before
+        // allocating a per-request KV or invoking native prefill.
+        if request.max_tokens == 0 {
+            return Ok(Vec::new());
+        }
+        let mut sampling = request.sampling;
         let mut generation = Generation {
             kvstate: KvState::create(&self.model)?,
         };
-        self.prefill(&mut generation, &request.prompt_tokens, cancel)?;
+        if cancel.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
+        let prefill = self.prefill(&mut generation, &request.prompt_tokens, sampling.as_ref())?;
+        advance_sampling_seed(&mut sampling);
+        if cancel.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
         let mut generated = Vec::with_capacity(request.max_tokens as usize);
+        generated.push(prefill.id);
+        if cancel.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
+        if request.eos_token_id == Some(prefill.id) {
+            return Ok(generated);
+        }
         while generated.len() < request.max_tokens as usize {
             if cancel.is_cancelled() {
                 return Err(EngineError::Cancelled);
             }
-            let step = self.decode_step(&mut generation, &request.sampling)?;
+            let step = self.decode_step(&mut generation, sampling.as_ref())?;
+            advance_sampling_seed(&mut sampling);
+            if cancel.is_cancelled() {
+                return Err(EngineError::Cancelled);
+            }
             generated.push(step.id);
+            if cancel.is_cancelled() {
+                return Err(EngineError::Cancelled);
+            }
             if request.eos_token_id == Some(step.id) {
                 break;
             }
@@ -421,10 +463,11 @@ impl Engine {
         Ok(generated)
     }
 
-    /// Stream a generation: prefill, then decode one token at a time, yielding
-    /// a [`StepEvent::Token`] per step on `tx` and a terminal
-    /// [`StepEvent::Done`] with [`Usage`]. The decode loop checks `cancel`
-    /// between steps (Cancelled → early return). **Cancel-on-client-drop**: if
+    /// Stream a generation: prefill produces completion token 1, then decode
+    /// produces at most `max_tokens - 1` subsequent tokens. Each is yielded as
+    /// [`StepEvent::Token`] on `tx`, followed by terminal [`StepEvent::Done`]
+    /// with [`Usage`]. The loop checks `cancel` before and after native steps
+    /// (Cancelled → early return). **Cancel-on-client-drop**: if
     /// the receiver is dropped (the axum response future dropped on client
     /// disconnect), the next `tx.blocking_send` returns `SendError`, mapped to
     /// [`EngineError::Cancelled`] — no explicit [`CancelToken`] fire needed.
@@ -453,16 +496,50 @@ impl Engine {
             }));
         }
 
+        // No KV state or native prefill is needed when the caller requested no
+        // completion tokens. A successful stream still consists of exactly its
+        // terminal usage event; a pre-cancelled request or dropped receiver is
+        // still reported as cancellation.
+        if request.max_tokens == 0 {
+            let usage = Usage {
+                prompt_tokens: u32::try_from(request.prompt_tokens.len()).unwrap_or(u32::MAX),
+                completion_tokens: 0,
+            };
+            if cancel.is_cancelled() {
+                return Err(EngineError::Cancelled);
+            }
+            if tx.blocking_send(StepEvent::Done(usage)).is_err() {
+                return Err(EngineError::Cancelled);
+            }
+            return Ok(usage);
+        }
+
+        let mut sampling = request.sampling;
+
         // Per-request KV (reset-around-every-generation). A fresh KvState
         // means no cross-request leakage; drop at the end of the scope frees it.
         let mut generation = Generation {
             kvstate: KvState::create(&self.model)?,
         };
+        if cancel.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
 
-        self.prefill(&mut generation, &request.prompt_tokens, cancel)?;
+        let prefill = self.prefill(&mut generation, &request.prompt_tokens, sampling.as_ref())?;
+        advance_sampling_seed(&mut sampling);
+        if cancel.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
 
-        let mut completion_tokens = 0u32;
-        while completion_tokens < request.max_tokens {
+        let mut completion_tokens = 1u32;
+        let prefill_is_eos = request.eos_token_id == Some(prefill.id);
+        if tx.blocking_send(StepEvent::Token(prefill)).is_err() {
+            return Err(EngineError::Cancelled);
+        }
+        if cancel.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
+        while completion_tokens < request.max_tokens && !prefill_is_eos {
             if cancel.is_cancelled() {
                 return Err(EngineError::Cancelled);
             }
@@ -470,12 +547,19 @@ impl Engine {
             // last token is already in the KV from prefill (or the prior step),
             // so no token is fed back here. The sampled id is read out and
             // streamed; the native side advances the offset for the next call.
-            let step = self.decode_step(&mut generation, &request.sampling)?;
-            completion_tokens += 1;
+            let step = self.decode_step(&mut generation, sampling.as_ref())?;
+            advance_sampling_seed(&mut sampling);
+            if cancel.is_cancelled() {
+                return Err(EngineError::Cancelled);
+            }
 
             // Yield the token. A dropped receiver (client disconnect) makes
             // `blocking_send` return Err → Cancelled (cancel-on-client-drop).
             if tx.blocking_send(StepEvent::Token(step)).is_err() {
+                return Err(EngineError::Cancelled);
+            }
+            completion_tokens += 1;
+            if cancel.is_cancelled() {
                 return Err(EngineError::Cancelled);
             }
 
@@ -488,6 +572,9 @@ impl Engine {
             prompt_tokens: u32::try_from(request.prompt_tokens.len()).unwrap_or(u32::MAX),
             completion_tokens,
         };
+        if cancel.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
         // The terminal frame. A dropped receiver here is still a cancel (the
         // client gave up before the Done frame); surface Cancelled so the
         // handler doesn't report a spurious success.
@@ -503,23 +590,30 @@ impl Engine {
     /// `kPrefillChunkSize` (2048) and expects the whole prompt in one call.
     /// Inter-chunk cancellation (02 "yields between chunks") would need a
     /// native continuation-prefill path that does not exist today, so the only
-    /// cancellation point during prefill is the upfront check in `drive`.
+    /// cancellation points around prefill are the checks immediately before and
+    /// after this call in `drive` / `stream`.
     fn prefill(
         &self,
         generation: &mut Generation,
         prompt: &[u32],
-        _cancel: &CancelToken,
-    ) -> Result<(), EngineError> {
-        // `drive` already rejected the empty prompt and checked cancel up
-        // front; there is no mid-prefill yield point on the current native
-        // API. `is_prompt` flags the prompt framing for the whole stream.
+        sampling: Option<&HypSamplingConfig>,
+    ) -> Result<StepToken, EngineError> {
+        // The caller already rejected the empty prompt and checked cancel up
+        // front; there is no mid-prefill yield point on the current native API.
+        // `is_prompt` flags the prompt framing for the whole stream.
         let stream = HypTokenStream::from_slice(prompt, true);
-        // Greedy prefill (the sampled variant is identical when config is
-        // None / temperature 0; PR B will route sampled prefill here too).
-        generation
-            .kvstate
-            .prefill_chunk(&self.model, &stream, &self.step)?;
-        Ok(())
+        match sampling {
+            Some(cfg) => generation.kvstate.prefill_chunk_sampled(
+                &self.model,
+                &stream,
+                Some(cfg),
+                &self.step,
+            )?,
+            None => generation
+                .kvstate
+                .prefill_chunk(&self.model, &stream, &self.step)?,
+        }
+        self.read_step_token()
     }
 
     /// Decode one token from the current KV offset. `decode_block` advances
@@ -529,7 +623,7 @@ impl Engine {
     fn decode_step(
         &self,
         generation: &mut Generation,
-        sampling: &Option<HypSamplingConfig>,
+        sampling: Option<&HypSamplingConfig>,
     ) -> Result<StepToken, EngineError> {
         match sampling {
             Some(cfg) => {
@@ -543,6 +637,10 @@ impl Engine {
                     .decode_block(&self.model, 1, &self.step)?;
             }
         }
+        self.read_step_token()
+    }
+
+    fn read_step_token(&self) -> Result<StepToken, EngineError> {
         let fields: HypStepResultFields = self.step.fields()?;
         Ok(StepToken {
             id: fields.token_id,
@@ -639,6 +737,37 @@ mod tests {
         let twin = token.clone();
         token.cancel();
         assert!(twin.is_cancelled(), "a cloned token must observe the fire");
+    }
+
+    #[test]
+    fn sampling_seed_sequence_matches_native_per_step_contract() {
+        // Exact values independently pin at least three transitions, including
+        // the implicit u64 modulo arithmetic used by model.cc.
+        let mut seed = 17;
+        let expected = [
+            17,
+            17_399_290_477_736_686_412,
+            604_063_801_117_309_355,
+            6_215_382_037_137_340_766,
+            1_645_788_613_595_576_533,
+        ];
+        for expected_seed in expected {
+            assert_eq!(seed, expected_seed);
+            seed = next_sampling_seed(seed);
+        }
+    }
+
+    #[test]
+    fn sampling_seed_transition_wraps_and_greedy_has_no_state() {
+        assert_eq!(
+            next_sampling_seed(u64::MAX),
+            13_525_302_890_751_722_018,
+            "native LCG arithmetic must wrap modulo 2^64"
+        );
+
+        let mut greedy = None;
+        advance_sampling_seed(&mut greedy);
+        assert!(greedy.is_none(), "greedy mode must remain stateless");
     }
 
     #[test]
@@ -883,13 +1012,84 @@ mod tests {
             .join("gemma4-unified-tiny")
     }
 
-    /// Real-tensor end-to-end proof of the engine wiring (load → prefill →
-    /// decode → fields-read → loop) on the committed tiny fixture. Greedy is
-    /// deterministic, so two runs must produce the identical token sequence
-    /// and every token must be in-vocab. `#[ignore]` so PR CI skips it; the
-    /// self-hosted M5 gate runs it. The rigorous byte-identity-vs-12B-CLI
-    /// comparison is the M3 gate's job (PR B's SSE-wrapped variant), not this
-    /// slice; this proves the Rust loop itself works on real tensors.
+    /// Obtain the prefill token directly through the native FFI on a fresh KV.
+    /// This intentionally does not call `Engine::prefill`: the ignored real
+    /// engine regression must catch a future Rust loop that discards a valid
+    /// native prefill `StepResult` again.
+    fn direct_native_prefill_token(
+        engine: &Engine,
+        prompt: &[u32],
+        sampling: Option<&HypSamplingConfig>,
+    ) -> u32 {
+        let kvstate = KvState::create(&engine.model).expect("create direct-prefill KV");
+        let stream = HypTokenStream::from_slice(prompt, true);
+        match sampling {
+            Some(cfg) => kvstate
+                .prefill_chunk_sampled(&engine.model, &stream, Some(cfg), &engine.step)
+                .expect("sampled native prefill"),
+            None => kvstate
+                .prefill_chunk(&engine.model, &stream, &engine.step)
+                .expect("greedy native prefill"),
+        }
+        engine
+            .step
+            .fields()
+            .expect("read direct native prefill fields")
+            .token_id
+    }
+
+    /// Obtain an entire sampled sequence through direct native calls on one
+    /// fresh KV. This intentionally advances a test-local copy of the seed
+    /// with literal model.cc constants instead of calling the production seed
+    /// helper, so it catches a Rust engine that resets or mis-advances the seed.
+    fn direct_native_sampled_tokens(
+        engine: &Engine,
+        prompt: &[u32],
+        mut sampling: HypSamplingConfig,
+        max_tokens: u32,
+    ) -> Vec<u32> {
+        assert!(max_tokens > 0, "direct native oracle requires a token");
+        let kvstate = KvState::create(&engine.model).expect("create direct-sampled KV");
+        let stream = HypTokenStream::from_slice(prompt, true);
+        kvstate
+            .prefill_chunk_sampled(&engine.model, &stream, Some(&sampling), &engine.step)
+            .expect("sampled native prefill");
+        let mut tokens = vec![
+            engine
+                .step
+                .fields()
+                .expect("read direct sampled prefill fields")
+                .token_id,
+        ];
+
+        while tokens.len() < max_tokens as usize {
+            // Literal independent oracle for model.cc's wrapping u64 update.
+            sampling.seed = sampling
+                .seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            kvstate
+                .decode_block_sampled(&engine.model, 1, Some(&sampling), &engine.step)
+                .expect("sampled native decode");
+            tokens.push(
+                engine
+                    .step
+                    .fields()
+                    .expect("read direct sampled decode fields")
+                    .token_id,
+            );
+        }
+        tokens
+    }
+
+    /// Real-tensor end-to-end proof of the engine wiring (load → prefill token 1
+    /// → decode → fields-read → loop) on the committed tiny fixture. It compares
+    /// `Engine` against independent direct native calls, covers total completion
+    /// budgets 0/1/N, zero-budget Done-only streaming, prefill EOS, a multi-step
+    /// sampled sequence, streaming usage, and receiver-drop cancellation.
+    /// `#[ignore]` so PR CI compiles but skips it; the self-hosted M5 gate may run
+    /// it. The rigorous byte-identity-vs-12B-CLI comparison remains the real HTTP
+    /// parity gate.
     #[test]
     #[ignore = "requires the committed tiny fixture + a Metal device (self-hosted M5)"]
     fn engine_drives_greedy_on_tiny_fixture() {
@@ -906,14 +1106,122 @@ mod tests {
             sampling: None,
         };
         let cancel = CancelToken::new();
+        let native_prefill = direct_native_prefill_token(&engine, &request.prompt_tokens, None);
         let first = engine
             .drive(&request, &cancel)
             .expect("greedy drive on tiny fixture");
-        assert!(!first.is_empty(), "greedy produced no tokens");
+        assert_eq!(first.len(), request.max_tokens as usize);
+        assert_eq!(
+            first[0], native_prefill,
+            "Engine::drive must begin with the native prefill token"
+        );
         assert!(
             first.iter().all(|t| *t < 128),
             "every token must be in the 128-token vocab"
         );
+
+        let one_token_request = EngineRequest {
+            max_tokens: 1,
+            ..request.clone()
+        };
+        assert_eq!(
+            engine.drive(&one_token_request, &cancel).unwrap(),
+            vec![native_prefill],
+            "max_tokens=1 is exactly the native prefill token"
+        );
+        let zero_token_request = EngineRequest {
+            max_tokens: 0,
+            ..request.clone()
+        };
+        assert!(
+            engine
+                .drive(&zero_token_request, &cancel)
+                .unwrap()
+                .is_empty(),
+            "max_tokens=0 must emit no completion tokens"
+        );
+        let (zero_tx, mut zero_rx) = tokio::sync::mpsc::channel(1);
+        let zero_usage = engine
+            .stream(&zero_token_request, &cancel, zero_tx)
+            .expect("zero-token stream");
+        assert_eq!(
+            zero_usage,
+            Usage {
+                prompt_tokens: 4,
+                completion_tokens: 0,
+            }
+        );
+        assert!(matches!(
+            zero_rx.blocking_recv(),
+            Some(StepEvent::Done(done)) if done == zero_usage
+        ));
+        assert!(
+            zero_rx.blocking_recv().is_none(),
+            "zero budget must emit exactly one Done event"
+        );
+
+        let (zero_drop_tx, zero_drop_rx) = tokio::sync::mpsc::channel(1);
+        drop(zero_drop_rx);
+        assert!(matches!(
+            engine.stream(&zero_token_request, &cancel, zero_drop_tx),
+            Err(EngineError::Cancelled)
+        ));
+        let prefill_eos_request = EngineRequest {
+            eos_token_id: Some(native_prefill),
+            ..request.clone()
+        };
+        assert_eq!(
+            engine.drive(&prefill_eos_request, &cancel).unwrap(),
+            vec![native_prefill],
+            "prefill EOS must be emitted once without decode"
+        );
+
+        let sampling = HypSamplingConfig {
+            temperature: 0.8,
+            top_k: 32,
+            top_p: 0.95,
+            min_p: 0.0,
+            seed: 17,
+        };
+        let sampled_max_tokens = 4;
+        let native_sampled = direct_native_sampled_tokens(
+            &engine,
+            &request.prompt_tokens,
+            sampling,
+            sampled_max_tokens,
+        );
+        let sampled_request = EngineRequest {
+            max_tokens: sampled_max_tokens,
+            sampling: Some(sampling),
+            ..request.clone()
+        };
+        assert_eq!(
+            engine.drive(&sampled_request, &cancel).unwrap(),
+            native_sampled,
+            "sampled Engine must match independent direct native calls across steps"
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let usage = engine
+            .stream(&one_token_request, &cancel, tx)
+            .expect("one-token stream");
+        assert_eq!(usage.completion_tokens, 1);
+        assert!(matches!(
+            rx.blocking_recv(),
+            Some(StepEvent::Token(StepToken { id, .. })) if id == native_prefill
+        ));
+        assert!(matches!(
+            rx.blocking_recv(),
+            Some(StepEvent::Done(done)) if done == usage
+        ));
+        assert!(rx.blocking_recv().is_none());
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        assert!(matches!(
+            engine.stream(&one_token_request, &cancel, tx),
+            Err(EngineError::Cancelled)
+        ));
 
         // Determinism: a second run with a fresh per-request KV produces the
         // identical sequence (greedy is deterministic; reset-around-every-

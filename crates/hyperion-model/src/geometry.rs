@@ -67,8 +67,9 @@ pub enum TextModelType {
 
 /// Validated, engine-ready geometry derived from a HF ``config.json``.
 ///
-/// Construct via [`Geometry::from_text_config_str`]; every other crate consumes
-/// the validated struct, never the raw file.
+/// Construct a full HF config via [`Geometry::from_config_str`], or an already
+/// extracted text backbone via [`Geometry::from_text_config_str`]. Every other
+/// crate consumes the validated struct, never the raw file.
 #[derive(Clone, Debug)]
 pub struct Geometry {
     pub model_type: TextModelType,
@@ -186,6 +187,28 @@ struct Gemma4TextConfigRaw {
 }
 
 impl Geometry {
+    /// Parse and validate a full Hugging Face Gemma 4 ``config.json`` document.
+    ///
+    /// Hyperion v1 is text-only, so unrelated outer multimodal and release
+    /// metadata is ignored. The required ``text_config`` value remains strict:
+    /// it must be an object and is delegated to [`Self::from_text_config_str`].
+    pub fn from_config_str(json: &str) -> Result<Self, GeometryError> {
+        let root: serde_json::Value = serde_json::from_str(json)
+            .map_err(|error| GeometryError::new(format!("gemma4 config parse failed: {error}")))?;
+        let root = root
+            .as_object()
+            .ok_or_else(|| GeometryError::new("gemma4 config root must be a JSON object"))?;
+        let text_config = root.get("text_config").ok_or_else(|| {
+            GeometryError::new("gemma4 config is missing required text_config object")
+        })?;
+        if !text_config.is_object() {
+            return Err(GeometryError::new(
+                "gemma4 config text_config must be a JSON object",
+            ));
+        }
+        Self::from_text_config_str(&text_config.to_string())
+    }
+
     /// Parse and validate a Gemma 4 ``text_config`` JSON object.
     ///
     /// Accepts the ``text_config`` value (not the full multimodal wrapper); the
@@ -476,6 +499,66 @@ mod tests {
 
     fn parse(value: &Value) -> Result<Geometry, GeometryError> {
         Geometry::from_text_config_str(&value.to_string())
+    }
+
+    #[test]
+    fn parses_canonical_style_config_wrapper_and_ignores_outer_metadata() {
+        let config = json!({
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "model_type": "gemma4_unified",
+            "text_config": base_12b(),
+            "vision_config": {"model_type": "siglip_vision_model"}
+        });
+
+        let geometry = Geometry::from_config_str(&config.to_string()).unwrap();
+        assert!(geometry.is_dense_unified());
+        assert_eq!(geometry.num_hidden_layers, 48);
+    }
+
+    #[test]
+    fn full_config_rejects_malformed_or_non_object_root() {
+        let malformed = Geometry::from_config_str("{").unwrap_err();
+        assert!(malformed.to_string().contains("config parse failed"));
+
+        let non_object = Geometry::from_config_str("[]").unwrap_err();
+        assert_eq!(
+            non_object.to_string(),
+            "gemma4 config root must be a JSON object"
+        );
+    }
+
+    #[test]
+    fn full_config_requires_object_text_config() {
+        let missing = Geometry::from_config_str(r#"{"architectures": []}"#).unwrap_err();
+        assert_eq!(
+            missing.to_string(),
+            "gemma4 config is missing required text_config object"
+        );
+
+        for value in [Value::Null, json!("text"), json!([])] {
+            let config = json!({"text_config": value});
+            let error = Geometry::from_config_str(&config.to_string()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "gemma4 config text_config must be a JSON object"
+            );
+        }
+    }
+
+    #[test]
+    fn full_config_preserves_strict_inner_text_config_validation() {
+        let mut text_config = base_12b();
+        text_config["fabricated_future_field"] = json!(true);
+        let config = json!({
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "text_config": text_config
+        });
+
+        let error = Geometry::from_config_str(&config.to_string()).unwrap_err();
+        assert!(
+            error.to_string().contains("fabricated_future_field"),
+            "expected the unknown inner field to surface, got: {error}"
+        );
     }
 
     #[test]
