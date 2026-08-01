@@ -172,9 +172,9 @@ if not os.path.isabs(path) or not os.path.isdir(path) or os.path.islink(path):
 print(path)
 ' "$m3_user_tmp")
 
-# Keep every source-binding Git query on one fixed, linked-worktree-aware path.
-# Native discovery still resolves the repository's .git directory or gitfile,
-# while -C/--work-tree bind the physical source tree that Cargo will compile.
+# Keep every source-binding Git query on one fixed path after a separate raw
+# repository-metadata inspection has resolved and approved the native linked-
+# worktree Git directory. No source query refreshes or writes the index.
 m3_source_git() {
     "$m3_env" -i \
         HOME="$m3_login_home" \
@@ -190,9 +190,11 @@ m3_source_git() {
         GIT_PAGER= PAGER= \
         GIT_OPTIONAL_LOCKS=0 \
         GIT_NO_LAZY_FETCH=1 \
+        GIT_NO_REPLACE_OBJECTS=1 \
         "$m3_git" \
         --no-optional-locks \
         -C "$m3_repo_root" \
+        --git-dir="${m3_source_git_dir:?}" \
         --work-tree="$m3_repo_root" \
         -c core.fsmonitor=false \
         -c core.untrackedCache=false \
@@ -209,56 +211,521 @@ m3_source_git() {
         "$@"
 }
 
-# Inspect the complete repository-native index without refreshing or mutating it.
-# `ls-files -v` lowercases every assume-unchanged entry tag and uses S for
-# skip-worktree; --stage gives every index stage an unambiguous tab-delimited
-# metadata prefix, while -z leaves the pathname as uninterpreted bytes.
-m3_source_index_has_no_hiding_flags() {
-    m3_source_git ls-files --cached --stage -v -z |
-        "$m3_env" -i \
-            HOME="$m3_login_home" \
-            DEVELOPER_DIR="$m3_xcode_developer_dir" \
-            PATH="$m3_source_git_path" \
-            TMPDIR="$m3_user_tmp" \
-            LANG=C LC_ALL=C \
-            "$m3_python" -I -S -c '
+# Resolve repository-native paths without loading repository configuration,
+# then parse each config file explicitly with includes disabled. Helper-capable
+# local settings and non-comment info excludes are rejected before source Git
+# commands can consult them. The returned deterministic digest record is also
+# compared at postflight under the declared active-same-UID exclusion.
+m3_validate_repository_metadata() {
+    m3_pinned_python -I -S - \
+        "$m3_repo_root" "$m3_git" "$m3_login_home" \
+        "$m3_user_tmp" "$m3_source_git_path" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import subprocess
 import sys
 
-data = sys.stdin.buffer.read()
-if data and not data.endswith(b"\0"):
-    print("native Git index inspection returned a truncated NUL stream")
+
+def fail(message):
+    print(message)
     raise SystemExit(1)
 
-prohibited = []
-for record in data[:-1].split(b"\0") if data else ():
+
+def regular_file_bytes(path, description, required=False):
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        if required:
+            fail(f"{description} is missing")
+        return None
+    except OSError as error:
+        fail(f"{description} is unreadable: {error}")
+    if not stat.S_ISREG(metadata.st_mode):
+        fail(f"{description} is not a real regular file")
+    try:
+        with open(path, "rb") as stream:
+            return stream.read()
+    except OSError as error:
+        fail(f"{description} is unreadable: {error}")
+
+
+def real_directory(path, description):
+    canonical = os.path.realpath(path)
+    try:
+        metadata = os.lstat(canonical)
+    except OSError as error:
+        fail(f"{description} is unavailable: {error}")
+    if not stat.S_ISDIR(metadata.st_mode):
+        fail(f"{description} is not a real directory")
+    return canonical
+
+
+repo_root, git_executable, login_home, user_tmp, source_git_path = sys.argv[1:]
+repo_root_bytes = os.fsencode(repo_root)
+dot_git = os.path.join(repo_root_bytes, b".git")
+try:
+    dot_git_metadata = os.lstat(dot_git)
+except OSError as error:
+    fail(f"repository-native .git is unavailable: {error}")
+if stat.S_ISDIR(dot_git_metadata.st_mode):
+    git_dir = real_directory(dot_git, "repository-native Git directory")
+elif stat.S_ISREG(dot_git_metadata.st_mode):
+    git_file = regular_file_bytes(dot_git, "repository-native Git file", required=True)
+    if b"\0" in git_file or not git_file.startswith(b"gitdir: "):
+        fail("repository-native Git file is malformed")
+    git_dir_field = git_file[len(b"gitdir: ") :]
+    if git_dir_field.endswith(b"\n"):
+        git_dir_field = git_dir_field[:-1]
+    if git_dir_field.endswith(b"\r"):
+        git_dir_field = git_dir_field[:-1]
+    if not git_dir_field or b"\n" in git_dir_field or b"\r" in git_dir_field:
+        fail("repository-native Git file has an invalid gitdir field")
+    if not os.path.isabs(git_dir_field):
+        git_dir_field = os.path.join(repo_root_bytes, git_dir_field)
+    git_dir = real_directory(git_dir_field, "linked-worktree Git directory")
+else:
+    fail("repository-native .git is neither a directory nor a regular gitfile")
+
+commondir_path = os.path.join(git_dir, b"commondir")
+commondir_field = regular_file_bytes(commondir_path, "linked-worktree commondir")
+if commondir_field is None:
+    common_dir = git_dir
+else:
+    if commondir_field.endswith(b"\n"):
+        commondir_field = commondir_field[:-1]
+    if commondir_field.endswith(b"\r"):
+        commondir_field = commondir_field[:-1]
+    if not commondir_field or b"\0" in commondir_field or b"\n" in commondir_field:
+        fail("linked-worktree commondir is malformed")
+    if not os.path.isabs(commondir_field):
+        commondir_field = os.path.join(git_dir, commondir_field)
+    common_dir = real_directory(commondir_field, "repository common Git directory")
+
+controlled_environment = {
+    "HOME": login_home,
+    "DEVELOPER_DIR": os.environ.get("DEVELOPER_DIR", ""),
+    "PATH": source_git_path,
+    "TMPDIR": user_tmp,
+    "LANG": "C",
+    "LC_ALL": "C",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_ATTR_NOSYSTEM": "1",
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_PAGER": "",
+    "PAGER": "",
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_NO_LAZY_FETCH": "1",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+}
+dangerous_exact = {
+    "core.attributesfile",
+    "core.excludesfile",
+    "core.fsmonitor",
+    "diff.external",
+}
+
+
+def config_record(path, description):
+    content = regular_file_bytes(path, description)
+    if content is None:
+        return None
+    command = [
+        git_executable,
+        "config",
+        "--file",
+        os.fsdecode(path),
+        "--no-includes",
+        "--null",
+        "--name-only",
+        "--list",
+    ]
+    completed = subprocess.run(
+        command,
+        env=controlled_environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        fail(f"{description} could not be parsed with includes disabled")
+    config_keys = completed.stdout[:-1] if completed.stdout.endswith(b"\0") else completed.stdout
+    keys = config_keys.split(b"\0") if config_keys else ()
+    if any(not raw_key for raw_key in keys):
+        fail(f"{description} produced an empty config key")
+    rejected = []
+    for raw_key in keys:
+        try:
+            key = raw_key.decode("utf-8").lower()
+        except UnicodeDecodeError:
+            fail(f"{description} contains a non-UTF-8 config key")
+        if (
+            key in dangerous_exact
+            or key.startswith("include.")
+            or key.startswith("includeif.")
+            or key.startswith("filter.")
+            or (
+                key.startswith("diff.")
+                and key.rsplit(".", 1)[-1] in {"command", "external", "textconv"}
+            )
+        ):
+            rejected.append(key)
+    if rejected:
+        fail(
+            f"{description} contains prohibited helper/config routing: "
+            + ",".join(sorted(set(rejected)))
+        )
+    return hashlib.sha256(content).hexdigest()
+
+
+records = {}
+config_paths = [
+    (os.path.join(common_dir, b"config"), "common_config"),
+    (os.path.join(git_dir, b"config.worktree"), "worktree_config"),
+]
+seen = set()
+for path, role in config_paths:
+    canonical_key = os.path.normpath(path)
+    if canonical_key in seen:
+        continue
+    seen.add(canonical_key)
+    records[role] = config_record(path, f"repository-native {role}")
+
+info_roots = []
+for candidate in (common_dir, git_dir):
+    if candidate not in info_roots:
+        info_roots.append(candidate)
+for index, info_root in enumerate(info_roots):
+    attributes_path = os.path.join(info_root, b"info", b"attributes")
+    if os.path.lexists(attributes_path):
+        fail("repository-native info/attributes is prohibited")
+    exclude_path = os.path.join(info_root, b"info", b"exclude")
+    exclude = regular_file_bytes(exclude_path, "repository-native info/exclude")
+    role = f"info_exclude_{index}"
+    if exclude is None:
+        records[role] = None
+        continue
+    for line in exclude.splitlines():
+        if line.strip() and not line.lstrip().startswith(b"#"):
+            fail("repository-native info/exclude contains active patterns")
+    records[role] = hashlib.sha256(exclude).hexdigest()
+
+print(
+    json.dumps(
+        {
+            "git_dir": os.fsdecode(git_dir),
+            "common_dir": os.fsdecode(common_dir),
+            "metadata_sha256": records,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+)
+PY
+}
+
+# Compare HEAD, the native index, and physical worktree bytes without Git
+# conversion, attribute, exclude, or diff machinery. Physical traversal supplies
+# the untracked/ignored inventory. Only the exact evidence directory and three
+# generated roots that are not inputs to this fresh-target contract build are
+# pruned, and an allowance is rejected if HEAD tracks anything beneath it.
+m3_attest_source() {
+    local m3_attest_evidence_relative=${1-}
+    m3_pinned_python -I -S - \
+        "$m3_repo_root" "$m3_source_git_dir" "$m3_git" \
+        "$m3_login_home" "$m3_user_tmp" "$m3_source_git_path" \
+        "$m3_attest_evidence_relative" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import subprocess
+import sys
+
+
+def fail(message):
+    print(message)
+    raise SystemExit(1)
+
+
+(
+    repo_root,
+    git_dir,
+    git_executable,
+    login_home,
+    user_tmp,
+    source_git_path,
+    evidence_relative,
+) = sys.argv[1:]
+environment = {
+    "HOME": login_home,
+    "DEVELOPER_DIR": os.environ.get("DEVELOPER_DIR", ""),
+    "PATH": source_git_path,
+    "TMPDIR": user_tmp,
+    "LANG": "C",
+    "LC_ALL": "C",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_ATTR_NOSYSTEM": "1",
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_PAGER": "",
+    "PAGER": "",
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_NO_LAZY_FETCH": "1",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+}
+base = [
+    git_executable,
+    "--no-optional-locks",
+    "-C",
+    repo_root,
+    f"--git-dir={git_dir}",
+    f"--work-tree={repo_root}",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.untrackedCache=false",
+    "-c",
+    "core.ignoreStat=false",
+    "-c",
+    "core.trustctime=true",
+    "-c",
+    "core.checkStat=default",
+    "-c",
+    "core.fileMode=true",
+    "-c",
+    "core.symlinks=true",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.attributesFile=/dev/null",
+    "-c",
+    "core.excludesFile=/dev/null",
+    "-c",
+    "core.pager=",
+    "-c",
+    "pager.status=false",
+    "-c",
+    "diff.external=",
+    "-c",
+    "diff.trustExitCode=false",
+]
+
+
+def git_output(arguments, description):
+    completed = subprocess.run(
+        base + arguments,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        fail(f"{description} failed closed")
+    return completed.stdout
+
+
+source_sha = git_output(
+    ["rev-parse", "--verify", "HEAD^{commit}"], "source commit binding"
+).strip()
+source_tree_sha = git_output(
+    ["rev-parse", "--verify", "HEAD^{tree}"], "source tree binding"
+).strip()
+if len(source_sha) not in (40, 64) or len(source_tree_sha) != len(source_sha):
+    fail("source object identifiers have an unsupported format")
+try:
+    int(source_sha, 16)
+    int(source_tree_sha, 16)
+except ValueError:
+    fail("source object identifiers are malformed")
+hash_name = "sha1" if len(source_sha) == 40 else "sha256"
+
+tree_stream = git_output(
+    ["ls-tree", "-r", "-z", "--full-tree", "HEAD"],
+    "HEAD tree enumeration",
+)
+if tree_stream and not tree_stream.endswith(b"\0"):
+    fail("HEAD tree enumeration returned a truncated NUL stream")
+head = {}
+for record in tree_stream[:-1].split(b"\0") if tree_stream else ():
+    metadata, separator, pathname = record.partition(b"\t")
+    fields = metadata.split(b" ")
+    if not separator or not pathname or len(fields) != 3:
+        fail("HEAD tree enumeration returned a malformed record")
+    mode, object_type, object_id = fields
+    if pathname in head:
+        fail(f"HEAD tree contains a duplicate path path_hex={pathname.hex()}")
+    head[pathname] = (mode, object_type, object_id)
+
+index_stream = git_output(
+    ["ls-files", "--cached", "--stage", "-v", "-z"],
+    "native index enumeration",
+)
+if index_stream and not index_stream.endswith(b"\0"):
+    fail("native index enumeration returned a truncated NUL stream")
+index = {}
+prohibited_flags = []
+for record in index_stream[:-1].split(b"\0") if index_stream else ():
     if len(record) < 4 or record[1:2] != b" ":
-        print("native Git index inspection returned a malformed record")
-        raise SystemExit(1)
-    separator = record.find(b"\t", 2)
-    if separator < 0 or separator == len(record) - 1:
-        print("native Git index inspection returned malformed stage metadata")
-        raise SystemExit(1)
-    tag = record[0:1]
-    if not (b"A" <= tag <= b"Z" or b"a" <= tag <= b"z" or tag == b"?"):
-        print("native Git index inspection returned an unknown entry tag")
-        raise SystemExit(1)
+        fail("native index enumeration returned a malformed record")
+    tag = record[:1]
+    metadata, separator, pathname = record[2:].partition(b"\t")
+    fields = metadata.split(b" ")
+    if not separator or not pathname or len(fields) != 3:
+        fail("native index enumeration returned malformed stage metadata")
+    mode, object_id, stage = fields
     flags = []
     if b"a" <= tag <= b"z":
         flags.append("assume-unchanged")
     if tag.upper() == b"S":
         flags.append("skip-worktree")
     if flags:
-        prohibited.append((flags, record[separator + 1 :]))
-
-if prohibited:
-    for flags, pathname in prohibited:
-        joined_flags = "+".join(flags)
+        prohibited_flags.append((flags, pathname))
+    if stage != b"0":
+        fail(f"native index contains a nonzero stage path_hex={pathname.hex()}")
+    if pathname in index:
+        fail(f"native index contains a duplicate path path_hex={pathname.hex()}")
+    index[pathname] = (mode, object_id)
+if prohibited_flags:
+    for flags, pathname in prohibited_flags:
         print(
             "prohibited native Git index entry: "
-            f"flags={joined_flags} path_hex={pathname.hex()}"
+            f"flags={'+'.join(flags)} path_hex={pathname.hex()}"
         )
     raise SystemExit(1)
-'
+
+head_index = {
+    pathname: (mode, object_id)
+    for pathname, (mode, _object_type, object_id) in head.items()
+}
+if head_index != index:
+    for pathname in sorted(set(head_index) | set(index)):
+        if head_index.get(pathname) != index.get(pathname):
+            fail(f"native index differs from exact HEAD path_hex={pathname.hex()}")
+
+repo_root_bytes = os.fsencode(repo_root)
+
+
+def git_blob_id(content):
+    digest = hashlib.new(hash_name)
+    digest.update(b"blob " + str(len(content)).encode("ascii") + b"\0")
+    digest.update(content)
+    return digest.hexdigest().encode("ascii")
+
+
+tracked_paths = set(head)
+for pathname, (mode, object_type, expected_id) in sorted(head.items()):
+    full_path = os.path.join(repo_root_bytes, pathname)
+    try:
+        metadata = os.lstat(full_path)
+    except OSError as error:
+        fail(f"tracked path is unavailable path_hex={pathname.hex()}: {error}")
+    if mode in (b"100644", b"100755") and object_type == b"blob":
+        if not stat.S_ISREG(metadata.st_mode):
+            fail(f"tracked regular-file type changed path_hex={pathname.hex()}")
+        executable = bool(metadata.st_mode & 0o111)
+        if executable != (mode == b"100755"):
+            fail(f"tracked executable mode changed path_hex={pathname.hex()}")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(full_path, flags)
+            try:
+                opened = os.fstat(descriptor)
+                if (opened.st_dev, opened.st_ino) != (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                ):
+                    fail(f"tracked file identity changed path_hex={pathname.hex()}")
+                chunks = []
+                while True:
+                    chunk = os.read(descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            finally:
+                os.close(descriptor)
+        except OSError as error:
+            fail(f"tracked file is unreadable path_hex={pathname.hex()}: {error}")
+        actual_id = git_blob_id(b"".join(chunks))
+    elif mode == b"120000" and object_type == b"blob":
+        if not stat.S_ISLNK(metadata.st_mode):
+            fail(f"tracked symlink type changed path_hex={pathname.hex()}")
+        try:
+            actual_id = git_blob_id(os.readlink(full_path))
+        except OSError as error:
+            fail(f"tracked symlink is unreadable path_hex={pathname.hex()}: {error}")
+    elif mode == b"160000" and object_type == b"commit":
+        fail(f"tracked gitlinks are unsupported path_hex={pathname.hex()}")
+    else:
+        fail(
+            "HEAD contains an unsupported mode/type "
+            f"path_hex={pathname.hex()} mode={mode.decode('ascii', 'replace')}"
+        )
+    if actual_id != expected_id:
+        fail(f"tracked raw bytes differ from exact HEAD path_hex={pathname.hex()}")
+
+allowed_roots = [b"build", b"target", b"oracle/.venv"]
+if evidence_relative:
+    evidence_bytes = os.fsencode(evidence_relative)
+    if (
+        os.path.isabs(evidence_bytes)
+        or os.path.normpath(evidence_bytes) != evidence_bytes
+        or evidence_bytes in (b"", b".")
+    ):
+        fail("inside-repository evidence allowance is not a normalized relative path")
+    allowed_roots.append(evidence_bytes)
+for allowed in allowed_roots:
+    if any(path == allowed or path.startswith(allowed + b"/") for path in tracked_paths):
+        fail(f"generated/evidence allowance overlaps tracked HEAD path_hex={allowed.hex()}")
+
+physical_files = set()
+
+
+def walk(relative):
+    directory = repo_root_bytes if not relative else os.path.join(repo_root_bytes, relative)
+    try:
+        entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+    except OSError as error:
+        fail(f"physical source inventory failed path_hex={relative.hex()}: {error}")
+    for entry in entries:
+        name = entry.name
+        pathname = name if not relative else relative + b"/" + name
+        if not relative and pathname == b".git":
+            continue
+        if pathname in allowed_roots:
+            if not entry.is_dir(follow_symlinks=False):
+                fail(f"generated/evidence allowance is not a real directory path_hex={pathname.hex()}")
+            continue
+        if entry.is_dir(follow_symlinks=False):
+            walk(pathname)
+        else:
+            physical_files.add(pathname)
+
+
+walk(b"")
+untracked = sorted(physical_files - tracked_paths)
+if untracked:
+    for pathname in untracked:
+        print(f"untracked or ignored physical source path path_hex={pathname.hex()}")
+    raise SystemExit(1)
+
+print(
+    json.dumps(
+        {
+            "sha": source_sha.decode("ascii"),
+            "tree_sha": source_tree_sha.decode("ascii"),
+            "tracked_path_count": len(tracked_paths),
+            "inventory": "HEAD/index/raw-worktree-bytes plus physical untracked/ignored paths",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+)
+PY
 }
 
 m3_validate_xcode_binding() {
@@ -272,6 +739,7 @@ m3_validate_xcode_binding() {
     "${m3_binding_python[@]}" -I -S - "$@" <<'PY'
 # M3_XCODE_BINDING_PYTHON_BEGIN
 import json
+import hashlib
 import os
 import stat
 import sys
@@ -311,14 +779,6 @@ except OSError as error:
 if not stat.S_ISDIR(selected_metadata.st_mode):
     fail("selected Xcode developer directory is not a real directory")
 
-toolchains_root = os.path.join(selected_canonical, "Toolchains")
-try:
-    toolchains_metadata = os.stat(toolchains_root, follow_symlinks=False)
-except OSError as error:
-    fail(f"selected Xcode Toolchains directory is unavailable: {error}")
-if not stat.S_ISDIR(toolchains_metadata.st_mode):
-    fail("selected Xcode Toolchains path is not a real directory")
-
 result = {
     "developer_dir": {
         "invocation_path": selected_invocation,
@@ -342,20 +802,20 @@ if mode == "binding":
         fail("xcrun metal driver is not a real regular file")
     if metal_driver_metadata.st_mode & 0o111 == 0:
         fail("xcrun metal driver is not executable")
+    digest = hashlib.sha256()
     try:
-        if (
-            os.path.commonpath((toolchains_root, metal_driver_canonical))
-            != toolchains_root
-            or metal_driver_canonical == toolchains_root
-        ):
-            fail("xcrun metal driver escapes the selected Xcode toolchain")
-    except ValueError:
-        fail("xcrun metal driver is on a different path root")
+        with open(metal_driver_canonical, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as error:
+        fail(f"xcrun metal driver is unreadable: {error}")
 
     result["environment_pin"] = {"DEVELOPER_DIR": pinned_canonical}
     result["metal_driver"] = {
         "invocation_path": metal_driver_invocation,
         "canonical_path": metal_driver_canonical,
+        "sha256": digest.hexdigest(),
+        "resolution": "fixed xcrun under canonical DEVELOPER_DIR pin",
     }
 
 print(json.dumps(result, sort_keys=True, separators=(",", ":")))
@@ -622,13 +1082,38 @@ m3_write_manifest() {
             tree_sha: (if $source_tree_sha == "" then null else $source_tree_sha end),
             clean: $source_clean,
             repository_root_binding: "<physical-repository-root>",
-            git_dir_discovery: "repository-native .git directory or linked-worktree gitfile",
+            git_dir_discovery: "raw repository-native .git directory or linked-worktree gitfile plus commondir; no repository config loaded during discovery",
+            repository_native_metadata_policy: {
+              inspection: "config and config.worktree parsed explicitly with includes disabled before source Git queries; metadata digests compared at postflight",
+              prohibited: [
+                "include/includeIf routing",
+                "filter.* helpers",
+                "core.attributesFile",
+                "core.excludesFile",
+                "core.fsmonitor",
+                "diff external/textconv helpers",
+                "info/attributes",
+                "active info/exclude patterns"
+              ],
+              default_info_exclude: "comment-only content allowed"
+            },
             native_index_policy: {
               index: "repository-native-linked-worktree-aware",
-              required_for_clean: "assume-unchanged and skip-worktree absent at source preflight and postflight",
+              required_for_clean: "all stage-0 mode/object/path entries exactly equal HEAD; assume-unchanged and skip-worktree absent at source preflight and postflight",
               prohibited_entry_flags: ["assume-unchanged", "skip-worktree"],
               inspection: "read-only git ls-files --cached --stage -v -z parsed as NUL-delimited bytes",
               mutation: "none; index is not refreshed or modified"
+            },
+            raw_worktree_policy: {
+              tracked_bytes: "physical regular-file and symlink bytes hashed as Git blobs and compared directly with exact HEAD object ids; attributes, clean/smudge filters, and textconv are not used",
+              tracked_modes: "physical regular-file, executable, and symlink modes must match exact HEAD",
+              path_inventory: "physical byte-path traversal rejects every untracked or ignored non-directory path outside the narrow generated/evidence allowances; Git excludes are not used",
+              generated_root_allowances: {
+                "build/": "legacy CMake output only; this contract build configures native code beneath Cargo OUT_DIR in the fresh external CARGO_TARGET_DIR",
+                "target/": "excluded only because CARGO_TARGET_DIR is a fresh runner-owned external directory",
+                "oracle/.venv/": "excluded only because the selected hyperion-server contract build/test does not invoke the oracle environment and uses the explicit artifact root",
+                inside_repository_evidence: "only the exact invocation-created benchmarks/raw/m3 evidence subtree is excluded"
+              }
             }
           },
           fixture: {
@@ -689,7 +1174,8 @@ m3_write_manifest() {
                 environment_launcher: "/usr/bin/env -i",
                 executable: "/usr/bin/xcrun",
                 inherited_environment: "cleared",
-                DEVELOPER_DIR: $xcode_developer_dir
+                DEVELOPER_DIR: $xcode_developer_dir,
+                metal_resolution: "the exact absolute regular executable returned by fixed xcrun is bound by invocation path, canonical path, and sha256; Apple MobileAsset/cryptex toolchains outside Xcode.app are allowed"
               },
               python_helpers: {
                 executable: "/usr/bin/python3",
@@ -729,7 +1215,8 @@ m3_write_manifest() {
                 GIT_PAGER: "",
                 PAGER: "",
                 GIT_OPTIONAL_LOCKS: "0",
-                GIT_NO_LAZY_FETCH: "1"
+                GIT_NO_LAZY_FETCH: "1",
+                GIT_NO_REPLACE_OBJECTS: "1"
               },
               repository_binding: {
                 working_directory: "<physical-repository-root>",
@@ -746,12 +1233,14 @@ m3_write_manifest() {
                 "core.fileMode=true",
                 "core.symlinks=true",
                 "core.hooksPath=/dev/null",
+                "core.attributesFile=/dev/null",
+                "core.excludesFile=/dev/null",
                 "core.pager=",
                 "pager.status=false",
                 "diff.external=",
                 "diff.trustExitCode=false"
               ],
-              local_repository_config: "loaded with the listed command-line safety overrides"
+              local_repository_config: "direct config files inspected first with includes disabled; helper-capable routing rejected, then benign repository config loaded with the listed command-line safety overrides"
             },
             toolchain_query_environment: {
               HOME: "<canonical-login-home>",
@@ -1084,6 +1573,56 @@ while :; do
     [[ -n "$m3_cargo_config_parent" ]] || m3_cargo_config_parent=/
 done
 
+m3_failure_stage=source_preflight
+m3_evidence_relative=
+case "$m3_evidence_root" in
+    "$m3_repo_root"/*)
+        m3_evidence_relative=${m3_evidence_root#"$m3_repo_root"/}
+        case "$m3_evidence_relative" in
+            benchmarks/raw/m3/*)
+                ;;
+            *)
+                m3_note "evidence inside the repository is allowed only under benchmarks/raw/m3"
+                exit 1
+                ;;
+        esac
+        ;;
+esac
+if ! m3_source_metadata_json=$(m3_validate_repository_metadata 2>&1); then
+    m3_note "source preflight rejected dangerous or unreadable repository-native Git metadata"
+    if [[ -n "$m3_source_metadata_json" ]]; then
+        printf '%s\n' "$m3_source_metadata_json" >>"$m3_preflight_log"
+    fi
+    exit 1
+fi
+if ! m3_source_git_dir=$("$m3_jq" -er \
+    '.git_dir | select(type == "string" and startswith("/"))' \
+    <<<"$m3_source_metadata_json")
+then
+    m3_note "source preflight could not bind the repository-native Git directory"
+    exit 1
+fi
+if ! m3_source_attestation_json=$(m3_attest_source \
+    "$m3_evidence_relative" 2>&1)
+then
+    m3_note "source preflight exact HEAD/index/raw-worktree attestation failed"
+    if [[ -n "$m3_source_attestation_json" ]]; then
+        printf '%s\n' "$m3_source_attestation_json" >>"$m3_preflight_log"
+    fi
+    exit 1
+fi
+if ! m3_source_sha=$("$m3_jq" -er \
+    '.sha | select(type == "string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$"))' \
+    <<<"$m3_source_attestation_json") || \
+   ! m3_source_tree_sha=$("$m3_jq" -er \
+    '.tree_sha | select(type == "string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$"))' \
+    <<<"$m3_source_attestation_json")
+then
+    m3_note "source preflight attestation output is malformed"
+    exit 1
+fi
+m3_source_clean=true
+
 m3_failure_stage=artifact_environment
 if [[ -z "${HYPERION_12B_ARTIFACT:-}" ]]; then
     m3_note "HYPERION_12B_ARTIFACT must be set explicitly to the pinned real artifact"
@@ -1242,49 +1781,6 @@ m3_verify_selected_artifact() {
           payload_hashes_verified: true
         }'
 }
-m3_failure_stage=source_preflight
-if ! m3_git_toplevel=$(m3_source_git rev-parse --show-toplevel); then
-    m3_note "git repository discovery failed closed"
-    exit 1
-fi
-if [[ "$m3_git_toplevel" != "$m3_repo_root" ]]; then
-    m3_note "runner must execute from its exact repository worktree"
-    exit 1
-fi
-case "$m3_evidence_root" in
-    "$m3_repo_root"/*)
-        m3_evidence_relative=${m3_evidence_root#"$m3_repo_root"/}
-        if ! m3_source_git check-ignore -q -- "$m3_evidence_relative"; then
-            m3_note "evidence inside the repository must be under a gitignored path"
-            exit 1
-        fi
-        ;;
-esac
-if ! m3_index_flags_output=$(m3_source_index_has_no_hiding_flags 2>&1); then
-    m3_note "source preflight rejected prohibited or unreadable native Git index flags"
-    if [[ -n "$m3_index_flags_output" ]]; then
-        printf '%s\n' "$m3_index_flags_output" >>"$m3_preflight_log"
-    fi
-    exit 1
-fi
-m3_failure_stage=source_preflight
-if ! m3_git_status=$(m3_source_git status \
-    --porcelain=v1 --untracked-files=all --ignore-submodules=none); then
-    m3_note "git status failed closed"
-    exit 1
-fi
-if [[ -n "$m3_git_status" ]]; then
-    m3_note "M3 stream parity requires a completely clean source worktree"
-    printf '%s\n' "$m3_git_status" >>"$m3_preflight_log"
-    exit 1
-fi
-if ! m3_source_sha=$(m3_source_git rev-parse --verify 'HEAD^{commit}') || \
-   ! m3_source_tree_sha=$(m3_source_git rev-parse --verify 'HEAD^{tree}'); then
-    m3_note "source commit or tree binding failed closed"
-    exit 1
-fi
-m3_source_clean=true
-
 m3_failure_stage=artifact_identity_preflight
 set +e
 m3_identity_output=$(m3_verify_selected_artifact 2>&1)
@@ -1702,31 +2198,28 @@ fi
 
 m3_source_clean=false
 m3_failure_stage=source_postflight
-if ! m3_post_index_flags_output=$(m3_source_index_has_no_hiding_flags 2>&1); then
-    m3_note "source postflight rejected prohibited or unreadable native Git index flags"
-    if [[ -n "$m3_post_index_flags_output" ]]; then
-        printf '%s\n' "$m3_post_index_flags_output" >>"$m3_preflight_log"
+if ! m3_post_source_metadata_json=$(m3_validate_repository_metadata 2>&1); then
+    m3_note "source postflight rejected dangerous or unreadable repository-native Git metadata"
+    if [[ -n "$m3_post_source_metadata_json" ]]; then
+        printf '%s\n' "$m3_post_source_metadata_json" >>"$m3_preflight_log"
     fi
     exit 1
 fi
-if ! m3_post_source_sha=$(m3_source_git rev-parse --verify 'HEAD^{commit}') || \
-   ! m3_post_source_tree_sha=$(m3_source_git rev-parse --verify 'HEAD^{tree}'); then
-    m3_note "postflight source commit or tree binding failed closed"
+if [[ "$m3_post_source_metadata_json" != "$m3_source_metadata_json" ]]; then
+    m3_note "repository-native Git metadata changed across the real-model test"
     exit 1
 fi
-if [[ "$m3_post_source_sha" != "$m3_source_sha" || \
-      "$m3_post_source_tree_sha" != "$m3_source_tree_sha" ]]; then
-    m3_note "source commit or tree changed across the real-model test"
+if ! m3_post_source_attestation_json=$(m3_attest_source \
+    "$m3_evidence_relative" 2>&1)
+then
+    m3_note "source postflight exact HEAD/index/raw-worktree attestation failed"
+    if [[ -n "$m3_post_source_attestation_json" ]]; then
+        printf '%s\n' "$m3_post_source_attestation_json" >>"$m3_preflight_log"
+    fi
     exit 1
 fi
-if ! m3_post_git_status=$(m3_source_git status \
-    --porcelain=v1 --untracked-files=all --ignore-submodules=none); then
-    m3_note "postflight git status failed closed"
-    exit 1
-fi
-if [[ -n "$m3_post_git_status" ]]; then
-    m3_note "source worktree changed across the real-model test"
-    printf '%s\n' "$m3_post_git_status" >>"$m3_preflight_log"
+if [[ "$m3_post_source_attestation_json" != "$m3_source_attestation_json" ]]; then
+    m3_note "exact source attestation changed across the real-model test"
     exit 1
 fi
 m3_post_fixture_sha256=$(m3_log_sha256 "$m3_fixture_path")

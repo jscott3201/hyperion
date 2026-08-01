@@ -223,8 +223,17 @@ m3_test_assert_static_identity() {
         .command.hashing.environment.LC_ALL == "C" and
         .source.repository_root_binding == "<physical-repository-root>" and
         (.source.git_dir_discovery | contains("linked-worktree gitfile")) and
+        (.source.git_dir_discovery | contains("no repository config loaded")) and
+        (.source.repository_native_metadata_policy.inspection |
+          contains("includes disabled")) and
+        (.source.repository_native_metadata_policy.prohibited |
+          index("filter.* helpers")) != null and
+        .source.repository_native_metadata_policy.default_info_exclude ==
+          "comment-only content allowed" and
         .source.native_index_policy.index ==
           "repository-native-linked-worktree-aware" and
+        (.source.native_index_policy.required_for_clean |
+          contains("exactly equal HEAD")) and
         (.source.native_index_policy.required_for_clean |
           contains("assume-unchanged and skip-worktree absent")) and
         .source.native_index_policy.prohibited_entry_flags ==
@@ -235,6 +244,20 @@ m3_test_assert_static_identity() {
           contains("NUL-delimited bytes")) and
         (.source.native_index_policy.mutation |
           contains("not refreshed or modified")) and
+        (.source.raw_worktree_policy.tracked_bytes |
+          contains("attributes, clean/smudge filters, and textconv are not used")) and
+        (.source.raw_worktree_policy.tracked_modes |
+          contains("symlink modes")) and
+        (.source.raw_worktree_policy.path_inventory |
+          contains("untracked or ignored")) and
+        (.source.raw_worktree_policy.path_inventory |
+          contains("Git excludes are not used")) and
+        (.source.raw_worktree_policy.generated_root_allowances["target/"] |
+          contains("fresh runner-owned external directory")) and
+        (.source.raw_worktree_policy.generated_root_allowances["build/"] |
+          contains("Cargo OUT_DIR")) and
+        (.source.raw_worktree_policy.generated_root_allowances["oracle/.venv/"] |
+          contains("does not invoke the oracle environment")) and
         .command.source_git.environment_launcher == "/usr/bin/env -i" and
         .command.source_git.executable == "/usr/bin/git" and
         .command.source_git.inherited_environment == "cleared" and
@@ -250,6 +273,7 @@ m3_test_assert_static_identity() {
         .command.source_git.environment.GIT_PAGER == "" and
         .command.source_git.environment.GIT_OPTIONAL_LOCKS == "0" and
         .command.source_git.environment.GIT_NO_LAZY_FETCH == "1" and
+        .command.source_git.environment.GIT_NO_REPLACE_OBJECTS == "1" and
         .command.source_git.repository_binding.working_directory ==
           "<physical-repository-root>" and
         .command.source_git.repository_binding.work_tree ==
@@ -266,9 +290,15 @@ m3_test_assert_static_identity() {
         (.command.source_git.command_line_config_overrides |
           index("core.hooksPath=/dev/null")) != null and
         (.command.source_git.command_line_config_overrides |
+          index("core.attributesFile=/dev/null")) != null and
+        (.command.source_git.command_line_config_overrides |
+          index("core.excludesFile=/dev/null")) != null and
+        (.command.source_git.command_line_config_overrides |
           index("diff.external=")) != null and
         (.command.source_git.local_repository_config |
-          contains("command-line safety overrides")) and
+          contains("helper-capable routing rejected")) and
+        (.command.developer_tools.xcrun.metal_resolution |
+          contains("MobileAsset/cryptex")) and
         .command.toolchain_query_environment.DEVELOPER_DIR ==
           .command.developer_tools.pin.canonical_value and
         .command.build_environment.DEVELOPER_DIR ==
@@ -299,8 +329,10 @@ m3_test_assert_static_identity() {
             $tools.metal_driver.invocation_path and
           $binding.metal_driver.canonical_path ==
             $tools.metal_driver.canonical_path and
-          ($binding.metal_driver.canonical_path |
-            startswith($binding.developer_dir.canonical_path + "/Toolchains/"))) and
+          $binding.metal_driver.sha256 == $tools.metal_driver.sha256 and
+          ($binding.metal_driver.sha256 | test("^[0-9a-f]{64}$")) and
+          ($binding.metal_driver.resolution |
+            contains("fixed xcrun under canonical DEVELOPER_DIR pin"))) and
         ([
           "bash", "dirname", "date", "mkdir", "mv", "tee", "shasum",
           "perl", "awk", "jq", "python3", "git", "sort", "head", "tail",
@@ -355,7 +387,7 @@ fi
     .status == "failed" and
     .failure_stage == "artifact_environment" and
     .exit_status == 64 and
-    .source.clean == false and
+    .source.clean == true and
     .fixture.expected_sha256 == "086ca72232de415973564b2c6028c98a7063f7d024b85411512071650c86cf3d" and
     .fixture.actual_sha256 == null and
     .artifact.expected_historical_manifest_sha256 == "9fa3c7f6c49305f621ed1f96edbb34c6402b6229701041db4e607df70e9b4144" and
@@ -756,7 +788,7 @@ if [[ -e "$m3_test_startup_marker" ]]; then
     exit 1
 fi
 if ! /usr/bin/grep -q \
-    'source preflight rejected prohibited or unreadable native Git index flags' \
+    'source preflight exact HEAD/index/raw-worktree attestation failed' \
     "$m3_test_index_evidence/preflight.log" || \
    ! /usr/bin/grep -q 'flags=assume-unchanged path_hex=' \
     "$m3_test_index_evidence/preflight.log" || \
@@ -780,7 +812,7 @@ fi
     .source.tree_sha == null and
     .source.clean == false and
     .fixture.actual_sha256 == null and
-    .artifact.identity_kind == "owner_payload_sha256sums" and
+    .artifact.identity_kind == null and
     .artifact.identity == null and
     .toolchain.rustc == null and
     .toolchain.cargo == null and
@@ -791,6 +823,266 @@ fi
 ' "$m3_test_index_evidence/manifest.json" >/dev/null
 m3_test_assert_static_identity "$m3_test_index_evidence"
 m3_test_assert_log_hashes "$m3_test_index_evidence"
+
+# Poison repository-native config, include routing, filter/fsmonitor helpers,
+# info attributes/excludes, and an ignored project Cargo config in a disposable
+# linked worktree. The runner must reject the native metadata before artifact,
+# build, or test work and must not execute either the Git helper or Cargo wrapper.
+m3_test_native_repo="$m3_test_scratch/native-metadata-repository"
+m3_test_native_worktree="$m3_test_scratch/native-metadata-linked-worktree"
+m3_test_native_evidence="$m3_test_scratch/native-metadata-evidence"
+m3_test_native_marker="$m3_test_scratch/native-metadata-helper-executed"
+/bin/mkdir -p "$m3_test_native_repo/scripts"
+m3_test_index_git "$m3_test_native_repo" init --quiet
+/bin/cp scripts/run-m3-stream-parity.sh \
+    "$m3_test_native_repo/scripts/run-m3-stream-parity.sh"
+/bin/chmod +x "$m3_test_native_repo/scripts/run-m3-stream-parity.sh"
+printf '%s\n' '/.cargo/config' >"$m3_test_native_repo/.gitignore"
+m3_test_index_git "$m3_test_native_repo" add -- \
+    scripts/run-m3-stream-parity.sh .gitignore
+m3_test_index_git "$m3_test_native_repo" \
+    -c user.name=m3-native-metadata-control \
+    -c user.email=m3-native-metadata-control.invalid \
+    commit --quiet -m 'test: seed native metadata control'
+m3_test_index_git "$m3_test_native_repo" worktree add --quiet \
+    -b native-metadata-control "$m3_test_native_worktree"
+
+m3_test_native_common="$m3_test_native_repo/.git"
+m3_test_native_helper="$m3_test_native_common/hostile-helper"
+m3_test_native_include="$m3_test_native_common/hostile-included-config"
+m3_test_native_external_excludes="$m3_test_native_common/hostile-excludes"
+printf '%s\n' \
+    '#!/bin/bash' \
+    "printf '%s\\n' 'hostile native helper executed' >>'$m3_test_native_marker'" \
+    "printf '%s\\n' 'canonical hostile filter output'" \
+    'exit 0' \
+    >"$m3_test_native_helper"
+/bin/chmod +x "$m3_test_native_helper"
+/bin/mkdir -p "$m3_test_native_worktree/.cargo"
+printf '%s\n' '[build]' "rustc-wrapper = \"$m3_test_native_helper\"" \
+    >"$m3_test_native_worktree/.cargo/config"
+
+# The tracked .gitignore hides this project-level Cargo config from ordinary
+# status. With otherwise benign repository metadata, physical inventory must
+# still report the byte path and reject before the wrapper can execute.
+m3_test_ignored_cargo_evidence="$m3_test_scratch/ignored-cargo-evidence"
+set +e
+PATH="$m3_test_fake_bin:$PATH" \
+    M3_TEST_FAKE_MARKER="$m3_test_fake_marker" \
+    HYPERION_12B_ARTIFACT="$m3_test_owner_artifact" \
+    "$m3_test_native_worktree/scripts/run-m3-stream-parity.sh" \
+    "$m3_test_ignored_cargo_evidence" \
+    >"$m3_test_scratch/ignored-cargo-invocation.log" 2>&1
+m3_test_ignored_cargo_status=$?
+set -e
+if (( m3_test_ignored_cargo_status != 1 )); then
+    echo "ignored-Cargo runner exit was $m3_test_ignored_cargo_status, expected 1" >&2
+    /usr/bin/sed -n '1,240p' \
+        "$m3_test_scratch/ignored-cargo-invocation.log" >&2
+    exit 1
+fi
+if [[ -e "$m3_test_native_marker" ]]; then
+    echo "ignored-Cargo source preflight executed the hostile wrapper" >&2
+    exit 1
+fi
+if ! /usr/bin/grep -q \
+    'source preflight exact HEAD/index/raw-worktree attestation failed' \
+    "$m3_test_ignored_cargo_evidence/preflight.log" || \
+   ! /usr/bin/grep -q \
+    'untracked or ignored physical source path path_hex=2e636172676f2f636f6e666967' \
+    "$m3_test_ignored_cargo_evidence/preflight.log"
+then
+    echo "ignored-Cargo control did not report the physical .cargo/config path" >&2
+    exit 1
+fi
+if [[ -s "$m3_test_ignored_cargo_evidence/identity.log" || \
+      -s "$m3_test_ignored_cargo_evidence/build.log" || \
+      -s "$m3_test_ignored_cargo_evidence/test.log" ]]; then
+    echo "ignored-Cargo control reached artifact identity, build, or test work" >&2
+    exit 1
+fi
+/usr/bin/jq -e '
+    .status == "failed" and
+    .failure_stage == "source_preflight" and
+    .source.sha == null and
+    .source.clean == false and
+    .artifact.identity_kind == null and
+    .execution.build_exit_status == null and
+    .execution.direct_test_exit_status == null
+' "$m3_test_ignored_cargo_evidence/manifest.json" >/dev/null
+m3_test_assert_static_identity "$m3_test_ignored_cargo_evidence"
+m3_test_assert_log_hashes "$m3_test_ignored_cargo_evidence"
+
+printf '%s\n' \
+    '[filter "included-hostile"]' \
+    "clean = $m3_test_native_helper" \
+    "smudge = $m3_test_native_helper" \
+    '[diff "included-hostile"]' \
+    "textconv = $m3_test_native_helper" \
+    >"$m3_test_native_include"
+printf '%s\n' '/.cargo/config' >"$m3_test_native_external_excludes"
+m3_test_index_git "$m3_test_native_worktree" config --local \
+    core.excludesFile "$m3_test_native_external_excludes"
+m3_test_index_git "$m3_test_native_worktree" config --local \
+    filter.direct-hostile.clean "$m3_test_native_helper"
+m3_test_index_git "$m3_test_native_worktree" config --local \
+    include.path "$m3_test_native_include"
+m3_test_index_git "$m3_test_native_worktree" config --local \
+    core.fsmonitor "$m3_test_native_helper"
+printf '%s\n' '* filter=included-hostile diff=included-hostile' \
+    >"$m3_test_native_common/info/attributes"
+printf '%s\n' '# hostile active native exclude follows' '/.cargo/config' \
+    >"$m3_test_native_common/info/exclude"
+
+# Exercise the poison once during setup, then remove the marker. The runner
+# itself must neither execute the helper nor reach Cargo.
+set +e
+m3_test_index_git "$m3_test_native_worktree" status \
+    --porcelain=v1 -z --untracked-files=all --ignore-submodules=none \
+    >"$m3_test_scratch/native-metadata-status.bin" 2>/dev/null
+set -e
+/bin/rm -f -- "$m3_test_native_marker"
+set +e
+PATH="$m3_test_fake_bin:$PATH" \
+    M3_TEST_FAKE_MARKER="$m3_test_fake_marker" \
+    HYPERION_12B_ARTIFACT="$m3_test_owner_artifact" \
+    "$m3_test_native_worktree/scripts/run-m3-stream-parity.sh" \
+    "$m3_test_native_evidence" \
+    >"$m3_test_scratch/native-metadata-invocation.log" 2>&1
+m3_test_native_status=$?
+set -e
+if (( m3_test_native_status != 1 )); then
+    echo "native-metadata runner exit was $m3_test_native_status, expected 1" >&2
+    /usr/bin/sed -n '1,240p' \
+        "$m3_test_scratch/native-metadata-invocation.log" >&2
+    exit 1
+fi
+m3_test_assert_fake_unused
+if [[ -e "$m3_test_native_marker" ]]; then
+    echo "native-metadata preflight executed a hostile Git/Cargo helper" >&2
+    exit 1
+fi
+if ! /usr/bin/grep -q \
+    'rejected dangerous or unreadable repository-native Git metadata' \
+    "$m3_test_native_evidence/preflight.log" || \
+   ! /usr/bin/grep -Eq \
+    'include\.path|filter\.direct-hostile\.clean|core\.excludesfile|core\.fsmonitor' \
+    "$m3_test_native_evidence/preflight.log"
+then
+    echo "native-metadata control did not report prohibited local config" >&2
+    exit 1
+fi
+if [[ -s "$m3_test_native_evidence/identity.log" || \
+      -s "$m3_test_native_evidence/build.log" || \
+      -s "$m3_test_native_evidence/test.log" ]]; then
+    echo "native-metadata control reached artifact identity, build, or test work" >&2
+    exit 1
+fi
+/usr/bin/jq -e '
+    .status == "failed" and
+    .failure_stage == "source_preflight" and
+    .exit_status == 1 and
+    .source.sha == null and
+    .source.tree_sha == null and
+    .source.clean == false and
+    .artifact.identity_kind == null and
+    .artifact.identity == null and
+    .execution.build_exit_status == null and
+    .execution.direct_test_exit_status == null
+' "$m3_test_native_evidence/manifest.json" >/dev/null
+m3_test_assert_static_identity "$m3_test_native_evidence"
+m3_test_assert_log_hashes "$m3_test_native_evidence"
+
+# Demonstrate the original tracked-byte bypass independently: Git status is
+# empty because a configured clean filter canonicalizes a poisoned raw file,
+# but the runner rejects the helper-capable native config before it can execute.
+m3_test_filter_repo="$m3_test_scratch/clean-filter-repository"
+m3_test_filter_worktree="$m3_test_scratch/clean-filter-linked-worktree"
+m3_test_filter_evidence="$m3_test_scratch/clean-filter-evidence"
+m3_test_filter_marker="$m3_test_scratch/clean-filter-helper-executed"
+m3_test_filter_helper="$m3_test_scratch/clean-filter-helper"
+/bin/mkdir -p "$m3_test_filter_repo/scripts"
+m3_test_index_git "$m3_test_filter_repo" init --quiet
+printf '%s\n' \
+    '#!/bin/bash' \
+    "printf '%s\\n' 'clean filter executed' >>'$m3_test_filter_marker'" \
+    "printf '%s\\n' 'canonical tracked bytes'" \
+    >"$m3_test_filter_helper"
+/bin/chmod +x "$m3_test_filter_helper"
+/bin/cp scripts/run-m3-stream-parity.sh \
+    "$m3_test_filter_repo/scripts/run-m3-stream-parity.sh"
+/bin/chmod +x "$m3_test_filter_repo/scripts/run-m3-stream-parity.sh"
+printf '%s\n' 'sentinel.txt filter=hostile-clean' \
+    >"$m3_test_filter_repo/.gitattributes"
+printf '%s\n' 'canonical tracked bytes' >"$m3_test_filter_repo/sentinel.txt"
+m3_test_index_git "$m3_test_filter_repo" config --local \
+    filter.hostile-clean.clean "$m3_test_filter_helper"
+m3_test_index_git "$m3_test_filter_repo" add -- \
+    scripts/run-m3-stream-parity.sh .gitattributes sentinel.txt
+m3_test_index_git "$m3_test_filter_repo" \
+    -c user.name=m3-clean-filter-control \
+    -c user.email=m3-clean-filter-control.invalid \
+    commit --quiet -m 'test: seed clean-filter control'
+m3_test_index_git "$m3_test_filter_repo" worktree add --quiet \
+    -b clean-filter-control "$m3_test_filter_worktree"
+printf '%s\n' 'poisoned tracked bytes!' \
+    >"$m3_test_filter_worktree/sentinel.txt"
+m3_test_filter_raw_sha=$(m3_test_sha256 \
+    "$m3_test_filter_worktree/sentinel.txt")
+m3_test_filter_head_sha=$(m3_test_index_git "$m3_test_filter_worktree" \
+    show HEAD:sentinel.txt | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')
+if [[ "$m3_test_filter_raw_sha" == "$m3_test_filter_head_sha" ]]; then
+    echo "clean-filter control did not change raw tracked bytes" >&2
+    exit 1
+fi
+m3_test_filter_status="$m3_test_scratch/clean-filter-status.bin"
+m3_test_index_git "$m3_test_filter_worktree" status \
+    --porcelain=v1 -z --untracked-files=all --ignore-submodules=none \
+    >"$m3_test_filter_status"
+if [[ -s "$m3_test_filter_status" ]]; then
+    echo "configured clean filter did not hide the raw tracked-byte change" >&2
+    exit 1
+fi
+/bin/rm -f -- "$m3_test_filter_marker"
+set +e
+PATH="$m3_test_fake_bin:$PATH" \
+    M3_TEST_FAKE_MARKER="$m3_test_fake_marker" \
+    HYPERION_12B_ARTIFACT="$m3_test_owner_artifact" \
+    "$m3_test_filter_worktree/scripts/run-m3-stream-parity.sh" \
+    "$m3_test_filter_evidence" \
+    >"$m3_test_scratch/clean-filter-invocation.log" 2>&1
+m3_test_filter_runner_status=$?
+set -e
+if (( m3_test_filter_runner_status != 1 )); then
+    echo "clean-filter runner exit was $m3_test_filter_runner_status, expected 1" >&2
+    /usr/bin/sed -n '1,240p' "$m3_test_scratch/clean-filter-invocation.log" >&2
+    exit 1
+fi
+if [[ -e "$m3_test_filter_marker" ]]; then
+    echo "source preflight executed the configured hostile clean filter" >&2
+    exit 1
+fi
+if ! /usr/bin/grep -q 'filter.hostile-clean.clean' \
+    "$m3_test_filter_evidence/preflight.log"; then
+    echo "clean-filter control did not report the prohibited local filter" >&2
+    exit 1
+fi
+if [[ -s "$m3_test_filter_evidence/identity.log" || \
+      -s "$m3_test_filter_evidence/build.log" || \
+      -s "$m3_test_filter_evidence/test.log" ]]; then
+    echo "clean-filter control reached artifact identity, build, or test work" >&2
+    exit 1
+fi
+/usr/bin/jq -e '
+    .status == "failed" and
+    .failure_stage == "source_preflight" and
+    .source.sha == null and
+    .source.clean == false and
+    .execution.build_exit_status == null and
+    .execution.direct_test_exit_status == null
+' "$m3_test_filter_evidence/manifest.json" >/dev/null
+m3_test_assert_static_identity "$m3_test_filter_evidence"
+m3_test_assert_log_hashes "$m3_test_filter_evidence"
 
 m3_test_hostile_perl_dir="$m3_test_scratch/hostile-perl"
 m3_test_hostile_perl_marker="$m3_test_scratch/hostile-perl-executed"
@@ -991,6 +1283,7 @@ printf '%s\n' '#!/bin/bash' 'exit 0' >"$m3_test_versioned_driver"
 /bin/chmod +x "$m3_test_versioned_driver"
 m3_test_versioned_developer_canonical=$(cd "$m3_test_versioned_developer" && pwd -P)
 m3_test_versioned_driver_canonical=$(cd "${m3_test_versioned_driver%/*}" && pwd -P)/metal
+m3_test_versioned_driver_sha=$(m3_test_sha256 "$m3_test_versioned_driver")
 m3_test_versioned_selection=$(/usr/bin/python3 -I -S \
     "$m3_test_xcode_binding_helper" \
     selection "$m3_test_versioned_developer")
@@ -1011,11 +1304,16 @@ m3_test_versioned_binding=$(/usr/bin/python3 -I -S \
 /usr/bin/jq -e \
     --arg invocation "$m3_test_versioned_developer" \
     --arg canonical "$m3_test_versioned_developer_canonical" \
-    --arg driver "$m3_test_versioned_driver_canonical" '
+    --arg driver_invocation "$m3_test_versioned_driver" \
+    --arg driver "$m3_test_versioned_driver_canonical" \
+    --arg driver_sha "$m3_test_versioned_driver_sha" '
     .developer_dir.invocation_path == $invocation and
     .developer_dir.canonical_path == $canonical and
     .environment_pin.DEVELOPER_DIR == $canonical and
-    .metal_driver.canonical_path == $driver
+    .metal_driver.invocation_path == $driver_invocation and
+    .metal_driver.canonical_path == $driver and
+    .metal_driver.sha256 == $driver_sha and
+    (.metal_driver.resolution | contains("fixed xcrun"))
 ' <<<"$m3_test_versioned_binding" >/dev/null
 
 /bin/ln -s Xcode_26.2.app "$m3_test_xcode_layout/Xcode.app"
@@ -1034,7 +1332,10 @@ m3_test_unversioned_binding=$(/usr/bin/python3 -I -S \
     .developer_dir.invocation_path == $invocation and
     .developer_dir.canonical_path == $canonical and
     .environment_pin.DEVELOPER_DIR == $canonical and
-    .metal_driver.canonical_path == $driver
+    .metal_driver.invocation_path ==
+      ($invocation + "/Toolchains/XcodeDefault.xctoolchain/usr/bin/metal") and
+    .metal_driver.canonical_path == $driver and
+    (.metal_driver.sha256 | test("^[0-9a-f]{64}$"))
 ' <<<"$m3_test_unversioned_binding" >/dev/null
 
 if /usr/bin/python3 -I -S "$m3_test_xcode_binding_helper" \
@@ -1054,24 +1355,97 @@ then
     exit 1
 fi
 
-m3_test_boundary_driver="$m3_test_versioned_developer/Toolchains.evil/XcodeDefault.xctoolchain/usr/bin/metal"
-/bin/mkdir -p "${m3_test_boundary_driver%/*}"
-printf '%s\n' '#!/bin/bash' 'exit 0' >"$m3_test_boundary_driver"
-/bin/chmod +x "$m3_test_boundary_driver"
-if /usr/bin/python3 -I -S "$m3_test_xcode_binding_helper" \
+# Hosted macOS images can install Metal as an Apple MobileAsset mounted by
+# cryptexd. The exact pinned-xcrun result is valid outside Xcode.app and is
+# bound by invocation path, canonical path, executable mode, and digest.
+m3_test_cryptex_driver="$m3_test_xcode_layout/private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v17.6.42.0.3a76QH/Metal.xctoolchain/usr/metal/current/bin/metal"
+/bin/mkdir -p "${m3_test_cryptex_driver%/*}"
+printf '%s\n' '#!/bin/bash' 'exit 0' >"$m3_test_cryptex_driver"
+/bin/chmod +x "$m3_test_cryptex_driver"
+m3_test_cryptex_driver_canonical=$(cd "${m3_test_cryptex_driver%/*}" && pwd -P)/metal
+m3_test_cryptex_driver_sha=$(m3_test_sha256 "$m3_test_cryptex_driver")
+m3_test_cryptex_binding=$(/usr/bin/python3 -I -S \
+    "$m3_test_xcode_binding_helper" \
     binding \
-    "$m3_test_versioned_developer" \
+    "$m3_test_unversioned_developer" \
     "$m3_test_versioned_developer_canonical" \
-    "$m3_test_boundary_driver" \
-    >"$m3_test_scratch/xcode-boundary.out" 2>&1
-then
-    echo "selected-Xcode binding accepted a Toolchains prefix-boundary escape" >&2
+    "$m3_test_cryptex_driver")
+/usr/bin/jq -e \
+    --arg invocation "$m3_test_cryptex_driver" \
+    --arg canonical "$m3_test_cryptex_driver_canonical" \
+    --arg sha256 "$m3_test_cryptex_driver_sha" '
+    .metal_driver.invocation_path == $invocation and
+    .metal_driver.canonical_path == $canonical and
+    .metal_driver.sha256 == $sha256 and
+    (.metal_driver.resolution | contains("canonical DEVELOPER_DIR pin"))
+' <<<"$m3_test_cryptex_binding" >/dev/null
+
+# A byte change at the same xcrun path must change the postflight binding and
+# therefore trip the runner's exact preflight/postflight JSON equality check.
+printf '%s\n' '#!/bin/bash' 'printf drifted' >"$m3_test_cryptex_driver"
+/bin/chmod +x "$m3_test_cryptex_driver"
+m3_test_cryptex_drift_binding=$(/usr/bin/python3 -I -S \
+    "$m3_test_xcode_binding_helper" \
+    binding \
+    "$m3_test_unversioned_developer" \
+    "$m3_test_versioned_developer_canonical" \
+    "$m3_test_cryptex_driver")
+if [[ "$m3_test_cryptex_drift_binding" == "$m3_test_cryptex_binding" ]] || \
+   [[ "$(/usr/bin/jq -r '.metal_driver.sha256' \
+        <<<"$m3_test_cryptex_drift_binding")" == "$m3_test_cryptex_driver_sha" ]]; then
+    echo "Metal binding did not expose postflight executable-byte drift" >&2
     exit 1
 fi
-if ! /usr/bin/grep -q 'escapes the selected Xcode toolchain' \
-    "$m3_test_scratch/xcode-boundary.out"
+
+m3_test_noncanonical_driver="${m3_test_cryptex_driver%/*}/../bin/metal"
+if /usr/bin/python3 -I -S "$m3_test_xcode_binding_helper" \
+    binding \
+    "$m3_test_unversioned_developer" \
+    "$m3_test_versioned_developer_canonical" \
+    "$m3_test_noncanonical_driver" \
+    >"$m3_test_scratch/xcode-noncanonical-driver.out" 2>&1
 then
-    echo "selected-Xcode boundary control did not report the escape" >&2
+    echo "selected-Xcode binding accepted a noncanonical xcrun Metal path" >&2
+    exit 1
+fi
+if ! /usr/bin/grep -q 'xcrun metal driver is not normalized and absolute' \
+    "$m3_test_scratch/xcode-noncanonical-driver.out"; then
+    echo "noncanonical xcrun Metal path was not reported" >&2
+    exit 1
+fi
+
+m3_test_missing_driver="$m3_test_xcode_layout/missing-metal"
+if /usr/bin/python3 -I -S "$m3_test_xcode_binding_helper" \
+    binding \
+    "$m3_test_unversioned_developer" \
+    "$m3_test_versioned_developer_canonical" \
+    "$m3_test_missing_driver" \
+    >"$m3_test_scratch/xcode-missing-driver.out" 2>&1
+then
+    echo "selected-Xcode binding accepted a missing xcrun Metal executable" >&2
+    exit 1
+fi
+if ! /usr/bin/grep -q 'xcrun metal driver is unavailable' \
+    "$m3_test_scratch/xcode-missing-driver.out"; then
+    echo "missing xcrun Metal executable was not reported" >&2
+    exit 1
+fi
+
+m3_test_nonexecutable_driver="$m3_test_xcode_layout/nonexecutable-metal"
+printf '%s\n' '#!/bin/bash' 'exit 0' >"$m3_test_nonexecutable_driver"
+if /usr/bin/python3 -I -S "$m3_test_xcode_binding_helper" \
+    binding \
+    "$m3_test_unversioned_developer" \
+    "$m3_test_versioned_developer_canonical" \
+    "$m3_test_nonexecutable_driver" \
+    >"$m3_test_scratch/xcode-nonexecutable-driver.out" 2>&1
+then
+    echo "selected-Xcode binding accepted a non-executable xcrun Metal file" >&2
+    exit 1
+fi
+if ! /usr/bin/grep -q 'xcrun metal driver is not executable' \
+    "$m3_test_scratch/xcode-nonexecutable-driver.out"; then
+    echo "non-executable xcrun Metal file was not reported" >&2
     exit 1
 fi
 
@@ -1080,23 +1454,6 @@ m3_test_substitute_driver="$m3_test_substitute_developer/Toolchains/XcodeDefault
 /bin/mkdir -p "${m3_test_substitute_driver%/*}"
 printf '%s\n' '#!/bin/bash' 'exit 0' >"$m3_test_substitute_driver"
 /bin/chmod +x "$m3_test_substitute_driver"
-if /usr/bin/python3 -I -S "$m3_test_xcode_binding_helper" \
-    binding \
-    "$m3_test_versioned_developer" \
-    "$m3_test_versioned_developer_canonical" \
-    "$m3_test_substitute_driver" \
-    >"$m3_test_scratch/xcode-substitution.out" 2>&1
-then
-    echo "selected-Xcode binding accepted a driver from another Xcode app" >&2
-    exit 1
-fi
-if ! /usr/bin/grep -q 'escapes the selected Xcode toolchain' \
-    "$m3_test_scratch/xcode-substitution.out"
-then
-    echo "selected-Xcode substitution control did not report the escape" >&2
-    exit 1
-fi
-
 m3_test_substitute_developer_canonical=$(cd "$m3_test_substitute_developer" && pwd -P)
 if /usr/bin/python3 -I -S "$m3_test_xcode_binding_helper" \
     binding \
