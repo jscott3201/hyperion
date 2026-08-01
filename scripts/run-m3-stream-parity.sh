@@ -202,6 +202,57 @@ m3_source_git() {
         "$@"
 }
 
+# Inspect the complete repository-native index without refreshing or mutating it.
+# `ls-files -v` lowercases every assume-unchanged entry tag and uses S for
+# skip-worktree; --stage gives every index stage an unambiguous tab-delimited
+# metadata prefix, while -z leaves the pathname as uninterpreted bytes.
+m3_source_index_has_no_hiding_flags() {
+    m3_source_git ls-files --cached --stage -v -z |
+        "$m3_env" -i \
+            HOME="$m3_login_home" \
+            PATH="$m3_source_git_path" \
+            TMPDIR="$m3_user_tmp" \
+            LANG=C LC_ALL=C \
+            "$m3_python" -I -S -c '
+import sys
+
+data = sys.stdin.buffer.read()
+if data and not data.endswith(b"\0"):
+    print("native Git index inspection returned a truncated NUL stream")
+    raise SystemExit(1)
+
+prohibited = []
+for record in data[:-1].split(b"\0") if data else ():
+    if len(record) < 4 or record[1:2] != b" ":
+        print("native Git index inspection returned a malformed record")
+        raise SystemExit(1)
+    separator = record.find(b"\t", 2)
+    if separator < 0 or separator == len(record) - 1:
+        print("native Git index inspection returned malformed stage metadata")
+        raise SystemExit(1)
+    tag = record[0:1]
+    if not (b"A" <= tag <= b"Z" or b"a" <= tag <= b"z" or tag == b"?"):
+        print("native Git index inspection returned an unknown entry tag")
+        raise SystemExit(1)
+    flags = []
+    if b"a" <= tag <= b"z":
+        flags.append("assume-unchanged")
+    if tag.upper() == b"S":
+        flags.append("skip-worktree")
+    if flags:
+        prohibited.append((flags, record[separator + 1 :]))
+
+if prohibited:
+    for flags, pathname in prohibited:
+        joined_flags = "+".join(flags)
+        print(
+            "prohibited native Git index entry: "
+            f"flags={joined_flags} path_hex={pathname.hex()}"
+        )
+    raise SystemExit(1)
+'
+}
+
 m3_metal_driver=$("$m3_env" -i \
     HOME="$m3_login_home" \
     PATH=/usr/bin:/bin:/usr/sbin:/sbin \
@@ -383,7 +434,14 @@ m3_write_manifest() {
             tree_sha: (if $source_tree_sha == "" then null else $source_tree_sha end),
             clean: $source_clean,
             repository_root_binding: "<physical-repository-root>",
-            git_dir_discovery: "repository-native .git directory or linked-worktree gitfile"
+            git_dir_discovery: "repository-native .git directory or linked-worktree gitfile",
+            native_index_policy: {
+              index: "repository-native-linked-worktree-aware",
+              required_for_clean: "assume-unchanged and skip-worktree absent at source preflight and postflight",
+              prohibited_entry_flags: ["assume-unchanged", "skip-worktree"],
+              inspection: "read-only git ls-files --cached --stage -v -z parsed as NUL-delimited bytes",
+              mutation: "none; index is not refreshed or modified"
+            }
           },
           fixture: {
             path: $fixture_path,
@@ -967,6 +1025,14 @@ case "$m3_evidence_root" in
         fi
         ;;
 esac
+if ! m3_index_flags_output=$(m3_source_index_has_no_hiding_flags 2>&1); then
+    m3_note "source preflight rejected prohibited or unreadable native Git index flags"
+    if [[ -n "$m3_index_flags_output" ]]; then
+        printf '%s\n' "$m3_index_flags_output" >>"$m3_preflight_log"
+    fi
+    exit 1
+fi
+m3_failure_stage=source_preflight
 if ! m3_git_status=$(m3_source_git status \
     --porcelain=v1 --untracked-files=all --ignore-submodules=none); then
     m3_note "git status failed closed"
@@ -1398,7 +1464,15 @@ if [[ "$m3_post_artifact_identity" != "$m3_artifact_identity" ]]; then
     exit 1
 fi
 
+m3_source_clean=false
 m3_failure_stage=source_postflight
+if ! m3_post_index_flags_output=$(m3_source_index_has_no_hiding_flags 2>&1); then
+    m3_note "source postflight rejected prohibited or unreadable native Git index flags"
+    if [[ -n "$m3_post_index_flags_output" ]]; then
+        printf '%s\n' "$m3_post_index_flags_output" >>"$m3_preflight_log"
+    fi
+    exit 1
+fi
 if ! m3_post_source_sha=$(m3_source_git rev-parse --verify 'HEAD^{commit}') || \
    ! m3_post_source_tree_sha=$(m3_source_git rev-parse --verify 'HEAD^{tree}'); then
     m3_note "postflight source commit or tree binding failed closed"
@@ -1424,6 +1498,7 @@ if [[ "$m3_post_fixture_sha256" != "$m3_expected_fixture_sha256" ]]; then
     m3_note "M2 golden fixture changed across the real-model test"
     exit 1
 fi
+m3_source_clean=true
 
 m3_final_status=passed
 m3_failure_stage=

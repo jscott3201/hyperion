@@ -204,6 +204,18 @@ m3_test_assert_static_identity() {
         .command.hashing.environment.LC_ALL == "C" and
         .source.repository_root_binding == "<physical-repository-root>" and
         (.source.git_dir_discovery | contains("linked-worktree gitfile")) and
+        .source.native_index_policy.index ==
+          "repository-native-linked-worktree-aware" and
+        (.source.native_index_policy.required_for_clean |
+          contains("assume-unchanged and skip-worktree absent")) and
+        .source.native_index_policy.prohibited_entry_flags ==
+          ["assume-unchanged", "skip-worktree"] and
+        (.source.native_index_policy.inspection |
+          contains("ls-files --cached --stage -v -z")) and
+        (.source.native_index_policy.inspection |
+          contains("NUL-delimited bytes")) and
+        (.source.native_index_policy.mutation |
+          contains("not refreshed or modified")) and
         .command.source_git.environment_launcher == "/usr/bin/env -i" and
         .command.source_git.executable == "/usr/bin/git" and
         .command.source_git.inherited_environment == "cleared" and
@@ -540,6 +552,195 @@ printf '%s\n' \
     'a62f4e85a47c0c136edaaa3a4f591fd6783717299a9def47e5ad03a49f6a5eb9  tokenizer_config.json' \
     >"$m3_test_owner_artifact/PAYLOAD_SHA256SUMS"
 
+# Build a disposable repository plus linked worktree containing an exact copy
+# of the runner. Two unusual tracked pathname byte sequences are changed only
+# after their native linked-worktree index entries receive the two source-hiding
+# flags. The ordinary status gate is therefore empty, but the exact runner must
+# reject both flags before artifact identity, fixture, build, or test work.
+m3_test_index_git() {
+    local m3_test_index_git_root=$1
+    shift
+    /usr/bin/env -i \
+        HOME="$HOME" \
+        PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+        TMPDIR="$TMPDIR" \
+        LANG=C LC_ALL=C \
+        GIT_CONFIG_NOSYSTEM=1 \
+        GIT_CONFIG_SYSTEM=/dev/null \
+        GIT_CONFIG_GLOBAL=/dev/null \
+        GIT_ATTR_NOSYSTEM=1 \
+        GIT_TERMINAL_PROMPT=0 \
+        GIT_PAGER= PAGER= \
+        GIT_OPTIONAL_LOCKS=0 \
+        GIT_NO_LAZY_FETCH=1 \
+        /usr/bin/git \
+        --no-optional-locks \
+        -C "$m3_test_index_git_root" \
+        -c core.fsmonitor=false \
+        -c core.untrackedCache=false \
+        -c core.ignoreStat=false \
+        -c core.trustctime=true \
+        -c core.checkStat=default \
+        -c core.fileMode=true \
+        -c core.symlinks=true \
+        -c core.hooksPath=/dev/null \
+        -c core.pager= \
+        -c pager.status=false \
+        -c diff.external= \
+        -c diff.trustExitCode=false \
+        "$@"
+}
+
+m3_test_index_repo="$m3_test_scratch/index-flags-repository"
+m3_test_index_worktree="$m3_test_scratch/index-flags-linked-worktree"
+m3_test_index_evidence="$m3_test_scratch/index-flags-evidence"
+m3_test_assume_name=$'sentinels/assume-unchanged\nsentinel.txt'
+m3_test_skip_name=$'sentinels/skip-worktree\tsentinel.txt'
+/bin/mkdir -p "$m3_test_index_repo/scripts" "$m3_test_index_repo/sentinels"
+m3_test_index_git "$m3_test_index_repo" init --quiet
+/bin/cp scripts/run-m3-stream-parity.sh \
+    "$m3_test_index_repo/scripts/run-m3-stream-parity.sh"
+/bin/chmod +x "$m3_test_index_repo/scripts/run-m3-stream-parity.sh"
+printf '%s\n' 'assume-unchanged committed bytes' \
+    >"$m3_test_index_repo/$m3_test_assume_name"
+printf '%s\n' 'skip-worktree committed bytes' \
+    >"$m3_test_index_repo/$m3_test_skip_name"
+m3_test_index_git "$m3_test_index_repo" add -- \
+    scripts/run-m3-stream-parity.sh \
+    "$m3_test_assume_name" \
+    "$m3_test_skip_name"
+m3_test_index_git "$m3_test_index_repo" \
+    -c user.name=m3-index-control \
+    -c user.email=m3-index-control.invalid \
+    commit --quiet -m 'test: seed hidden-index control'
+m3_test_index_git "$m3_test_index_repo" worktree add --quiet \
+    -b index-flags-control "$m3_test_index_worktree"
+
+if [[ "$(m3_test_sha256 scripts/run-m3-stream-parity.sh)" != \
+      "$(m3_test_sha256 "$m3_test_index_worktree/scripts/run-m3-stream-parity.sh")" ]]; then
+    echo "disposable linked worktree does not contain the exact runner copy" >&2
+    exit 1
+fi
+m3_test_assume_baseline_sha=$(m3_test_sha256 \
+    "$m3_test_index_worktree/$m3_test_assume_name")
+m3_test_skip_baseline_sha=$(m3_test_sha256 \
+    "$m3_test_index_worktree/$m3_test_skip_name")
+m3_test_index_git "$m3_test_index_worktree" update-index \
+    --assume-unchanged -- "$m3_test_assume_name"
+m3_test_index_git "$m3_test_index_worktree" update-index \
+    --skip-worktree -- "$m3_test_skip_name"
+printf '%s\n' 'assume-unchanged changed bytes compiled from disk' \
+    >"$m3_test_index_worktree/$m3_test_assume_name"
+printf '%s\n' 'skip-worktree changed bytes compiled from disk' \
+    >"$m3_test_index_worktree/$m3_test_skip_name"
+if [[ "$m3_test_assume_baseline_sha" == \
+      "$(m3_test_sha256 "$m3_test_index_worktree/$m3_test_assume_name")" || \
+      "$m3_test_skip_baseline_sha" == \
+      "$(m3_test_sha256 "$m3_test_index_worktree/$m3_test_skip_name")" ]]; then
+    echo "disposable index control did not change both tracked sentinels" >&2
+    exit 1
+fi
+
+m3_test_index_listing="$m3_test_scratch/index-flags-listing.bin"
+m3_test_index_git "$m3_test_index_worktree" \
+    ls-files --cached --stage -v -z >"$m3_test_index_listing"
+/usr/bin/python3 -I -S - \
+    "$m3_test_index_listing" "$m3_test_assume_name" "$m3_test_skip_name" <<'PY'
+import os
+import sys
+
+with open(sys.argv[1], "rb") as stream:
+    data = stream.read()
+if not data or not data.endswith(b"\0"):
+    raise SystemExit("disposable index listing is not a complete NUL stream")
+
+tags = {}
+for record in data[:-1].split(b"\0"):
+    separator = record.find(b"\t", 2)
+    if len(record) < 4 or record[1:2] != b" " or separator < 0:
+        raise SystemExit("disposable index listing contains a malformed record")
+    tags[record[separator + 1 :]] = record[0:1]
+
+assume_name = os.fsencode(sys.argv[2])
+skip_name = os.fsencode(sys.argv[3])
+if tags.get(assume_name) != b"h":
+    raise SystemExit("assume-unchanged sentinel is not present with tag h")
+if tags.get(skip_name) != b"S":
+    raise SystemExit("skip-worktree sentinel is not present with tag S")
+PY
+
+m3_test_index_status="$m3_test_scratch/index-flags-status.bin"
+m3_test_index_git "$m3_test_index_worktree" status \
+    --porcelain=v1 -z --untracked-files=all --ignore-submodules=none \
+    >"$m3_test_index_status"
+if [[ -s "$m3_test_index_status" ]]; then
+    echo "disposable status did not hide both changed flagged sentinels" >&2
+    exit 1
+fi
+
+m3_test_imported_function() {
+    printf '%s\n' 'imported caller function executed' >"$m3_test_startup_marker"
+}
+export -f m3_test_imported_function
+set +e
+PATH="$m3_test_fake_bin:$PATH" \
+    M3_TEST_FAKE_MARKER="$m3_test_fake_marker" \
+    HYPERION_12B_ARTIFACT="$m3_test_owner_artifact" \
+    BASH_ENV="$m3_test_startup_file" \
+    ENV="$m3_test_startup_file" \
+    "$m3_test_index_worktree/scripts/run-m3-stream-parity.sh" \
+    "$m3_test_index_evidence" \
+    >"$m3_test_scratch/index-flags-invocation.log" 2>&1
+m3_test_index_status_code=$?
+set -e
+unset -f m3_test_imported_function
+if (( m3_test_index_status_code != 1 )); then
+    echo "native-index flags runner exit was $m3_test_index_status_code, expected 1" >&2
+    /usr/bin/sed -n '1,240p' "$m3_test_scratch/index-flags-invocation.log" >&2
+    exit 1
+fi
+m3_test_assert_fake_unused
+if [[ -e "$m3_test_startup_marker" ]]; then
+    echo "native-index flags control processed inherited shell startup state" >&2
+    exit 1
+fi
+if ! /usr/bin/grep -q \
+    'source preflight rejected prohibited or unreadable native Git index flags' \
+    "$m3_test_index_evidence/preflight.log" || \
+   ! /usr/bin/grep -q 'flags=assume-unchanged path_hex=' \
+    "$m3_test_index_evidence/preflight.log" || \
+   ! /usr/bin/grep -q 'flags=skip-worktree path_hex=' \
+    "$m3_test_index_evidence/preflight.log"
+then
+    echo "native-index flags control did not report both prohibited flag classes" >&2
+    exit 1
+fi
+if [[ -s "$m3_test_index_evidence/identity.log" || \
+      -s "$m3_test_index_evidence/build.log" || \
+      -s "$m3_test_index_evidence/test.log" ]]; then
+    echo "native-index flags control reached artifact identity, build, or test work" >&2
+    exit 1
+fi
+/usr/bin/jq -e '
+    .status == "failed" and
+    .failure_stage == "source_preflight" and
+    .exit_status == 1 and
+    .source.sha == null and
+    .source.tree_sha == null and
+    .source.clean == false and
+    .fixture.actual_sha256 == null and
+    .artifact.identity_kind == "owner_payload_sha256sums" and
+    .artifact.identity == null and
+    .toolchain.rustc == null and
+    .toolchain.cargo == null and
+    .execution.build_exit_status == null and
+    .execution.direct_test_exit_status == null and
+    .execution.test_binary_path == null and
+    .execution.test_binary_sha256 == null
+' "$m3_test_index_evidence/manifest.json" >/dev/null
+m3_test_assert_static_identity "$m3_test_index_evidence"
+m3_test_assert_log_hashes "$m3_test_index_evidence"
+
 m3_test_hostile_perl_dir="$m3_test_scratch/hostile-perl"
 m3_test_hostile_perl_marker="$m3_test_scratch/hostile-perl-executed"
 /bin/mkdir -p "$m3_test_hostile_perl_dir"
@@ -871,4 +1072,4 @@ m3_test_cleanup_race=
 m3_test_cleanup_original=
 
 printf '%s\n' \
-    'm3-stream-parity-runner-regression-pass: privileged-shell/controlled-hashing/identity/environment/git-routing/artifact/discovery/cleanup controls passed model-free'
+    'm3-stream-parity-runner-regression-pass: privileged-shell/controlled-hashing/identity/environment/git-routing/index-flags/artifact/discovery/cleanup controls passed model-free'
