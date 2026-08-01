@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+m3_test_repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$m3_test_repo_root"
+
+m3_test_scratch=$(mktemp -d)
+m3_test_cleanup() {
+    rm -rf -- "$m3_test_scratch"
+}
+trap m3_test_cleanup EXIT
+
+m3_test_real_cargo=$(command -v cargo)
+m3_test_real_git=$(command -v git)
+m3_test_real_shasum=$(command -v shasum)
+m3_test_heavy_marker="$m3_test_scratch/heavy-command-started"
+mkdir -p "$m3_test_scratch/bin"
+# shellcheck disable=SC2016 # The generated shim expands these at execution time.
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -euo pipefail' \
+    'case "${1:-}" in' \
+    '    test|build|run)' \
+    '        : >"${M3_TEST_HEAVY_MARKER:?}"' \
+    '        exit 97' \
+    '        ;;' \
+    '    *) exec "${M3_TEST_REAL_CARGO:?}" "$@" ;;' \
+    'esac' \
+    >"$m3_test_scratch/bin/cargo"
+chmod +x "$m3_test_scratch/bin/cargo"
+
+m3_test_evidence="$m3_test_scratch/evidence"
+set +e
+env -u HYPERION_12B_ARTIFACT \
+    PATH="$m3_test_scratch/bin:$PATH" \
+    M3_TEST_HEAVY_MARKER="$m3_test_heavy_marker" \
+    M3_TEST_REAL_CARGO="$m3_test_real_cargo" \
+    scripts/run-m3-stream-parity.sh "$m3_test_evidence" \
+    >"$m3_test_scratch/invocation.log" 2>&1
+m3_test_status=$?
+set -e
+
+if (( m3_test_status != 64 )); then
+    echo "missing-artifact runner exit was $m3_test_status, expected 64" >&2
+    sed -n '1,200p' "$m3_test_scratch/invocation.log" >&2
+    exit 1
+fi
+if [[ -e "$m3_test_heavy_marker" ]]; then
+    echo "missing-artifact runner started a Cargo build/test/run" >&2
+    exit 1
+fi
+if [[ ! -f "$m3_test_evidence/preflight.log" || \
+      ! -f "$m3_test_evidence/identity.log" || \
+      ! -f "$m3_test_evidence/test.log" || \
+      ! -f "$m3_test_evidence/manifest.json" ]]; then
+    echo "missing-artifact runner did not leave all required evidence files" >&2
+    exit 1
+fi
+if ! grep -q \
+    'HYPERION_12B_ARTIFACT must be set explicitly to the pinned real artifact' \
+    "$m3_test_evidence/preflight.log"
+then
+    echo "missing-artifact preflight did not identify the explicit artifact requirement" >&2
+    exit 1
+fi
+if [[ -s "$m3_test_evidence/identity.log" || -s "$m3_test_evidence/test.log" ]]; then
+    echo "missing-artifact runner wrote identity/test output before rejecting the artifact" >&2
+    exit 1
+fi
+jq -e '
+    .schema == "hyperion.m3-stream-parity-evidence.v1" and
+    .status == "failed" and
+    .failure_stage == "artifact_environment" and
+    .exit_status == 64 and
+    .source.clean == false and
+    .fixture.expected_sha256 == "086ca72232de415973564b2c6028c98a7063f7d024b85411512071650c86cf3d" and
+    .fixture.actual_sha256 == null and
+    .artifact.expected_historical_manifest_sha256 == "9fa3c7f6c49305f621ed1f96edbb34c6402b6229701041db4e607df70e9b4144" and
+    .artifact.expected_owner_payload_manifest_sha256 == "3cee7e9c21051eb6e6857ef485b355b4a2e847901930d64620348cbc7f56c806" and
+    .artifact.identity_kind == null and
+    .artifact.manifest_sha256 == null and
+    .artifact.identity == null and
+    .command.argv == [
+      "cargo", "test", "--locked", "--offline",
+      "-p", "hyperion-server", "--test", "contract",
+      "real_http_sse_matches_m2_golden",
+      "--", "--ignored", "--exact", "--nocapture"
+    ]
+' "$m3_test_evidence/manifest.json" >/dev/null
+for m3_test_log_name in preflight identity test; do
+    m3_test_actual_log_sha=$(shasum -a 256 "$m3_test_evidence/$m3_test_log_name.log" | awk '{print $1}')
+    m3_test_manifest_log_sha=$(jq -r ".logs.$m3_test_log_name.sha256" "$m3_test_evidence/manifest.json")
+    if [[ "$m3_test_actual_log_sha" != "$m3_test_manifest_log_sha" ]]; then
+        echo "manifest hash for $m3_test_log_name.log is stale" >&2
+        exit 1
+    fi
+done
+
+m3_test_unknown_artifact="$m3_test_scratch/unknown-artifact"
+m3_test_unknown_evidence="$m3_test_scratch/unknown-evidence"
+mkdir -p "$m3_test_unknown_artifact"
+printf 'unapproved reconstructed payload\n' >"$m3_test_unknown_artifact/SHA256SUMS"
+m3_test_unknown_manifest_sha=$(shasum -a 256 "$m3_test_unknown_artifact/SHA256SUMS" | awk '{print $1}')
+set +e
+PATH="$m3_test_scratch/bin:$PATH" \
+    M3_TEST_HEAVY_MARKER="$m3_test_heavy_marker" \
+    M3_TEST_REAL_CARGO="$m3_test_real_cargo" \
+    HYPERION_12B_ARTIFACT="$m3_test_unknown_artifact" \
+    scripts/run-m3-stream-parity.sh "$m3_test_unknown_evidence" \
+    >"$m3_test_scratch/unknown-invocation.log" 2>&1
+m3_test_unknown_status=$?
+set -e
+if (( m3_test_unknown_status != 64 )); then
+    echo "unknown-manifest runner exit was $m3_test_unknown_status, expected 64" >&2
+    sed -n '1,200p' "$m3_test_scratch/unknown-invocation.log" >&2
+    exit 1
+fi
+if [[ -e "$m3_test_heavy_marker" ]]; then
+    echo "unknown-manifest runner started a Cargo build/test/run" >&2
+    exit 1
+fi
+if ! grep -q \
+    'artifact identity manifest digest is not an approved immutable payload' \
+    "$m3_test_unknown_evidence/preflight.log"
+then
+    echo "unknown-manifest preflight did not report the immutable allowlist failure" >&2
+    exit 1
+fi
+jq -e \
+    --arg actual "$m3_test_unknown_manifest_sha" \
+    '.status == "failed" and
+     .failure_stage == "artifact_environment" and
+     .exit_status == 64 and
+     .artifact.identity_kind == "historical_sha256sums" and
+     .artifact.manifest_sha256 == $actual and
+     .artifact.identity == null' \
+    "$m3_test_unknown_evidence/manifest.json" >/dev/null
+
+for m3_test_manifest_case in missing_manifest ambiguous_manifests; do
+    m3_test_case_artifact="$m3_test_scratch/$m3_test_manifest_case-artifact"
+    m3_test_case_evidence="$m3_test_scratch/$m3_test_manifest_case-evidence"
+    mkdir -p "$m3_test_case_artifact"
+    if [[ "$m3_test_manifest_case" == ambiguous_manifests ]]; then
+        : >"$m3_test_case_artifact/SHA256SUMS"
+        : >"$m3_test_case_artifact/PAYLOAD_SHA256SUMS"
+    fi
+    set +e
+    PATH="$m3_test_scratch/bin:$PATH" \
+        M3_TEST_HEAVY_MARKER="$m3_test_heavy_marker" \
+        M3_TEST_REAL_CARGO="$m3_test_real_cargo" \
+        HYPERION_12B_ARTIFACT="$m3_test_case_artifact" \
+        scripts/run-m3-stream-parity.sh "$m3_test_case_evidence" \
+        >"$m3_test_scratch/$m3_test_manifest_case-invocation.log" 2>&1
+    m3_test_case_status=$?
+    set -e
+    if (( m3_test_case_status != 64 )); then
+        echo "$m3_test_manifest_case runner exit was $m3_test_case_status, expected 64" >&2
+        exit 1
+    fi
+    if ! grep -q \
+        'artifact must contain exactly one recognized identity manifest' \
+        "$m3_test_case_evidence/preflight.log"
+    then
+        echo "$m3_test_manifest_case did not fail the manifest ambiguity gate" >&2
+        exit 1
+    fi
+done
+
+# Drive the approved owner-manifest branch with synthetic files while the
+# shasum shim accepts only the manifest digest and fails payload verification.
+# This proves a failed `shasum -c` cannot be overwritten by later JSON output.
+# shellcheck disable=SC2016 # Generated shim expands variables when invoked.
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -euo pipefail' \
+    'if [[ "${1:-}" == status ]]; then exit 0; fi' \
+    'exec "${M3_TEST_REAL_GIT:?}" "$@"' \
+    >"$m3_test_scratch/bin/git"
+# shellcheck disable=SC2016 # Generated shim expands variables when invoked.
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -euo pipefail' \
+    'if (( $# == 3 )) && [[ "$1" == -a && "$2" == 256 && "$3" == */PAYLOAD_SHA256SUMS ]]; then' \
+    '    printf "%s  %s\n" "3cee7e9c21051eb6e6857ef485b355b4a2e847901930d64620348cbc7f56c806" "$3"' \
+    '    exit 0' \
+    'fi' \
+    'if (( $# == 4 )) && [[ "$1" == -a && "$2" == 256 && "$3" == -c && "$4" == PAYLOAD_SHA256SUMS ]]; then' \
+    '    echo "generation_config.json: FAILED"' \
+    '    exit 1' \
+    'fi' \
+    'exec "${M3_TEST_REAL_SHASUM:?}" "$@"' \
+    >"$m3_test_scratch/bin/shasum"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "arm64\n"' >"$m3_test_scratch/bin/uname"
+# shellcheck disable=SC2016 # Generated shim expands variables when invoked.
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "${2:-}" in' \
+    '    hw.model) printf "TestMac\n" ;;' \
+    '    hw.memsize) printf "17179869184\n" ;;' \
+    '    *) exit 1 ;;' \
+    'esac' \
+    >"$m3_test_scratch/bin/sysctl"
+# shellcheck disable=SC2016 # Generated shim expands variables when invoked.
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "${1:-}" in' \
+    '    -productVersion) printf "26.2\n" ;;' \
+    '    -buildVersion) printf "test-build\n" ;;' \
+    '    *) exit 1 ;;' \
+    'esac' \
+    >"$m3_test_scratch/bin/sw_vers"
+chmod +x \
+    "$m3_test_scratch/bin/git" \
+    "$m3_test_scratch/bin/shasum" \
+    "$m3_test_scratch/bin/uname" \
+    "$m3_test_scratch/bin/sysctl" \
+    "$m3_test_scratch/bin/sw_vers"
+
+m3_test_owner_artifact="$m3_test_scratch/owner-artifact"
+m3_test_owner_evidence="$m3_test_scratch/owner-evidence"
+mkdir -p "$m3_test_owner_artifact"
+for m3_test_owner_file in \
+    chat_template.jinja \
+    config.json \
+    generation_config.json \
+    model-00001-of-00002.safetensors \
+    model-00002-of-00002.safetensors \
+    model.safetensors.index.json \
+    tokenizer.json \
+    tokenizer_config.json
+do
+    : >"$m3_test_owner_artifact/$m3_test_owner_file"
+    printf '%064d  %s\n' 0 "$m3_test_owner_file" >>"$m3_test_owner_artifact/PAYLOAD_SHA256SUMS"
+done
+printf 'allowed release metadata\n' >"$m3_test_owner_artifact/README.md"
+set +e
+PATH="$m3_test_scratch/bin:$PATH" \
+    M3_TEST_HEAVY_MARKER="$m3_test_heavy_marker" \
+    M3_TEST_REAL_CARGO="$m3_test_real_cargo" \
+    M3_TEST_REAL_GIT="$m3_test_real_git" \
+    M3_TEST_REAL_SHASUM="$m3_test_real_shasum" \
+    HYPERION_12B_ARTIFACT="$m3_test_owner_artifact" \
+    scripts/run-m3-stream-parity.sh "$m3_test_owner_evidence" \
+    >"$m3_test_scratch/owner-invocation.log" 2>&1
+m3_test_owner_status=$?
+set -e
+if (( m3_test_owner_status != 1 )); then
+    echo "owner checksum-failure exit was $m3_test_owner_status, expected 1" >&2
+    sed -n '1,240p' "$m3_test_scratch/owner-invocation.log" >&2
+    exit 1
+fi
+if [[ -e "$m3_test_heavy_marker" ]]; then
+    echo "owner checksum failure started the Cargo test" >&2
+    exit 1
+fi
+if ! grep -q 'generation_config.json: FAILED' "$m3_test_owner_evidence/identity.log"; then
+    echo "owner checksum failure was not retained in identity.log" >&2
+    exit 1
+fi
+jq -e '
+    .status == "failed" and
+    .failure_stage == "artifact_identity_preflight" and
+    .exit_status == 1 and
+    .artifact.identity_kind == "owner_payload_sha256sums" and
+    .artifact.manifest_sha256 == "3cee7e9c21051eb6e6857ef485b355b4a2e847901930d64620348cbc7f56c806" and
+    .artifact.identity == null
+' "$m3_test_owner_evidence/manifest.json" >/dev/null
+
+printf 'm3-stream-parity-runner-regression-pass: artifact fail-closed controls passed before Cargo\n'

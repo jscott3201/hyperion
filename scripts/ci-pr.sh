@@ -23,6 +23,7 @@ scripts/verify-m1-corpus.sh
 scripts/test-m1-corpus.sh
 scripts/test-oracle-startup.sh
 scripts/test-model-identity.sh
+scripts/test-m3-stream-parity-runner.sh
 scripts/test-m1-harness.sh
 scripts/test-m1-archive-layout.sh
 scripts/test-workflow-checkouts.sh
@@ -36,5 +37,6 @@ bash -n scripts/m1-preflight.sh scripts/run-m1-core.sh scripts/run-m1-budget-swe
     scripts/verify-oracle.sh scripts/verify-m0-models.sh scripts/verify-m1-e4b-models.sh \
     scripts/verify-m1-archive-layout.sh scripts/test-m1-archive-layout.sh \
     scripts/run-isolated-oracle.sh scripts/test-oracle-startup.sh \
-    scripts/test-workflow-checkouts.sh
+    scripts/test-workflow-checkouts.sh scripts/run-m3-stream-parity.sh \
+    scripts/test-m3-stream-parity-runner.sh
 scripts/test-native.sh --model-free
