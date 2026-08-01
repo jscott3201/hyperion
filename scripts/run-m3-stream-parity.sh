@@ -1,11 +1,11 @@
-#!/bin/bash
+#!/bin/bash -p
 # shellcheck disable=SC2016 # Literal awk/jq programs intentionally contain `$` fields.
-set -euo pipefail
-
-if [[ ${BASH:-} != /bin/bash ]]; then
-    printf '%s\n' 'M3 stream parity requires the fixed /bin/bash interpreter' >&2
+if [[ ${BASH:-} != /bin/bash || $- != *p* ]]; then
+    printf '%s\n' \
+        'M3 stream parity requires direct execution by fixed /bin/bash in privileged mode' >&2
     exit 127
 fi
+set -euo pipefail
 
 m3_dirname=/usr/bin/dirname
 m3_date=/bin/date
@@ -13,6 +13,7 @@ m3_mkdir=/bin/mkdir
 m3_mv=/bin/mv
 m3_tee=/usr/bin/tee
 m3_shasum=/usr/bin/shasum
+m3_perl=/usr/bin/perl
 m3_awk=/usr/bin/awk
 m3_jq=/usr/bin/jq
 m3_python=/usr/bin/python3
@@ -29,7 +30,7 @@ m3_getconf=/usr/bin/getconf
 
 for m3_bootstrap_tool in \
     "$m3_dirname" "$m3_date" "$m3_mkdir" "$m3_mv" "$m3_tee" \
-    "$m3_shasum" "$m3_awk" "$m3_jq" "$m3_python" "$m3_git" \
+    "$m3_shasum" "$m3_perl" "$m3_awk" "$m3_jq" "$m3_python" "$m3_git" \
     "$m3_sort" "$m3_head" "$m3_tail" "$m3_uname" "$m3_sysctl" \
     "$m3_sw_vers" "$m3_env" "$m3_mktemp" "$m3_getconf"
 do
@@ -40,6 +41,13 @@ do
         exit 127
     fi
 done
+
+IFS= read -r m3_shasum_shebang <"$m3_shasum" || m3_shasum_shebang=
+if [[ "$m3_shasum_shebang" != '#!/usr/bin/perl' ]]; then
+    printf '%s\n' \
+        'fixed /usr/bin/shasum does not declare the required /usr/bin/perl runtime' >&2
+    exit 127
+fi
 
 m3_repo_root=$(cd "$("$m3_dirname" "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd "$m3_repo_root"
@@ -139,7 +147,6 @@ m3_ar=/usr/bin/ar
 m3_ranlib=/usr/bin/ranlib
 m3_xcrun=/usr/bin/xcrun
 m3_make=/usr/bin/make
-m3_perl=/usr/bin/perl
 m3_sh=/bin/sh
 m3_cc=/usr/bin/cc
 m3_ld=/usr/bin/ld
@@ -147,6 +154,7 @@ m3_libtool=/usr/bin/libtool
 m3_install_name_tool=/usr/bin/install_name_tool
 m3_controlled_path="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:$m3_cargo_home/bin"
 m3_source_git_path=/usr/bin:/bin:/usr/sbin:/sbin
+m3_hash_path=/usr/bin:/bin:/usr/sbin:/sbin
 m3_user_tmp=$("$m3_getconf" DARWIN_USER_TEMP_DIR)
 m3_user_tmp=$("$m3_python" -I -S -c '
 import os
@@ -300,8 +308,17 @@ m3_note() {
     printf '%s\n' "$*" | "$m3_tee" -a "$m3_preflight_log"
 }
 
+m3_controlled_shasum() {
+    "$m3_env" -i \
+        HOME="$m3_login_home" \
+        PATH="$m3_hash_path" \
+        TMPDIR="$m3_user_tmp" \
+        LANG=C LC_ALL=C \
+        "$m3_shasum" "$@"
+}
+
 m3_log_sha256() {
-    "$m3_shasum" -a 256 "$1" | "$m3_awk" '{print $1}'
+    m3_controlled_shasum -a 256 "$1" | "$m3_awk" '{print $1}'
 }
 
 m3_write_manifest() {
@@ -344,6 +361,7 @@ m3_write_manifest() {
         --arg python3 "$m3_python_version" \
         --arg controlled_path "$m3_controlled_path" \
         --arg source_git_path "$m3_source_git_path" \
+        --arg hash_path "$m3_hash_path" \
         --arg user_tmp "$m3_user_tmp" \
         --argjson tools "$m3_tool_identities_json" \
         --arg preflight_sha "$m3_preflight_sha" \
@@ -394,6 +412,26 @@ m3_write_manifest() {
             ],
             environment: {
               HYPERION_12B_ARTIFACT: "<explicit-artifact-root>"
+            },
+            shell: {
+              interpreter: "/bin/bash",
+              invocation: "direct executable",
+              privileged_mode_required: true,
+              inherited_startup_state: "BASH_ENV, ENV, imported functions, SHELLOPTS, CDPATH, and GLOBIGNORE ignored by privileged mode before script code"
+            },
+            hashing: {
+              environment_launcher: "/usr/bin/env -i",
+              executable: "/usr/bin/shasum",
+              runtime: "/usr/bin/perl",
+              inherited_environment: "cleared",
+              working_directory: "preserved",
+              environment: {
+                HOME: "<canonical-login-home>",
+                PATH: $hash_path,
+                TMPDIR: $user_tmp,
+                LANG: "C",
+                LC_ALL: "C"
+              }
             },
             source_git: {
               environment_launcher: "/usr/bin/env -i",
@@ -890,7 +928,7 @@ m3_verify_selected_artifact() {
     local m3_public_checksum_status
     (
         cd "$m3_artifact_root"
-        "$m3_shasum" -a 256 -c PAYLOAD_SHA256SUMS
+        m3_controlled_shasum -a 256 -c PAYLOAD_SHA256SUMS
     )
     m3_public_checksum_status=$?
     if (( m3_public_checksum_status != 0 )); then

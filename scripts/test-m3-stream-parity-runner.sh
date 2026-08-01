@@ -1,5 +1,24 @@
-#!/bin/bash
+#!/bin/bash -p
+# shellcheck disable=SC2329 # Exported probe functions are inspected by child Bash processes.
+if [[ ${BASH:-} != /bin/bash || $- != *p* ]]; then
+    printf '%s\n' \
+        'M3 stream parity runner harness requires direct execution by fixed /bin/bash in privileged mode' >&2
+    exit 127
+fi
 set -euo pipefail
+
+if [[ ${M3_TEST_PRIVILEGED_SELF_PROBE:-} == 1 ]]; then
+    if [[ -e ${M3_TEST_STARTUP_MARKER:?} ]]; then
+        echo "privileged harness startup processed inherited BASH_ENV" >&2
+        exit 1
+    fi
+    if declare -F m3_test_imported_function >/dev/null; then
+        echo "privileged harness startup imported a caller function" >&2
+        exit 1
+    fi
+    printf '%s\n' 'm3-privileged-harness-self-probe-pass'
+    exit 0
+fi
 
 m3_test_repo_root=$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd "$m3_test_repo_root"
@@ -26,6 +45,50 @@ m3_test_cleanup() {
     /bin/rm -rf -- "$m3_test_scratch"
 }
 trap m3_test_cleanup EXIT
+
+m3_test_startup_marker="$m3_test_scratch/inherited-startup-executed"
+m3_test_startup_file="$m3_test_scratch/inherited-startup.sh"
+printf '%s\n' \
+    "printf '%s\\n' 'inherited shell startup executed' >'$m3_test_startup_marker'" \
+    >"$m3_test_startup_file"
+m3_test_imported_function() {
+    printf '%s\n' 'imported caller function executed' >"$m3_test_startup_marker"
+}
+export -f m3_test_imported_function
+M3_TEST_PRIVILEGED_SELF_PROBE=1 \
+    M3_TEST_STARTUP_MARKER="$m3_test_startup_marker" \
+    BASH_ENV="$m3_test_startup_file" \
+    scripts/test-m3-stream-parity-runner.sh \
+    >"$m3_test_scratch/privileged-harness-self-probe.log" 2>&1
+if [[ -e "$m3_test_startup_marker" ]]; then
+    echo "direct harness execution processed inherited shell startup state" >&2
+    exit 1
+fi
+if ! /usr/bin/grep -qx 'm3-privileged-harness-self-probe-pass' \
+    "$m3_test_scratch/privileged-harness-self-probe.log"
+then
+    echo "direct harness execution did not confirm privileged startup" >&2
+    exit 1
+fi
+
+set +e
+M3_TEST_PRIVILEGED_SELF_PROBE=1 \
+    M3_TEST_STARTUP_MARKER="$m3_test_startup_marker" \
+    BASH_ENV="$m3_test_startup_file" \
+    /bin/bash scripts/test-m3-stream-parity-runner.sh \
+    >"$m3_test_scratch/nonprivileged-harness.log" 2>&1
+m3_test_nonprivileged_harness_status=$?
+set -e
+unset -f m3_test_imported_function
+if (( m3_test_nonprivileged_harness_status != 127 )); then
+    echo "non-privileged explicit harness exit was $m3_test_nonprivileged_harness_status, expected 127" >&2
+    exit 1
+fi
+if [[ ! -e "$m3_test_startup_marker" ]]; then
+    echo "explicit /bin/bash harness control did not demonstrate inherited BASH_ENV timing" >&2
+    exit 1
+fi
+/bin/rm -f "$m3_test_startup_marker"
 
 # Remove inherited execution-shaping variables so each negative control selects
 # exactly one rejection path. The runner itself also rejects all of these names.
@@ -84,6 +147,19 @@ m3_test_assert_fake_unused() {
     fi
 }
 
+m3_test_sha256() {
+    /usr/bin/python3 -I -S -c '
+import hashlib
+import sys
+
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as stream:
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+print(digest.hexdigest())
+' "$1"
+}
+
 m3_test_assert_log_hashes() {
     local m3_test_assert_evidence=$1
     local m3_test_log_name
@@ -94,8 +170,8 @@ m3_test_assert_log_hashes() {
             echo "runner did not retain $m3_test_log_name.log" >&2
             return 1
         fi
-        m3_test_actual_log_sha=$(/usr/bin/shasum -a 256 \
-            "$m3_test_assert_evidence/$m3_test_log_name.log" | /usr/bin/awk '{print $1}')
+        m3_test_actual_log_sha=$(m3_test_sha256 \
+            "$m3_test_assert_evidence/$m3_test_log_name.log")
         m3_test_manifest_log_sha=$(/usr/bin/jq -r \
             ".logs.$m3_test_log_name.sha256" \
             "$m3_test_assert_evidence/manifest.json")
@@ -111,6 +187,21 @@ m3_test_assert_static_identity() {
     /usr/bin/jq -e '
         .trust_boundary.active_same_uid_mutation_excluded == true and
         (.trust_boundary.statement | contains("active same-UID mutation")) and
+        .command.shell.interpreter == "/bin/bash" and
+        .command.shell.invocation == "direct executable" and
+        .command.shell.privileged_mode_required == true and
+        (.command.shell.inherited_startup_state | contains("BASH_ENV")) and
+        (.command.shell.inherited_startup_state | contains("imported functions")) and
+        .command.hashing.environment_launcher == "/usr/bin/env -i" and
+        .command.hashing.executable == "/usr/bin/shasum" and
+        .command.hashing.runtime == "/usr/bin/perl" and
+        .command.hashing.inherited_environment == "cleared" and
+        .command.hashing.working_directory == "preserved" and
+        .command.hashing.environment.HOME == "<canonical-login-home>" and
+        .command.hashing.environment.PATH == "/usr/bin:/bin:/usr/sbin:/sbin" and
+        (.command.hashing.environment.TMPDIR | startswith("/private/var/folders/")) and
+        .command.hashing.environment.LANG == "C" and
+        .command.hashing.environment.LC_ALL == "C" and
         .source.repository_root_binding == "<physical-repository-root>" and
         (.source.git_dir_discovery | contains("linked-worktree gitfile")) and
         .command.source_git.environment_launcher == "/usr/bin/env -i" and
@@ -150,7 +241,9 @@ m3_test_assert_static_identity() {
     ' "$m3_test_assert_evidence/manifest.json" >/dev/null
     /usr/bin/jq -e '
         .execution_identity.tools as $tools |
-        [
+        ($tools.shasum.invocation_path == "/usr/bin/shasum") and
+        ($tools.perl.invocation_path == "/usr/bin/perl") and
+        ([
           "bash", "dirname", "date", "mkdir", "mv", "tee", "shasum",
           "perl", "awk", "jq", "python3", "git", "sort", "head", "tail",
           "uname", "sysctl", "sw_vers", "env", "mktemp", "getconf", "cargo", "rustc",
@@ -162,7 +255,7 @@ m3_test_assert_static_identity() {
           ($tools[$name].invocation_path | startswith("/")) and
           ($tools[$name].canonical_path | startswith("/")) and
           ($tools[$name].sha256 | test("^[0-9a-f]{64}$"))
-        )
+        ))
     ' "$m3_test_assert_evidence/manifest.json" >/dev/null
 }
 
@@ -232,12 +325,44 @@ fi
 m3_test_assert_static_identity "$m3_test_evidence"
 m3_test_assert_log_hashes "$m3_test_evidence"
 
+# Explicit /bin/bash invocation bypasses the required privileged shebang mode.
+# BASH_ENV executes before runner code in this unsupported form, but the runner
+# must then fail closed before it initializes an evidence receipt.
+m3_test_nonprivileged_runner_evidence="$m3_test_scratch/nonprivileged-runner-evidence"
+set +e
+BASH_ENV="$m3_test_startup_file" \
+    /bin/bash scripts/run-m3-stream-parity.sh \
+    "$m3_test_nonprivileged_runner_evidence" \
+    >"$m3_test_scratch/nonprivileged-runner.log" 2>&1
+m3_test_nonprivileged_runner_status=$?
+set -e
+if (( m3_test_nonprivileged_runner_status != 127 )); then
+    echo "non-privileged explicit runner exit was $m3_test_nonprivileged_runner_status, expected 127" >&2
+    exit 1
+fi
+if [[ ! -e "$m3_test_startup_marker" ]]; then
+    echo "explicit /bin/bash runner control did not demonstrate inherited BASH_ENV timing" >&2
+    exit 1
+fi
+if [[ -e "$m3_test_nonprivileged_runner_evidence/manifest.json" ]] && \
+    /usr/bin/jq -e '.status == "passed" and .exit_status == 0' \
+        "$m3_test_nonprivileged_runner_evidence/manifest.json" >/dev/null 2>&1
+then
+    echo "non-privileged explicit runner created a passing receipt" >&2
+    exit 1
+fi
+if [[ -e "$m3_test_nonprivileged_runner_evidence" ]]; then
+    echo "non-privileged explicit runner initialized evidence before failing closed" >&2
+    exit 1
+fi
+/bin/rm -f "$m3_test_startup_marker"
+
 m3_test_unknown_artifact="$m3_test_scratch/unknown-artifact"
 m3_test_unknown_evidence="$m3_test_scratch/unknown-evidence"
 /bin/mkdir -p "$m3_test_unknown_artifact"
 printf 'unapproved reconstructed payload\n' >"$m3_test_unknown_artifact/SHA256SUMS"
-m3_test_unknown_manifest_sha=$(/usr/bin/shasum -a 256 \
-    "$m3_test_unknown_artifact/SHA256SUMS" | /usr/bin/awk '{print $1}')
+m3_test_unknown_manifest_sha=$(m3_test_sha256 \
+    "$m3_test_unknown_artifact/SHA256SUMS")
 set +e
 PATH="$m3_test_fake_bin:$PATH" \
     M3_TEST_FAKE_MARKER="$m3_test_fake_marker" \
@@ -415,6 +540,17 @@ printf '%s\n' \
     'a62f4e85a47c0c136edaaa3a4f591fd6783717299a9def47e5ad03a49f6a5eb9  tokenizer_config.json' \
     >"$m3_test_owner_artifact/PAYLOAD_SHA256SUMS"
 
+m3_test_hostile_perl_dir="$m3_test_scratch/hostile-perl"
+m3_test_hostile_perl_marker="$m3_test_scratch/hostile-perl-executed"
+/bin/mkdir -p "$m3_test_hostile_perl_dir"
+printf '%s\n' \
+    'package M3Hostile;' \
+    'use strict;' \
+    'use warnings;' \
+    "BEGIN { open my \$marker, '>', '$m3_test_hostile_perl_marker' or die \$!; print {\$marker} \"hostile Perl startup executed\\n\"; close \$marker or die \$!; }" \
+    '1;' \
+    >"$m3_test_hostile_perl_dir/M3Hostile.pm"
+
 # Hostile inherited Git routing, object, index, config, pager, prompt, and
 # helper state must not divert the physical source preflight. The invocation
 # must bind the real HEAD/tree, report a clean source, and reach the later
@@ -462,10 +598,22 @@ m3_test_expected_source_tree_sha=$(/usr/bin/env -i \
     LANG=C LC_ALL=C \
     /usr/bin/git --no-optional-locks -C "$m3_test_repo_root" \
     --work-tree="$m3_test_repo_root" rev-parse --verify 'HEAD^{tree}')
+m3_test_imported_function() {
+    printf '%s\n' 'imported caller function executed' >"$m3_test_startup_marker"
+}
+export -f m3_test_imported_function
 set +e
 PATH="$m3_test_fake_bin:$PATH" \
     M3_TEST_FAKE_MARKER="$m3_test_fake_marker" \
     HYPERION_12B_ARTIFACT="$m3_test_owner_artifact" \
+    BASH_ENV="$m3_test_startup_file" \
+    ENV="$m3_test_startup_file" \
+    PERL5OPT=-MM3Hostile \
+    PERL5LIB="$m3_test_hostile_perl_dir" \
+    PERLLIB="$m3_test_hostile_perl_dir" \
+    PERL_LOCAL_LIB_ROOT="$m3_test_hostile_perl_dir" \
+    PERL_MB_OPT="--install_base $m3_test_hostile_perl_dir" \
+    PERL_MM_OPT="INSTALL_BASE=$m3_test_hostile_perl_dir" \
     GIT_DIR="$m3_test_hostile_git_dir" \
     GIT_COMMON_DIR="$m3_test_hostile_git_dir" \
     GIT_WORK_TREE="$m3_test_hostile_git_work_tree" \
@@ -492,12 +640,21 @@ PATH="$m3_test_fake_bin:$PATH" \
     >"$m3_test_scratch/hostile-git-invocation.log" 2>&1
 m3_test_hostile_git_status=$?
 set -e
+unset -f m3_test_imported_function
 if (( m3_test_hostile_git_status != 1 )); then
     echo "hostile-Git runner exit was $m3_test_hostile_git_status, expected 1" >&2
     /usr/bin/sed -n '1,240p' "$m3_test_scratch/hostile-git-invocation.log" >&2
     exit 1
 fi
 m3_test_assert_fake_unused
+if [[ -e "$m3_test_startup_marker" ]]; then
+    echo "direct runner execution processed inherited shell startup state" >&2
+    exit 1
+fi
+if [[ -e "$m3_test_hostile_perl_marker" ]]; then
+    echo "controlled shasum processed hostile inherited Perl startup state" >&2
+    exit 1
+fi
 if [[ -e "$m3_test_hostile_git_marker" ]]; then
     echo "source preflight invoked a hostile inherited Git helper" >&2
     exit 1
@@ -714,4 +871,4 @@ m3_test_cleanup_race=
 m3_test_cleanup_original=
 
 printf '%s\n' \
-    'm3-stream-parity-runner-regression-pass: identity/environment/git-routing/artifact/discovery/cleanup controls passed model-free'
+    'm3-stream-parity-runner-regression-pass: privileged-shell/controlled-hashing/identity/environment/git-routing/artifact/discovery/cleanup controls passed model-free'
