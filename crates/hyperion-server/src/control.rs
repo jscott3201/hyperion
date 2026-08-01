@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::Serialize;
 
+use crate::tool_call::ToolCallStats;
+
 /// The shared ops state: readiness + counters + shutdown flag. Cloned cheaply
 /// (all `Arc`) into each handler. The request handlers bump the counters; the
 /// `/control/*` handlers read them.
@@ -31,6 +33,12 @@ struct Inner {
     governor_rejections: AtomicU64,
     near_tie_events: AtomicU64,
     single_flight_rejections: AtomicU64,
+    tool_calls_parsed: AtomicU64,
+    tool_calls_wellformed: AtomicU64,
+    tool_calls_repaired: AtomicU64,
+    tool_calls_deduped: AtomicU64,
+    tool_call_candidate_overflows: AtomicU64,
+    tool_call_limit_exceeded: AtomicU64,
     shutdown: AtomicBool,
 }
 
@@ -50,6 +58,12 @@ impl ControlState {
                 governor_rejections: AtomicU64::new(0),
                 near_tie_events: AtomicU64::new(0),
                 single_flight_rejections: AtomicU64::new(0),
+                tool_calls_parsed: AtomicU64::new(0),
+                tool_calls_wellformed: AtomicU64::new(0),
+                tool_calls_repaired: AtomicU64::new(0),
+                tool_calls_deduped: AtomicU64::new(0),
+                tool_call_candidate_overflows: AtomicU64::new(0),
+                tool_call_limit_exceeded: AtomicU64::new(0),
                 shutdown: AtomicBool::new(false),
             }),
         }
@@ -107,6 +121,23 @@ impl ControlState {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Aggregate one completed request parser snapshot exactly once. Every
+    /// counter saturates independently so lifetime telemetry cannot wrap.
+    pub fn add_tool_call_stats(&self, stats: ToolCallStats) {
+        saturating_atomic_add(&self.inner.tool_calls_parsed, stats.parsed);
+        saturating_atomic_add(&self.inner.tool_calls_wellformed, stats.wellformed);
+        saturating_atomic_add(&self.inner.tool_calls_repaired, stats.repaired);
+        saturating_atomic_add(&self.inner.tool_calls_deduped, stats.deduped);
+        saturating_atomic_add(
+            &self.inner.tool_call_candidate_overflows,
+            stats.candidate_overflows,
+        );
+        saturating_atomic_add(
+            &self.inner.tool_call_limit_exceeded,
+            stats.call_limit_exceeded,
+        );
+    }
+
     /// Request a graceful shutdown. Returns true if this call set the flag
     /// (the first shutdown request); false if one was already in flight.
     pub fn request_shutdown(&self) -> bool {
@@ -140,6 +171,12 @@ pub struct Stats {
     pub governor_rejections: u64,
     pub near_tie_events: u64,
     pub single_flight_rejections: u64,
+    pub tool_calls_parsed: u64,
+    pub tool_calls_wellformed: u64,
+    pub tool_calls_repaired: u64,
+    pub tool_calls_deduped: u64,
+    pub tool_call_candidate_overflows: u64,
+    pub tool_call_limit_exceeded: u64,
 }
 
 impl ControlState {
@@ -167,6 +204,15 @@ impl ControlState {
             governor_rejections: self.inner.governor_rejections.load(Ordering::Relaxed),
             near_tie_events: self.inner.near_tie_events.load(Ordering::Relaxed),
             single_flight_rejections: self.inner.single_flight_rejections.load(Ordering::Relaxed),
+            tool_calls_parsed: self.inner.tool_calls_parsed.load(Ordering::Relaxed),
+            tool_calls_wellformed: self.inner.tool_calls_wellformed.load(Ordering::Relaxed),
+            tool_calls_repaired: self.inner.tool_calls_repaired.load(Ordering::Relaxed),
+            tool_calls_deduped: self.inner.tool_calls_deduped.load(Ordering::Relaxed),
+            tool_call_candidate_overflows: self
+                .inner
+                .tool_call_candidate_overflows
+                .load(Ordering::Relaxed),
+            tool_call_limit_exceeded: self.inner.tool_call_limit_exceeded.load(Ordering::Relaxed),
         }
     }
 
@@ -181,6 +227,12 @@ impl ControlState {
             ReloadVerdict::NotImplemented
         }
     }
+}
+
+fn saturating_atomic_add(counter: &AtomicU64, amount: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(amount))
+    });
 }
 
 /// The `/control/reload` result.
@@ -225,12 +277,26 @@ mod tests {
         s.inc_governor_rejections();
         s.inc_near_tie();
         s.inc_single_flight_rejections();
+        s.add_tool_call_stats(ToolCallStats {
+            parsed: 3,
+            wellformed: 2,
+            repaired: 1,
+            deduped: 1,
+            candidate_overflows: 4,
+            call_limit_exceeded: 5,
+        });
         let stats = s.stats();
         assert_eq!(stats.requests_total, 2);
         assert_eq!(stats.tokens_total, 42);
         assert_eq!(stats.governor_rejections, 1);
         assert_eq!(stats.near_tie_events, 1);
         assert_eq!(stats.single_flight_rejections, 1);
+        assert_eq!(stats.tool_calls_parsed, 3);
+        assert_eq!(stats.tool_calls_wellformed, 2);
+        assert_eq!(stats.tool_calls_repaired, 1);
+        assert_eq!(stats.tool_calls_deduped, 1);
+        assert_eq!(stats.tool_call_candidate_overflows, 4);
+        assert_eq!(stats.tool_call_limit_exceeded, 5);
         assert!(!stats.requests_in_flight);
     }
 
@@ -240,6 +306,17 @@ mod tests {
         s.set_in_flight(true);
         assert_eq!(s.reload_verdict(), ReloadVerdict::Conflict);
         assert_eq!(s.reload_verdict().status(), 409);
+    }
+
+    #[test]
+    fn parser_stats_saturate_without_wrapping() {
+        let s = ControlState::new("m");
+        s.inner.tool_calls_parsed.store(u64::MAX, Ordering::Relaxed);
+        s.add_tool_call_stats(ToolCallStats {
+            parsed: 1,
+            ..ToolCallStats::default()
+        });
+        assert_eq!(s.stats().tool_calls_parsed, u64::MAX);
     }
 
     #[test]

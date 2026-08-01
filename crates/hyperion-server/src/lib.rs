@@ -29,6 +29,7 @@ pub mod dialect;
 pub mod engine;
 pub mod history;
 pub mod prepare;
+pub(crate) mod response_adapter;
 pub mod server;
 pub mod sse;
 pub mod tool_call;

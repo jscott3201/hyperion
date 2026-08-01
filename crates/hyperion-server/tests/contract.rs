@@ -55,6 +55,56 @@ const MINIMAL_TOKENIZER_JSON: &str = r#"{
   }
 }"#;
 
+/// A model-free BPE tokenizer whose Fuse decoder concatenates native tool
+/// controls and call material exactly as Gemma 4 emits them. Opener, closer,
+/// and native quote markers must survive selective response decoding;
+/// channel/EOS are marked special so the live adapter can prove they remain
+/// hidden.
+const TOOL_TOKENIZER_JSON: &str = r#"{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {"id": 0, "content": "<eos>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 1, "content": "<bos>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 5, "content": "<|tool_call>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 6, "content": "<tool_call|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 8, "content": "<|\"|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 9, "content": "<|channel>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {"type": "Fuse"},
+  "model": {
+    "type": "BPE",
+    "dropout": null,
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": null,
+    "end_of_word_suffix": null,
+    "fuse_unk": false,
+    "byte_fallback": false,
+    "ignore_merges": false,
+    "vocab": {
+      "<eos>": 0,
+      "<bos>": 1,
+      "hello": 2,
+      "world": 3,
+      "[UNK]": 4,
+      "<|tool_call>": 5,
+      "<tool_call|>": 6,
+      "call:lookup{query:": 7,
+      "<|\"|>": 8,
+      "<|channel>": 9,
+      "hi": 10,
+      "bye": 11,
+      "}": 12,
+      "call:lookup{query:7}": 13
+    },
+    "merges": []
+  }
+}"#;
+
 /// A model-free BPE/ByteFallback tokenizer whose generated `<0xE5>` token is
 /// unresolved by incremental `push` and becomes one replacement scalar only
 /// when the response decoder is finished at EOF.
@@ -305,6 +355,56 @@ fn streamed_text(body: &str, dialect: &str) -> String {
             _ => None,
         })
         .collect()
+}
+
+fn anthropic_stream_content(body: &str) -> serde_json::Value {
+    let events = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap());
+    let mut blocks = Vec::<serde_json::Value>::new();
+    let mut partial_inputs = Vec::<String>::new();
+
+    for event in events {
+        let Some(index) = event["index"].as_u64().map(|index| index as usize) else {
+            continue;
+        };
+        while blocks.len() <= index {
+            blocks.push(serde_json::Value::Null);
+            partial_inputs.push(String::new());
+        }
+        match event["type"].as_str() {
+            Some("content_block_start") => {
+                blocks[index] = event["content_block"].clone();
+            }
+            Some("content_block_delta") if event["delta"]["type"] == "text_delta" => {
+                let fragment = event["delta"]["text"].as_str().unwrap();
+                let block = blocks[index].as_object_mut().unwrap();
+                let mut text = block
+                    .get("text")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                text.push_str(fragment);
+                block.insert("text".to_owned(), serde_json::Value::String(text));
+            }
+            Some("content_block_delta") if event["delta"]["type"] == "input_json_delta" => {
+                partial_inputs[index].push_str(event["delta"]["partial_json"].as_str().unwrap());
+            }
+            _ => {}
+        }
+    }
+
+    for (index, partial) in partial_inputs.into_iter().enumerate() {
+        if !partial.is_empty() {
+            blocks[index]
+                .as_object_mut()
+                .unwrap()
+                .insert("input".to_owned(), serde_json::from_str(&partial).unwrap());
+        }
+    }
+    assert!(blocks.iter().all(|block| !block.is_null()));
+    serde_json::Value::Array(blocks)
 }
 
 #[tokio::test]
@@ -607,7 +707,7 @@ async fn explicit_none_with_resolved_history_reaches_engine_for_both_dialects() 
 }
 
 #[tokio::test]
-async fn omitted_or_auto_tool_choice_rejects_before_engine_for_both_dialects() {
+async fn omitted_or_auto_tool_choice_reaches_engine_for_both_dialects() {
     let control = fresh_control();
     let openai_calls = Arc::new(AtomicUsize::new(0));
     let openai_server = test_server_with_engine(
@@ -618,7 +718,7 @@ async fn omitted_or_auto_tool_choice_rejects_before_engine_for_both_dialects() {
         None,
         4096,
         &control,
-        MINIMAL_TOKENIZER_JSON,
+        TOOL_TOKENIZER_JSON,
     );
     let openai_body = serde_json::json!({
         "messages": [{"role": "user", "content": "hi"}],
@@ -633,10 +733,8 @@ async fn omitted_or_auto_tool_choice_rejects_before_engine_for_both_dialects() {
         &openai_body,
     )
     .await;
-    let envelope: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(envelope["error"]["type"], "invalid_request_error");
-    assert_eq!(openai_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(status, StatusCode::OK, "OpenAI auto response: {body}");
+    assert_eq!(openai_calls.load(Ordering::SeqCst), 1);
 
     let anthropic_calls = Arc::new(AtomicUsize::new(0));
     let anthropic_server = test_server_with_engine(
@@ -647,7 +745,7 @@ async fn omitted_or_auto_tool_choice_rejects_before_engine_for_both_dialects() {
         None,
         4096,
         &control,
-        MINIMAL_TOKENIZER_JSON,
+        TOOL_TOKENIZER_JSON,
     );
     let anthropic_body = serde_json::json!({
         "messages": [{"role": "user", "content": "hi"}],
@@ -664,11 +762,425 @@ async fn omitted_or_auto_tool_choice_rejects_before_engine_for_both_dialects() {
         &anthropic_body,
     )
     .await;
-    let envelope: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(status, StatusCode::OK, "Anthropic auto response: {body}");
+    assert_eq!(anthropic_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn auto_without_native_quote_fails_before_engine() {
+    let control = fresh_control();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tokenizer_without_quote = TOOL_TOKENIZER_JSON
+        .replace(
+            "    {\"id\": 8, \"content\": \"<|\\\"|>\", \"single_word\": false, \"lstrip\": false, \"rstrip\": false, \"normalized\": false, \"special\": true},\n",
+            "",
+        )
+        .replace("      \"<|\\\"|>\": 8,\n", "");
+    let server = test_server_with_engine(
+        Arc::new(CountingEngine {
+            calls: calls.clone(),
+            tokens: vec![2],
+        }),
+        None,
+        4096,
+        &control,
+        &tokenizer_without_quote,
+    );
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [openai_tool()],
+        "tool_choice": "auto"
+    })
+    .to_string();
+    let (status, response) = send(
+        server.router(),
+        Method::POST,
+        "/v1/chat/completions",
+        &[("content-type", "application/json")],
+        &body,
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(envelope["type"], "error");
+    let envelope: serde_json::Value = serde_json::from_str(&response).unwrap();
     assert_eq!(envelope["error"]["type"], "invalid_request_error");
-    assert_eq!(anthropic_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn non_streaming_native_tool_shapes_are_provider_compatible() {
+    let openai_control = fresh_control();
+    let openai = test_server_with_tokenizer(
+        StubEngine {
+            tokens: vec![9, 5, 7, 8, 10, 8, 12, 6],
+            block_after: None,
+        },
+        None,
+        4096,
+        &openai_control,
+        TOOL_TOKENIZER_JSON,
+    );
+    let openai_body = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [openai_tool()],
+        "tool_choice": "auto"
+    })
+    .to_string();
+    let (status, body) = send(
+        openai.router(),
+        Method::POST,
+        "/v1/chat/completions",
+        &[("content-type", "application/json")],
+        &openai_body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "OpenAI response: {body}");
+    let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let choice = &response["choices"][0];
+    assert_eq!(choice["finish_reason"], "tool_calls");
+    assert!(choice["message"]["content"].is_null());
+    let call = &choice["message"]["tool_calls"][0];
+    let id = call["id"].as_str().unwrap().to_owned();
+    assert!(id.starts_with("call_") && id.ends_with("_1"));
+    assert!(
+        call.get("index").is_none(),
+        "non-streaming tool calls remain valid history without an index"
+    );
+    assert_eq!(call["type"], "function");
+    assert_eq!(call["function"]["name"], "lookup");
+    let arguments: serde_json::Value =
+        serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(arguments, serde_json::json!({"query": "hi"}));
+    assert!(!body.contains("<|channel>"));
+
+    let replay_body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "hi"},
+            choice["message"].clone(),
+            {"role": "tool", "tool_call_id": id, "content": "ok"},
+        ],
+        "tools": [openai_tool()],
+        "tool_choice": "none"
+    })
+    .to_string();
+    let (status, replay) = send(
+        openai.router(),
+        Method::POST,
+        "/v1/chat/completions",
+        &[("content-type", "application/json")],
+        &replay_body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "OpenAI response replay: {replay}");
+
+    let anthropic_control = fresh_control();
+    let anthropic = test_server_with_tokenizer(
+        StubEngine {
+            tokens: vec![2, 5, 7, 8, 10, 8, 12, 6, 3],
+            block_after: None,
+        },
+        None,
+        4096,
+        &anthropic_control,
+        TOOL_TOKENIZER_JSON,
+    );
+    let anthropic_body = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 8,
+        "tools": [anthropic_tool()],
+        "tool_choice": {"type": "auto"}
+    })
+    .to_string();
+    let (status, body) = send(
+        anthropic.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        &anthropic_body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "Anthropic response: {body}");
+    let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(response["stop_reason"], "tool_use");
+    assert_eq!(response["content"].as_array().unwrap().len(), 3);
+    assert_eq!(response["content"][0]["text"], "hello");
+    let call = &response["content"][1];
+    assert_eq!(call["type"], "tool_use");
+    let id = call["id"].as_str().unwrap().to_owned();
+    assert!(id.starts_with("toolu_") && id.ends_with("_1"));
+    assert_eq!(call["name"], "lookup");
+    assert_eq!(call["input"], serde_json::json!({"query": "hi"}));
+    assert_eq!(response["content"][2]["text"], "world");
+
+    let replay_body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": response["content"].clone()},
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": id, "content": "ok"}],
+            },
+        ],
+        "max_tokens": 8,
+        "tools": [anthropic_tool()],
+        "tool_choice": {"type": "none"}
+    })
+    .to_string();
+    let (status, replay) = send(
+        anthropic.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        &replay_body,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "Anthropic response replay: {replay}"
+    );
+}
+
+#[tokio::test]
+async fn streaming_native_tool_shapes_preserve_mixed_order_and_indices() {
+    let openai_control = fresh_control();
+    let openai = test_server_with_tokenizer(
+        StubEngine {
+            tokens: vec![2, 5, 7, 8, 10, 8, 12, 6, 3, 5, 7, 8, 11, 8, 12, 6],
+            block_after: None,
+        },
+        None,
+        4096,
+        &openai_control,
+        TOOL_TOKENIZER_JSON,
+    );
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": true,
+        "tools": [openai_tool()]
+    })
+    .to_string();
+    let (status, openai_sse) = send(
+        openai.router(),
+        Method::POST,
+        "/v1/chat/completions",
+        &[("content-type", "application/json")],
+        &body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "OpenAI SSE: {openai_sse}");
+    let chunks: Vec<serde_json::Value> = openai_sse
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    let tool_deltas: Vec<&serde_json::Value> = chunks
+        .iter()
+        .filter(|chunk| chunk["choices"][0]["delta"]["tool_calls"].is_array())
+        .collect();
+    assert_eq!(tool_deltas.len(), 2);
+    let response_prefix = tool_deltas[0]["choices"][0]["delta"]["tool_calls"][0]["id"]
+        .as_str()
+        .unwrap()
+        .strip_suffix("_1")
+        .unwrap()
+        .to_owned();
+    for (index, chunk) in tool_deltas.iter().enumerate() {
+        let call = &chunk["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(call["index"].as_u64(), Some(index as u64));
+        assert_eq!(call["id"], format!("{response_prefix}_{}", index + 1));
+        assert_eq!(call["function"]["name"], "lookup");
+        serde_json::from_str::<serde_json::Value>(call["function"]["arguments"].as_str().unwrap())
+            .unwrap();
+    }
+    assert!(
+        chunks.iter().any(|chunk| {
+            chunk["choices"][0]["finish_reason"] == serde_json::json!("tool_calls")
+        })
+    );
+    assert_eq!(streamed_text(&openai_sse, "openai"), "helloworld");
+
+    let anthropic_control = fresh_control();
+    let anthropic = test_server_with_tokenizer(
+        StubEngine {
+            tokens: vec![2, 5, 7, 8, 10, 8, 12, 6, 3, 5, 7, 8, 11, 8, 12, 6],
+            block_after: None,
+        },
+        None,
+        4096,
+        &anthropic_control,
+        TOOL_TOKENIZER_JSON,
+    );
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 16,
+        "stream": true,
+        "tools": [anthropic_tool()]
+    })
+    .to_string();
+    let (status, anthropic_sse) = send(
+        anthropic.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        &body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "Anthropic SSE: {anthropic_sse}");
+    let events: Vec<serde_json::Value> = anthropic_sse
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    let starts: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["type"] == "content_block_start")
+        .collect();
+    assert_eq!(starts.len(), 4);
+    for (index, event) in starts.iter().enumerate() {
+        assert_eq!(event["index"].as_u64(), Some(index as u64));
+    }
+    let response_prefix = starts[1]["content_block"]["id"]
+        .as_str()
+        .unwrap()
+        .strip_suffix("_1")
+        .unwrap();
+    assert!(response_prefix.starts_with("toolu_"));
+    assert_eq!(
+        starts[3]["content_block"]["id"],
+        format!("{response_prefix}_2")
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["delta"]["type"] == "input_json_delta")
+            .count(),
+        2
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "content_block_stop")
+            .count(),
+        4
+    );
+    assert!(events.iter().any(|event| {
+        event["type"] == "message_delta" && event["delta"]["stop_reason"] == "tool_use"
+    }));
+    assert_eq!(streamed_text(&anthropic_sse, "anthropic"), "helloworld");
+
+    let content = anthropic_stream_content(&anthropic_sse);
+    let results = content
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|block| block["type"] == "tool_use")
+        .map(|block| {
+            serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": block["id"].clone(),
+                "content": "ok",
+            })
+        })
+        .collect::<Vec<_>>();
+    let replay_body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": content},
+            {"role": "user", "content": results},
+        ],
+        "max_tokens": 16,
+        "tools": [anthropic_tool()],
+        "tool_choice": {"type": "none"}
+    })
+    .to_string();
+    let (status, replay) = send(
+        anthropic.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        &replay_body,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "streamed Anthropic response replay: {replay}"
+    );
+}
+
+#[tokio::test]
+async fn invalid_calls_round_trip_and_duplicate_stats_aggregate_once() {
+    let invalid_control = fresh_control();
+    let invalid = test_server_with_tokenizer(
+        StubEngine {
+            tokens: vec![5, 13, 6],
+            block_after: None,
+        },
+        None,
+        4096,
+        &invalid_control,
+        TOOL_TOKENIZER_JSON,
+    );
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [openai_tool()]
+    })
+    .to_string();
+    let (status, response) = send(
+        invalid.router(),
+        Method::POST,
+        "/v1/chat/completions",
+        &[("content-type", "application/json")],
+        &body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "invalid call response: {response}");
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(response["choices"][0]["finish_reason"], "stop");
+    assert_eq!(
+        response["choices"][0]["message"]["content"],
+        "<|tool_call>call:lookup{query:7}<tool_call|>"
+    );
+    assert!(response["choices"][0]["message"]["tool_calls"].is_null());
+
+    let duplicate_control = fresh_control();
+    let duplicate = test_server_with_tokenizer(
+        StubEngine {
+            tokens: vec![5, 7, 8, 10, 8, 12, 6, 5, 7, 8, 10, 8, 12, 6],
+            block_after: None,
+        },
+        None,
+        4096,
+        &duplicate_control,
+        TOOL_TOKENIZER_JSON,
+    );
+    let (status, response) = send(
+        duplicate.router(),
+        Method::POST,
+        "/v1/chat/completions",
+        &[("content-type", "application/json")],
+        &body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "duplicate response: {response}");
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(
+        response["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let (status, stats) = send(duplicate.router(), Method::GET, "/control/stats", &[], "").await;
+    assert_eq!(status, StatusCode::OK);
+    let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+    assert_eq!(stats["tool_calls_parsed"], 2);
+    assert_eq!(stats["tool_calls_wellformed"], 2);
+    assert_eq!(stats["tool_calls_repaired"], 0);
+    assert_eq!(stats["tool_calls_deduped"], 1);
+    assert_eq!(stats["tool_call_candidate_overflows"], 0);
+    assert_eq!(stats["tool_call_limit_exceeded"], 0);
 }
 
 #[tokio::test]

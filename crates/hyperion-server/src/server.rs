@@ -33,6 +33,7 @@ use crate::engine::{CancelToken, EngineDriver, EngineError, EngineRequest, StepE
 use crate::prepare::{
     ContextWindow, PrepareError, count_anthropic_tokens, prepare_anthropic, prepare_openai,
 };
+use crate::response_adapter::{ResponseEvent, ToolResponseAdapter};
 use crate::sse::{Framer, StopReason};
 
 /// The shared server state, cheaply cloned (all `Arc`) into each handler.
@@ -88,6 +89,37 @@ struct Guard {
 impl Drop for Guard {
     fn drop(&mut self) {
         self.cancel.cancel();
+    }
+}
+
+/// Ensures every request parser snapshot reaches `/control/stats` exactly
+/// once, including decoder errors, engine errors, and dropped SSE bodies.
+struct MeteredAdapter {
+    adapter: ToolResponseAdapter,
+    control: ControlState,
+}
+
+impl MeteredAdapter {
+    fn new(adapter: ToolResponseAdapter, control: ControlState) -> Self {
+        Self { adapter, control }
+    }
+
+    fn push(&mut self, fragment: &str) -> Vec<ResponseEvent> {
+        self.adapter.push(fragment)
+    }
+
+    fn finish(&mut self) -> Vec<ResponseEvent> {
+        self.adapter.finish()
+    }
+
+    fn has_calls(&self) -> bool {
+        self.adapter.has_calls()
+    }
+}
+
+impl Drop for MeteredAdapter {
+    fn drop(&mut self) {
+        self.control.add_tool_call_stats(self.adapter.stats());
     }
 }
 
@@ -412,10 +444,25 @@ async fn handle_shutdown(State(srv): State<Server>, headers: HeaderMap) -> Respo
 /// The core run: single-flight → engine stream → frame (SSE or JSON). Shared
 /// by both dialects' generation endpoints.
 async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response {
-    let dialect = prepared.dialect;
-    let request = prepared.engine_request;
-    let stream = prepared.stream;
-    let prompt_tokens = prepared.prompt_tokens_len;
+    let crate::prepare::PreparedPrompt {
+        engine_request: request,
+        stream,
+        dialect,
+        prompt_tokens_len: prompt_tokens,
+        tool_registry,
+        preserved_special_ids,
+    } = prepared;
+    let decoder = if preserved_special_ids.is_empty() {
+        Ok(srv.tokenizer.streaming_decoder(SpecialTokenPolicy::Skip))
+    } else {
+        srv.tokenizer
+            .streaming_decoder_preserving_special_ids(&preserved_special_ids)
+    };
+    let decoder = match decoder {
+        Ok(decoder) => decoder,
+        Err(error) => return tokenizer_error_response(&error, dialect),
+    };
+    let adapter = ToolResponseAdapter::new(tool_registry, dialect);
 
     // Acquire single-flight and share its lease between the response guard and
     // blocking engine closure. A disconnect cancels immediately, but permit /
@@ -455,9 +502,10 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
         // `Framer` method returns a complete `event: ...\ndata: ...\n\n` (or
         // `data: ...\n\n`) chunk; we yield the bytes verbatim.
         let mut framer = Framer::new(dialect, &srv.model_id, prompt_tokens);
-        let tokenizer = srv.tokenizer.clone();
         let control = srv.control.clone();
         let request_for_stream = request.clone();
+        let mut decoder = decoder;
+        let mut adapter = MeteredAdapter::new(adapter, control.clone());
         // The guard moves into the stream so it lives as long as the stream
         // does. Dropping the stream cancels generation; its shared lease keeps
         // single-flight held until the blocking engine closure exits.
@@ -469,15 +517,21 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
             // empty for OpenAI). `start` is a complete SSE chunk.
             yield Ok::<Bytes, Infallible>(Bytes::from(framer.start()));
             let mut usage = Usage { prompt_tokens, completion_tokens: 0 };
-            let mut decoder = tokenizer.streaming_decoder(SpecialTokenPolicy::Skip);
             let mut decoder_error = None;
             while let Some(event) = rx.recv().await {
                 match event {
                     StepEvent::Token(t) => {
                         match decoder.push(t.id) {
-                            Ok(Some(fragment)) if !fragment.is_empty() => {
-                                let frame = framer.text(&fragment);
-                                yield Ok(Bytes::from(frame));
+                            Ok(Some(fragment)) => {
+                                for event in adapter.push(&fragment) {
+                                    let frame = match event {
+                                        ResponseEvent::Text(text) => framer.text(&text),
+                                        ResponseEvent::Call(call) => framer.tool_call(&call),
+                                    };
+                                    if !frame.is_empty() {
+                                        yield Ok(Bytes::from(frame));
+                                    }
+                                }
                             }
                             Ok(_) => {}
                             Err(error) => {
@@ -509,9 +563,16 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
                 match result {
                     Ok(_) => match decoder.finish() {
                         Ok(fragment) => {
-                            if !fragment.is_empty() {
-                                let frame = framer.text(&fragment);
-                                yield Ok(Bytes::from(frame));
+                            let mut events = adapter.push(&fragment);
+                            events.extend(adapter.finish());
+                            for event in events {
+                                let frame = match event {
+                                    ResponseEvent::Text(text) => framer.text(&text),
+                                    ResponseEvent::Call(call) => framer.tool_call(&call),
+                                };
+                                if !frame.is_empty() {
+                                    yield Ok(Bytes::from(frame));
+                                }
                             }
                             let stop = stop_reason(&usage, &request_for_stream, false);
                             let frame = framer.done(usage, stop);
@@ -557,16 +618,17 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
         resp
     } else {
         // Non-streaming: collect all tokens, then build a single JSON response.
-        let mut text = String::new();
+        let mut events = Vec::new();
         let mut usage = Usage::default();
-        let mut decoder = srv.tokenizer.streaming_decoder(SpecialTokenPolicy::Skip);
+        let mut decoder = decoder;
+        let mut adapter = MeteredAdapter::new(adapter, srv.control.clone());
         let mut decoder_error = None;
         let mut rx = rx;
         let _guard = guard;
         while let Some(event) = rx.recv().await {
             match event {
                 StepEvent::Token(t) => match decoder.push(t.id) {
-                    Ok(Some(fragment)) => text.push_str(&fragment),
+                    Ok(Some(fragment)) => events.extend(adapter.push(&fragment)),
                     Ok(None) => {}
                     Err(error) => {
                         cancel.cancel();
@@ -594,9 +656,17 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
             (_, Some(error)) => tokenizer_error_response(&error, dialect),
             (Ok(_), None) => match decoder.finish() {
                 Ok(fragment) => {
-                    text.push_str(&fragment);
+                    events.extend(adapter.push(&fragment));
+                    events.extend(adapter.finish());
                     let stop = stop_reason(&usage, &request, false);
-                    non_streaming_json(dialect, &srv.model_id, &text, usage, stop)
+                    non_streaming_json(
+                        dialect,
+                        &srv.model_id,
+                        &events,
+                        usage,
+                        stop,
+                        adapter.has_calls(),
+                    )
                 }
                 Err(error) => {
                     cancel.cancel();
@@ -612,34 +682,82 @@ async fn run(srv: Server, prepared: crate::prepare::PreparedPrompt) -> Response 
 fn non_streaming_json(
     dialect: Dialect,
     model: &str,
-    text: &str,
+    events: &[ResponseEvent],
     usage: Usage,
     stop: StopReason,
+    has_calls: bool,
 ) -> Response {
     match dialect {
         Dialect::Anthropic => {
+            let mut content = Vec::new();
+            let mut text = String::new();
+            for event in events {
+                match event {
+                    ResponseEvent::Text(fragment) => text.push_str(fragment),
+                    ResponseEvent::Call(call) => {
+                        if !text.is_empty() {
+                            content.push(serde_json::json!({"type": "text", "text": text}));
+                            text = String::new();
+                        }
+                        content.push(serde_json::json!({
+                            "type": "tool_use",
+                            "id": call.id,
+                            "name": call.name,
+                            "input": call.arguments
+                        }));
+                    }
+                }
+            }
+            if !text.is_empty() || content.is_empty() {
+                content.push(serde_json::json!({"type": "text", "text": text}));
+            }
             let body = serde_json::json!({
                 "id": "msg_1",
                 "type": "message",
                 "role": "assistant",
                 "model": model,
-                "content": [{"type": "text", "text": text}],
-                "stop_reason": stop.anthropic(),
+                "content": content,
+                "stop_reason": if has_calls { "tool_use" } else { stop.anthropic() },
                 "stop_sequence": null,
                 "usage": {"input_tokens": usage.prompt_tokens, "output_tokens": usage.completion_tokens}
             });
             (StatusCode::OK, Json(body)).into_response()
         }
         Dialect::OpenAi => {
+            let mut text = String::new();
+            let mut tool_calls = Vec::new();
+            for event in events {
+                match event {
+                    ResponseEvent::Text(fragment) => text.push_str(fragment),
+                    ResponseEvent::Call(call) => tool_calls.push(serde_json::json!({
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": serde_json::to_string(&call.arguments)
+                                .expect("serde_json::Value serialization cannot fail")
+                        }
+                    })),
+                }
+            }
+            let content = if text.is_empty() && has_calls {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(text)
+            };
+            let mut message = serde_json::json!({"role": "assistant", "content": content});
+            if !tool_calls.is_empty() {
+                message["tool_calls"] = serde_json::Value::Array(tool_calls);
+            }
             let body = serde_json::json!({
                 "id": "chatcmpl-1",
                 "object": "chat.completion",
                 "model": model,
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": stop.openai()}],
+                "choices": [{"index": 0, "message": message, "finish_reason": if has_calls { "tool_calls" } else { stop.openai() }}],
                 "usage": {
                     "prompt_tokens": usage.prompt_tokens,
                     "completion_tokens": usage.completion_tokens,
-                    "total_tokens": usage.prompt_tokens + usage.completion_tokens
+                    "total_tokens": usage.prompt_tokens.saturating_add(usage.completion_tokens)
                 }
             });
             (StatusCode::OK, Json(body)).into_response()

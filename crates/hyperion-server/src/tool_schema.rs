@@ -109,6 +109,7 @@ enum Schema {
 }
 
 /// An immutable set of renderer-safe declarations and private validators.
+#[derive(Debug)]
 pub struct ToolRegistry {
     mode: ToolMode,
     render_tools: Vec<Value>,

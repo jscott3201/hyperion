@@ -5,22 +5,21 @@
 //! dialect. The response decoder may briefly withhold an incomplete byte
 //! fallback sequence until it can emit valid text.
 //!
-//! - **Anthropic**: the event sequence `message_start` →
-//!   `content_block_start` → `content_block_delta` (text_delta per step) →
-//!   `content_block_stop` → `message_delta` (stop_reason + usage) →
-//!   `message_stop`. Framing: `event: <type>\ndata: <json>\n\n`.
-//! - **OpenAI**: chunked `data: {…}\n\n` with `choices[0].delta.content` per
-//!   step, terminating `data: [DONE]\n\n`.
+//! - **Anthropic**: `message_start`, then ordered text or `tool_use` content
+//!   block lifecycles, followed by `message_delta` and `message_stop`.
+//! - **OpenAI**: chunked text or indexed `delta.tool_calls`, then the terminal
+//!   usage chunk and `data: [DONE]\n\n`.
 //! - **529 mid-stream**: once headers are flushed (200 OK sent), a governor
 //!   rejection becomes an SSE `error` event, NOT an HTTP status change.
 //!
 //! The framers track just enough state (the content-block index and response
 //! metadata) to emit well-formed sequences. The handler owns the
-//! [`Framer`] and calls [`Framer::text`] for each safe decoded fragment + [`Framer::done`] (or
-//! [`Framer::error`]) at the end.
+//! [`Framer`] and calls [`Framer::text`] or [`Framer::tool_call`] for each
+//! validated event, then [`Framer::done`] (or [`Framer::error`]) at the end.
 
 use crate::dialect::Dialect;
 use crate::engine::Usage;
+use crate::response_adapter::AcceptedToolCall;
 
 /// A stop reason for the terminal Anthropic `message_delta` / OpenAI `finish`
 /// field.
@@ -68,6 +67,14 @@ pub struct Framer {
     prompt_tokens: u32,
     /// A model id echoed in the frames (e.g. "gemma4-12b").
     model: String,
+    /// Whether an Anthropic text block is currently open.
+    anthropic_text_open: bool,
+    /// Next monotonic Anthropic content-block index.
+    next_content_index: usize,
+    /// Next contiguous OpenAI tool-call index.
+    next_tool_index: usize,
+    /// Accepted call presence owns the successful terminal reason.
+    has_tool_calls: bool,
 }
 
 impl Framer {
@@ -80,12 +87,16 @@ impl Framer {
             started: false,
             prompt_tokens,
             model: model.to_string(),
+            anthropic_text_open: false,
+            next_content_index: 0,
+            next_tool_index: 0,
+            has_tool_calls: false,
         }
     }
 
-    /// Emit the opening frames for the dialect (the `message_start` +
-    /// `content_block_start` for Anthropic; nothing for OpenAI — its first
-    /// chunk carries the role). Returns the SSE bytes to flush.
+    /// Emit the opening frame for the dialect (`message_start` for Anthropic;
+    /// nothing for OpenAI). Content blocks begin lazily so a call-only turn
+    /// does not gain a synthetic empty text block.
     #[must_use]
     pub fn start(&mut self) -> String {
         debug_assert!(!self.started, "start called twice");
@@ -104,14 +115,7 @@ impl Framer {
                         "usage": {"input_tokens": self.prompt_tokens, "output_tokens": 0}
                     }
                 });
-                let block_start = serde_json::json!({
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "text", "text": ""}
-                });
-                format!(
-                    "event: message_start\ndata: {message_start}\n\nevent: content_block_start\ndata: {block_start}\n\n"
-                )
+                format!("event: message_start\ndata: {message_start}\n\n")
             }
             Dialect::OpenAi => String::new(), // OpenAI emits no start frame; the first chunk carries the role.
         }
@@ -124,12 +128,32 @@ impl Framer {
     pub fn text(&mut self, text: &str) -> String {
         match self.dialect {
             Dialect::Anthropic => {
+                let index = self.next_content_index.saturating_sub(1);
                 let delta = serde_json::json!({
                     "type": "content_block_delta",
-                    "index": 0,
+                    "index": index,
                     "delta": {"type": "text_delta", "text": text}
                 });
-                format!("event: content_block_delta\ndata: {delta}\n\n")
+                if self.anthropic_text_open {
+                    format!("event: content_block_delta\ndata: {delta}\n\n")
+                } else {
+                    let index = self.next_content_index;
+                    self.next_content_index = self.next_content_index.saturating_add(1);
+                    self.anthropic_text_open = true;
+                    let block_start = serde_json::json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {"type": "text", "text": ""}
+                    });
+                    let delta = serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "text_delta", "text": text}
+                    });
+                    format!(
+                        "event: content_block_start\ndata: {block_start}\n\nevent: content_block_delta\ndata: {delta}\n\n"
+                    )
+                }
             }
             Dialect::OpenAi => {
                 let chunk = serde_json::json!({
@@ -137,6 +161,83 @@ impl Framer {
                     "object": "chat.completion.chunk",
                     "model": self.model,
                     "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
+                });
+                format!("data: {chunk}\n\n")
+            }
+        }
+    }
+
+    /// Emit one validated call using the provider-native streaming shape.
+    #[must_use]
+    pub(crate) fn tool_call(&mut self, call: &AcceptedToolCall) -> String {
+        self.has_tool_calls = true;
+        let arguments = serde_json::to_string(&call.arguments)
+            .expect("serde_json::Value serialization cannot fail");
+        match self.dialect {
+            Dialect::Anthropic => {
+                let mut output = String::new();
+                if self.anthropic_text_open {
+                    let index = self.next_content_index.saturating_sub(1);
+                    let block_stop = serde_json::json!({
+                        "type": "content_block_stop",
+                        "index": index
+                    });
+                    output.push_str(&format!(
+                        "event: content_block_stop\ndata: {block_stop}\n\n"
+                    ));
+                    self.anthropic_text_open = false;
+                }
+                let index = self.next_content_index;
+                self.next_content_index = self.next_content_index.saturating_add(1);
+                let block_start = serde_json::json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": call.id,
+                        "name": call.name,
+                        "input": {}
+                    }
+                });
+                let delta = serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": arguments
+                    }
+                });
+                let block_stop = serde_json::json!({
+                    "type": "content_block_stop",
+                    "index": index
+                });
+                output.push_str(&format!(
+                    "event: content_block_start\ndata: {block_start}\n\nevent: content_block_delta\ndata: {delta}\n\nevent: content_block_stop\ndata: {block_stop}\n\n"
+                ));
+                output
+            }
+            Dialect::OpenAi => {
+                let index = self.next_tool_index;
+                self.next_tool_index = self.next_tool_index.saturating_add(1);
+                let chunk = serde_json::json!({
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion.chunk",
+                    "model": self.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": index,
+                                "id": call.id,
+                                "type": "function",
+                                "function": {
+                                    "name": call.name,
+                                    "arguments": arguments
+                                }
+                            }]
+                        },
+                        "finish_reason": null
+                    }]
                 });
                 format!("data: {chunk}\n\n")
             }
@@ -151,18 +252,32 @@ impl Framer {
     pub fn done(&mut self, usage: Usage, stop: StopReason) -> String {
         match self.dialect {
             Dialect::Anthropic => {
-                let block_stop = serde_json::json!({
-                    "type": "content_block_stop",
-                    "index": 0
-                });
+                let mut output = String::new();
+                if self.anthropic_text_open {
+                    let index = self.next_content_index.saturating_sub(1);
+                    let block_stop = serde_json::json!({
+                        "type": "content_block_stop",
+                        "index": index
+                    });
+                    output.push_str(&format!(
+                        "event: content_block_stop\ndata: {block_stop}\n\n"
+                    ));
+                    self.anthropic_text_open = false;
+                }
+                let stop_reason = if self.has_tool_calls {
+                    "tool_use"
+                } else {
+                    stop.anthropic()
+                };
                 let message_delta = serde_json::json!({
                     "type": "message_delta",
-                    "delta": {"stop_reason": stop.anthropic(), "stop_sequence": null},
+                    "delta": {"stop_reason": stop_reason, "stop_sequence": null},
                     "usage": {"input_tokens": usage.prompt_tokens, "output_tokens": usage.completion_tokens}
                 });
-                format!(
-                    "event: content_block_stop\ndata: {block_stop}\n\nevent: message_delta\ndata: {message_delta}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
-                )
+                output.push_str(&format!(
+                    "event: message_delta\ndata: {message_delta}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+                ));
+                output
             }
             Dialect::OpenAi => {
                 let total = usage.prompt_tokens.saturating_add(usage.completion_tokens);
@@ -170,7 +285,7 @@ impl Framer {
                     "id": "chatcmpl-1",
                     "object": "chat.completion.chunk",
                     "model": self.model,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": stop.openai()}],
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": if self.has_tool_calls { "tool_calls" } else { stop.openai() }}],
                     "usage": {
                         "prompt_tokens": usage.prompt_tokens,
                         "completion_tokens": usage.completion_tokens,
@@ -320,5 +435,44 @@ mod tests {
             out.contains("\"text\":\"a\\\"b\\n\""),
             "raw quote/newline must be escaped: {out}"
         );
+    }
+
+    #[test]
+    fn openai_tool_delta_is_complete_indexed_and_owns_finish_reason() {
+        let mut f = Framer::new(Dialect::OpenAi, "m", 1);
+        let call = AcceptedToolCall {
+            id: "call_1".into(),
+            name: "lookup".into(),
+            arguments: serde_json::json!({"query": "hi"}),
+        };
+        let delta = f.tool_call(&call);
+        assert!(delta.contains("\"tool_calls\":[{\"function\""));
+        assert!(delta.contains("\"id\":\"call_1\""));
+        assert!(delta.contains("\"index\":0"));
+        assert!(delta.contains("\"arguments\":\"{\\\"query\\\":\\\"hi\\\"}\""));
+        let done = f.done(Usage::default(), StopReason::MaxTokens);
+        assert!(done.contains("\"finish_reason\":\"tool_calls\""));
+    }
+
+    #[test]
+    fn anthropic_mixed_blocks_are_monotonic_and_closed() {
+        let mut f = Framer::new(Dialect::Anthropic, "m", 1);
+        let mut out = f.start();
+        out.push_str(&f.text("before"));
+        out.push_str(&f.tool_call(&AcceptedToolCall {
+            id: "toolu_1".into(),
+            name: "lookup".into(),
+            arguments: serde_json::json!({"query": "hi"}),
+        }));
+        out.push_str(&f.text("after"));
+        out.push_str(&f.done(Usage::default(), StopReason::EndTurn));
+        assert!(out.contains("\"index\":0"));
+        assert!(out.contains("\"index\":1"));
+        assert!(out.contains("\"index\":2"));
+        assert_eq!(out.matches("event: content_block_start\n").count(), 3);
+        assert_eq!(out.matches("event: content_block_stop\n").count(), 3);
+        assert!(out.contains("\"type\":\"tool_use\""));
+        assert!(out.contains("\"type\":\"input_json_delta\""));
+        assert!(out.contains("\"stop_reason\":\"tool_use\""));
     }
 }

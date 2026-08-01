@@ -214,7 +214,20 @@ impl ToolCallParser {
     /// Consume the next sequential UTF-8 fragment and return newly available
     /// ordered text/call events.
     pub fn push(&mut self, fragment: &str) -> Vec<ToolCallEvent> {
-        let mut events = self.process();
+        self.push_with_admission(fragment, &mut |_| true)
+    }
+
+    /// Consume a fragment while allowing the caller to reject parsed calls
+    /// before the parser commits dedupe or per-turn quota state.
+    pub(crate) fn push_with_admission<F>(
+        &mut self,
+        fragment: &str,
+        admission: &mut F,
+    ) -> Vec<ToolCallEvent>
+    where
+        F: FnMut(&ToolCall) -> bool,
+    {
+        let mut events = self.process(admission);
         self.record_retained_peak();
         let mut consumed = 0;
 
@@ -254,7 +267,7 @@ impl ToolCallParser {
             self.pending.push_str(&remaining[..take]);
             consumed += take;
             self.record_retained_peak();
-            events.extend(self.process());
+            events.extend(self.process(admission));
             self.record_retained_peak();
         }
 
@@ -264,7 +277,16 @@ impl ToolCallParser {
     /// Finish the stream, returning any incomplete candidate or delimiter
     /// prefix exactly as text.
     pub fn finish(&mut self) -> Vec<ToolCallEvent> {
-        let mut events = self.process();
+        self.finish_with_admission(&mut |_| true)
+    }
+
+    /// Finish a stream using the same pre-commit admission policy as
+    /// [`Self::push_with_admission`].
+    pub(crate) fn finish_with_admission<F>(&mut self, admission: &mut F) -> Vec<ToolCallEvent>
+    where
+        F: FnMut(&ToolCall) -> bool,
+    {
+        let mut events = self.process(admission);
         if let Some(candidate) = self.candidate.take() {
             emit_text(&mut events, candidate.raw);
         }
@@ -281,7 +303,10 @@ impl ToolCallParser {
         self.stats
     }
 
-    fn process(&mut self) -> Vec<ToolCallEvent> {
+    fn process<F>(&mut self, admission: &mut F) -> Vec<ToolCallEvent>
+    where
+        F: FnMut(&ToolCall) -> bool,
+    {
         let mut events = Vec::new();
 
         loop {
@@ -293,7 +318,7 @@ impl ToolCallParser {
             }
 
             if self.candidate.is_some() {
-                if self.process_candidate(&mut events) {
+                if self.process_candidate(&mut events, admission) {
                     continue;
                 }
                 break;
@@ -334,7 +359,10 @@ impl ToolCallParser {
     }
 
     /// Returns whether scanning can immediately continue.
-    fn process_candidate(&mut self, events: &mut Vec<ToolCallEvent>) -> bool {
+    fn process_candidate<F>(&mut self, events: &mut Vec<ToolCallEvent>, admission: &mut F) -> bool
+    where
+        F: FnMut(&ToolCall) -> bool,
+    {
         let candidate_len = self.candidate.as_ref().map_or(0, |value| value.raw.len());
         if candidate_len > self.max_candidate_bytes {
             let candidate = self
@@ -377,7 +405,7 @@ impl ToolCallParser {
                 pending.push_str(&self.pending);
                 self.pending = pending;
             }
-            self.complete_candidate(candidate, events);
+            self.complete_candidate(candidate, events, admission);
             return true;
         }
 
@@ -453,7 +481,14 @@ impl ToolCallParser {
         }
     }
 
-    fn complete_candidate(&mut self, candidate: Candidate, events: &mut Vec<ToolCallEvent>) {
+    fn complete_candidate<F>(
+        &mut self,
+        candidate: Candidate,
+        events: &mut Vec<ToolCallEvent>,
+        admission: &mut F,
+    ) where
+        F: FnMut(&ToolCall) -> bool,
+    {
         let Some(parsed) = parse_candidate(&candidate.raw, candidate.stale_opener) else {
             emit_text(events, candidate.raw);
             return;
@@ -466,8 +501,19 @@ impl ToolCallParser {
             self.stats.wellformed = self.stats.wellformed.saturating_add(1);
         }
 
-        let canonical = canonical_json(&parsed.arguments);
-        let dedupe_key = (parsed.name.clone(), canonical);
+        let call = ToolCall {
+            name: parsed.name,
+            arguments: parsed.arguments,
+            raw: candidate.raw,
+            repaired: parsed.repaired,
+        };
+        if !admission(&call) {
+            emit_text(events, call.raw);
+            return;
+        }
+
+        let canonical = canonical_json(&call.arguments);
+        let dedupe_key = (call.name.clone(), canonical);
         if self.seen.contains(&dedupe_key) {
             self.stats.deduped = self.stats.deduped.saturating_add(1);
             return;
@@ -475,18 +521,13 @@ impl ToolCallParser {
 
         if self.surfaced_calls >= self.max_tool_calls {
             self.stats.call_limit_exceeded = self.stats.call_limit_exceeded.saturating_add(1);
-            emit_text(events, candidate.raw);
+            emit_text(events, call.raw);
             return;
         }
 
         self.seen.insert(dedupe_key);
         self.surfaced_calls = self.surfaced_calls.saturating_add(1);
-        events.push(ToolCallEvent::Call(ToolCall {
-            name: parsed.name,
-            arguments: parsed.arguments,
-            raw: candidate.raw,
-            repaired: parsed.repaired,
-        }));
+        events.push(ToolCallEvent::Call(call));
     }
 }
 

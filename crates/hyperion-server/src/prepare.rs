@@ -3,13 +3,15 @@
 //! `/v1/messages` or OpenAI `/v1/chat/completions`) is parsed into a
 //! `ChatMessage` list + sampler config, rendered through the M3 chat template,
 //! tokenized, and packaged as a [`PreparedPrompt`] — the `EngineRequest` +
-//! stream flag + dialect the handler feeds to the engine. Provider-shaped
-//! tool history is accepted only when generation is explicitly disabled.
+//! stream flag + dialect + compiled tool registry the handler feeds to the
+//! engine and response adapter.
 //!
 //! The 413 context-overflow check (`prompt_tokens + max_tokens > context`)
 //! lives here, distinct from the 32 MiB body-size 413 (B5's
-//! `DefaultBodyLimit`). Model-generated tool calls remain disabled until the
-//! response parser/framing slice lands.
+//! `DefaultBodyLimit`). Auto-mode requests retain the three native control
+//! IDs needed by selective response decoding.
+
+use std::sync::Arc;
 
 use hyperion_ffi::HypSamplingConfig;
 use hyperion_tokenizer::TokenizerHandle;
@@ -21,6 +23,10 @@ use crate::history::{AnthropicHistoryInput, OpenAiHistoryInput, ToolHistoryError
 use crate::tool_schema::{
     AnthropicToolsInput, OpenAiToolsInput, ToolMode, ToolRegistry, ToolSchemaError,
 };
+
+const TOOL_CALL_OPEN_SPECIAL: &str = "<|tool_call>";
+const TOOL_CALL_CLOSE_SPECIAL: &str = "<tool_call|>";
+const TOOL_CALL_QUOTE_SPECIAL: &str = "<|\"|>";
 
 /// The context window (tokens) used for the 413 overflow check. The 12B's
 /// `max_position_embeddings` (262_144); passed in from the loaded geometry so
@@ -42,6 +48,12 @@ pub struct PreparedPrompt {
     pub dialect: Dialect,
     /// The rendered prompt token count (for usage accounting / the 413 check).
     pub prompt_tokens_len: u32,
+    /// The request's single compiled declaration registry, reused for output
+    /// validation after it supplied the rendered declarations.
+    pub tool_registry: Arc<ToolRegistry>,
+    /// Native tool-call delimiter and quote IDs retained by the response
+    /// decoder. Empty for explicit-none/text-only requests.
+    pub preserved_special_ids: Vec<u32>,
 }
 
 /// A normalization failure, mapped to the 06 error taxonomy.
@@ -49,12 +61,14 @@ pub struct PreparedPrompt {
 pub enum PrepareError {
     /// The JSON body was malformed or missing required fields → 400.
     MalformedBody(String),
-    /// The request enables model-generated tool calls before response parsing
-    /// and framing support is available → 400.
+    /// Tool declarations would be hidden without the request explicitly
+    /// selecting `none` → 400 (the retained history-only compatibility gate).
     ToolsUnsupported,
     /// Tool declarations or controls failed bounded registry compilation →
     /// 400. The public display text does not expose the source error.
     ToolSchema(ToolSchemaError),
+    /// A required native tool-call control is absent from the tokenizer.
+    ToolDelimitersUnavailable,
     /// Provider history failed bounded normalization → 400. The public display
     /// text does not expose the source error.
     ToolHistory(ToolHistoryError),
@@ -76,6 +90,9 @@ impl std::fmt::Display for PrepareError {
             Self::MalformedBody(s) => write!(f, "malformed request body: {s}"),
             Self::ToolsUnsupported => f.write_str("tool calling is not yet supported"),
             Self::ToolSchema(_) => f.write_str("invalid tool schema"),
+            Self::ToolDelimitersUnavailable => {
+                f.write_str("tool calling is unavailable for this tokenizer")
+            }
             Self::ToolHistory(_) => f.write_str("invalid tool history"),
             Self::Render(e) => write!(f, "template render error: {e}"),
             Self::ContextOverflow {
@@ -96,7 +113,10 @@ impl std::error::Error for PrepareError {
             Self::ToolSchema(error) => Some(error),
             Self::ToolHistory(error) => Some(error),
             Self::Render(error) => Some(error),
-            Self::MalformedBody(_) | Self::ToolsUnsupported | Self::ContextOverflow { .. } => None,
+            Self::MalformedBody(_)
+            | Self::ToolsUnsupported
+            | Self::ToolDelimitersUnavailable
+            | Self::ContextOverflow { .. } => None,
         }
     }
 }
@@ -109,6 +129,7 @@ impl PrepareError {
             Self::MalformedBody(_)
             | Self::ToolsUnsupported
             | Self::ToolSchema(_)
+            | Self::ToolDelimitersUnavailable
             | Self::ToolHistory(_)
             | Self::Render(_) => 400,
             Self::ContextOverflow { .. } => 413,
@@ -213,21 +234,23 @@ fn has_non_null_tools(tools: Option<&serde_json::Value>) -> bool {
     tools.is_some_and(|tools| !tools.is_null())
 }
 
-fn require_history_only_generation(
+fn require_explicit_none_for_hidden_declarations(
     registry: &ToolRegistry,
     tools_present: bool,
     explicit_none: bool,
 ) -> Result<(), PrepareError> {
-    if registry.mode() == ToolMode::Auto || (tools_present && !explicit_none) {
+    if registry.mode() == ToolMode::None && tools_present && !explicit_none {
         Err(PrepareError::ToolsUnsupported)
     } else {
         Ok(())
     }
 }
 
-/// Compile declarations, enforce OpenAI's explicit history-only generation
-/// boundary, then normalize the complete provider message value.
-fn normalize_openai_for_generation(body: &OpenAiBody) -> Result<Vec<ChatMessage>, PrepareError> {
+/// Compile declarations, retain the explicit-none compatibility boundary,
+/// then normalize the complete OpenAI message value.
+fn normalize_openai_for_generation(
+    body: &OpenAiBody,
+) -> Result<(Vec<ChatMessage>, ToolRegistry), PrepareError> {
     let registry = ToolRegistry::from_openai(OpenAiToolsInput {
         tools: body.tools.as_ref(),
         tool_choice: body.tool_choice.as_ref(),
@@ -237,23 +260,24 @@ fn normalize_openai_for_generation(body: &OpenAiBody) -> Result<Vec<ChatMessage>
     let explicit_none = body.tool_choice.as_ref().is_some_and(
         |choice| matches!(choice, serde_json::Value::String(value) if value == "none"),
     );
-    require_history_only_generation(
+    require_explicit_none_for_hidden_declarations(
         &registry,
         has_non_null_tools(body.tools.as_ref()),
         explicit_none,
     )?;
-    registry
+    let messages = registry
         .normalize_openai_history(OpenAiHistoryInput {
             messages: &body.messages,
         })
-        .map_err(PrepareError::ToolHistory)
+        .map_err(PrepareError::ToolHistory)?;
+    Ok((messages, registry))
 }
 
-/// Compile declarations, enforce Anthropic's explicit history-only generation
-/// boundary, then normalize the complete provider system/messages values.
+/// Compile declarations, retain the explicit-none compatibility boundary,
+/// then normalize the complete Anthropic system/messages values.
 fn normalize_anthropic_for_generation(
     body: &AnthropicBody,
-) -> Result<Vec<ChatMessage>, PrepareError> {
+) -> Result<(Vec<ChatMessage>, ToolRegistry), PrepareError> {
     let registry = ToolRegistry::from_anthropic(AnthropicToolsInput {
         tools: body.tools.as_ref(),
         tool_choice: body.tool_choice.as_ref(),
@@ -266,17 +290,18 @@ fn normalize_anthropic_for_generation(
             .and_then(serde_json::Value::as_str)
             == Some("none")
     });
-    require_history_only_generation(
+    require_explicit_none_for_hidden_declarations(
         &registry,
         has_non_null_tools(body.tools.as_ref()),
         explicit_none,
     )?;
-    registry
+    let messages = registry
         .normalize_anthropic_history(AnthropicHistoryInput {
             system: body.system.as_ref(),
             messages: &body.messages,
         })
-        .map_err(PrepareError::ToolHistory)
+        .map_err(PrepareError::ToolHistory)?;
+    Ok((messages, registry))
 }
 
 /// Compile and normalize Anthropic count-only input without applying the
@@ -304,8 +329,10 @@ fn normalize_anthropic_for_count(
 /// # Errors
 /// - `PrepareError::MalformedBody` — bad JSON or missing `max_tokens` (Anthropic
 ///   requires it).
-/// - `PrepareError::ToolsUnsupported` — the effective tool mode permits model
-///   generation, or declarations are present without an explicit `none`.
+/// - `PrepareError::ToolsUnsupported` — hidden declarations are present
+///   without an explicit `none`.
+/// - `PrepareError::ToolDelimitersUnavailable` — auto mode cannot resolve the
+///   native tool-call delimiters or quote marker.
 /// - `PrepareError::ToolSchema` / `PrepareError::ToolHistory` — bounded tool
 ///   declaration/history validation failed.
 /// - `PrepareError::Render` — the chat template rejected the conversation.
@@ -321,7 +348,8 @@ pub fn prepare_anthropic(
     let max_tokens = parsed
         .max_tokens
         .ok_or_else(|| PrepareError::MalformedBody("Anthropic requires max_tokens".to_string()))?;
-    let messages = normalize_anthropic_for_generation(&parsed)?;
+    let (messages, registry) = normalize_anthropic_for_generation(&parsed)?;
+    let tools = registry.render_tools().to_vec();
     let sampler = SamplerParams {
         temperature: parsed.temperature,
         top_p: parsed.top_p,
@@ -331,15 +359,18 @@ pub fn prepare_anthropic(
     };
     finalize(
         messages,
-        Vec::new(),
-        max_tokens,
-        parsed.stream.unwrap_or(false),
-        sampler,
-        Dialect::Anthropic,
+        tools,
         PrepareEnv {
             template,
             tokenizer,
             context,
+        },
+        FinalizeConfig {
+            max_tokens,
+            stream: parsed.stream.unwrap_or(false),
+            sampler,
+            dialect: Dialect::Anthropic,
+            registry,
         },
     )
 }
@@ -381,7 +412,8 @@ pub fn prepare_openai(
     let parsed: OpenAiBody =
         serde_json::from_str(body).map_err(|e| PrepareError::MalformedBody(e.to_string()))?;
     let max_tokens = parsed.max_tokens.unwrap_or(default_max_tokens);
-    let messages = normalize_openai_for_generation(&parsed)?;
+    let (messages, registry) = normalize_openai_for_generation(&parsed)?;
+    let tools = registry.render_tools().to_vec();
     let sampler = SamplerParams {
         temperature: parsed.temperature,
         top_p: parsed.top_p,
@@ -391,15 +423,18 @@ pub fn prepare_openai(
     };
     finalize(
         messages,
-        Vec::new(),
-        max_tokens,
-        parsed.stream.unwrap_or(false),
-        sampler,
-        Dialect::OpenAi,
+        tools,
         PrepareEnv {
             template,
             tokenizer,
             context,
+        },
+        FinalizeConfig {
+            max_tokens,
+            stream: parsed.stream.unwrap_or(false),
+            sampler,
+            dialect: Dialect::OpenAi,
+            registry,
         },
     )
 }
@@ -413,18 +448,30 @@ pub struct PrepareEnv<'a> {
     pub context: ContextWindow,
 }
 
+struct FinalizeConfig {
+    max_tokens: u32,
+    stream: bool,
+    sampler: SamplerParams,
+    dialect: Dialect,
+    registry: ToolRegistry,
+}
+
 /// The shared tail: render → tokenize → context-overflow check →
 /// `PreparedPrompt`. The eos token id is resolved from the tokenizer's
 /// `eos_token` (the gemma4 `<eos>`); `None` if absent (run to max_tokens).
 fn finalize(
     messages: Vec<ChatMessage>,
     tools: Vec<serde_json::Value>,
-    max_tokens: u32,
-    stream: bool,
-    sampler: SamplerParams,
-    dialect: Dialect,
     env: PrepareEnv<'_>,
+    config: FinalizeConfig,
 ) -> Result<PreparedPrompt, PrepareError> {
+    let FinalizeConfig {
+        max_tokens,
+        stream,
+        sampler,
+        dialect,
+        registry,
+    } = config;
     let prompt_tokens = render_prompt_tokens(&messages, tools, env.template, env.tokenizer)?;
     let prompt_tokens_len = u32::try_from(prompt_tokens.len()).unwrap_or(u32::MAX);
     if prompt_tokens_len.saturating_add(max_tokens) > env.context {
@@ -441,11 +488,28 @@ fn finalize(
         eos_token_id,
         sampling: sampler.to_sampling(),
     };
+    let preserved_special_ids = if registry.mode() == ToolMode::Auto {
+        vec![
+            env.tokenizer
+                .token_to_id(TOOL_CALL_OPEN_SPECIAL)
+                .ok_or(PrepareError::ToolDelimitersUnavailable)?,
+            env.tokenizer
+                .token_to_id(TOOL_CALL_CLOSE_SPECIAL)
+                .ok_or(PrepareError::ToolDelimitersUnavailable)?,
+            env.tokenizer
+                .token_to_id(TOOL_CALL_QUOTE_SPECIAL)
+                .ok_or(PrepareError::ToolDelimitersUnavailable)?,
+        ]
+    } else {
+        Vec::new()
+    };
     Ok(PreparedPrompt {
         engine_request,
         stream,
         dialect,
         prompt_tokens_len,
+        tool_registry: Arc::new(registry),
+        preserved_special_ids,
     })
 }
 
@@ -482,7 +546,10 @@ mod tests {
       "padding": null,
       "added_tokens": [
         {"id": 0, "content": "<eos>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
-        {"id": 1, "content": "<bos>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+        {"id": 1, "content": "<bos>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+        {"id": 6, "content": "<|tool_call>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+        {"id": 7, "content": "<tool_call|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+        {"id": 8, "content": "<|\"|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
       ],
       "normalizer": null,
       "pre_tokenizer": {"type": "Whitespace"},
@@ -490,7 +557,7 @@ mod tests {
       "decoder": null,
       "model": {
         "type": "WordLevel",
-        "vocab": {"<eos>": 0, "<bos>": 1, "DECL": 2, "user": 3, "hi": 4, "[UNK]": 5},
+        "vocab": {"<eos>": 0, "<bos>": 1, "DECL": 2, "user": 3, "hi": 4, "[UNK]": 5, "<|tool_call>": 6, "<tool_call|>": 7, "<|\"|>": 8},
         "unk_token": "[UNK]"
       }
     }"#;
@@ -591,7 +658,7 @@ mod tests {
         .unwrap();
 
         assert!(body.messages[1].get("tool_calls").is_some());
-        let messages = normalize_openai_for_generation(&body).unwrap();
+        let (messages, _) = normalize_openai_for_generation(&body).unwrap();
         assert_eq!(messages.len(), 3);
         assert!(messages[1].tool_calls.is_some());
         assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
@@ -622,7 +689,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(body.messages[1]["content"][0]["type"], "tool_use");
-        let messages = normalize_anthropic_for_generation(&body).unwrap();
+        let (messages, _) = normalize_anthropic_for_generation(&body).unwrap();
         assert_eq!(messages[0].role, "system");
         assert!(messages[2].tool_calls.is_some());
         assert_eq!(messages[3].tool_call_id.as_deref(), Some("toolu_1"));
@@ -642,16 +709,14 @@ mod tests {
     }
 
     #[test]
-    fn effective_auto_is_rejected_before_generation_rendering() {
+    fn effective_auto_is_enabled_for_generation() {
         let body: AnthropicBody = serde_json::from_value(json!({
             "messages": [{"role": "user", "content": "hi"}],
             "tool_choice": {"type": "auto"}
         }))
         .unwrap();
-        assert!(matches!(
-            normalize_anthropic_for_generation(&body),
-            Err(PrepareError::ToolsUnsupported)
-        ));
+        let (_, registry) = normalize_anthropic_for_generation(&body).unwrap();
+        assert_eq!(registry.mode(), ToolMode::Auto);
     }
 
     #[test]
@@ -720,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_anthropic_rejects_auto_tools_with_400() {
+    fn prepare_anthropic_accepts_auto_tools_with_native_delimiters() {
         let parsed: AnthropicBody = serde_json::from_value(json!({
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 10,
@@ -728,11 +793,32 @@ mod tests {
             "tool_choice": {"type": "auto"}
         }))
         .unwrap();
-        assert!(matches!(
-            normalize_anthropic_for_generation(&parsed),
-            Err(PrepareError::ToolsUnsupported)
-        ));
-        assert_eq!(PrepareError::ToolsUnsupported.http_status(), 400);
+        let (_, registry) = normalize_anthropic_for_generation(&parsed).unwrap();
+        assert_eq!(registry.mode(), ToolMode::Auto);
+
+        let tokenizer = TokenizerHandle::from_bytes(COUNT_TOKENIZER_JSON.as_bytes()).unwrap();
+        let template = ChatTemplate::from_source(
+            "{% if tools | length > 0 %}DECL {% endif %}{% for message in messages %}{{ message.role }} {{ message.content }} {% endfor %}",
+            "<bos>",
+            "<eos>",
+        )
+        .unwrap();
+        let prepared = prepare_anthropic(
+            &serde_json::to_string(&json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 10,
+                "tools": [anthropic_tool()],
+                "tool_choice": {"type": "auto"}
+            }))
+            .unwrap(),
+            &template,
+            &tokenizer,
+            100,
+        )
+        .unwrap();
+        assert_eq!(prepared.tool_registry.mode(), ToolMode::Auto);
+        assert_eq!(prepared.preserved_special_ids, vec![6, 7, 8]);
+        assert_eq!(prepared.engine_request.prompt_tokens.first(), Some(&2));
     }
 
     #[test]

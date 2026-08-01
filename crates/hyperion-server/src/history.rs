@@ -249,10 +249,11 @@ impl<'a> Normalizer<'a> {
                 "assistant"
                     if self.is_anthropic_tool_use(content, &format!("{path}.content"))? =>
                 {
-                    let calls = self.anthropic_calls(content, &format!("{path}.content"))?;
+                    let (text, calls) =
+                        self.anthropic_assistant_batch(content, &format!("{path}.content"))?;
                     let result_index = index + 1;
                     let results = self.anthropic_results(messages, result_index, &calls)?;
-                    let (assistant, tool_rows) = canonical_batch(None, calls, results);
+                    let (assistant, tool_rows) = canonical_batch(text, calls, results);
                     output.push(assistant);
                     output.extend(tool_rows);
                     index = result_index + 1;
@@ -452,20 +453,13 @@ impl<'a> Normalizer<'a> {
             return Ok(false);
         };
         self.precheck_anthropic_content_array(blocks, path)?;
-        let tool_uses = blocks
-            .iter()
-            .filter(|block| {
-                block
-                    .as_object()
-                    .and_then(|object| object.get("type"))
-                    .and_then(Value::as_str)
-                    == Some("tool_use")
-            })
-            .count();
-        if tool_uses > 0 && tool_uses != blocks.len() {
-            return Err(self.error(path, "must not mix tool_use and non-tool_use blocks"));
-        }
-        Ok(tool_uses > 0)
+        Ok(blocks.iter().any(|block| {
+            block
+                .as_object()
+                .and_then(|object| object.get("type"))
+                .and_then(Value::as_str)
+                == Some("tool_use")
+        }))
     }
 
     fn anthropic_has_block_type(
@@ -497,47 +491,96 @@ impl<'a> Normalizer<'a> {
             .aggregate_text_blocks
             .checked_sub(self.text_blocks)
             .ok_or_else(|| self.error(path, "text-block accounting underflow"))?;
-        let first_is_tool_block = blocks
-            .first()
-            .and_then(Value::as_object)
-            .and_then(|block| block.get("type"))
-            .and_then(Value::as_str)
-            .is_some_and(|kind| matches!(kind, "tool_use" | "tool_result"));
-        let scan_limit = if first_is_tool_block {
-            self.limits.calls_per_turn
-        } else {
-            remaining_text_blocks
-        };
+        let scan_limit = remaining_text_blocks
+            .checked_add(self.limits.calls_per_turn)
+            .ok_or_else(|| self.error(path, "content-block scan budget overflow"))?;
         if blocks.len() > scan_limit {
             return Err(self.error(
                 path,
                 "exceeds the remaining text-block or tool-use scan budget",
             ));
         }
+
+        let mut text_blocks = 0usize;
+        let mut tool_blocks = 0usize;
+        for block in blocks {
+            let kind = block
+                .as_object()
+                .and_then(|block| block.get("type"))
+                .and_then(Value::as_str);
+            match kind {
+                Some("text") => {
+                    text_blocks = text_blocks.saturating_add(1);
+                    if text_blocks > remaining_text_blocks {
+                        return Err(self.error(
+                            path,
+                            "exceeds the remaining text-block or tool-use scan budget",
+                        ));
+                    }
+                }
+                Some("tool_use" | "tool_result") => {
+                    tool_blocks = tool_blocks.saturating_add(1);
+                    if tool_blocks > self.limits.calls_per_turn {
+                        return Err(self.error(
+                            path,
+                            "exceeds the remaining text-block or tool-use scan budget",
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
         Ok(())
     }
 
-    fn anthropic_calls(
+    fn anthropic_assistant_batch(
         &mut self,
         content: &Value,
         path: &str,
-    ) -> Result<Vec<HistoricalCall>, ToolHistoryError> {
+    ) -> Result<(Option<String>, Vec<HistoricalCall>), ToolHistoryError> {
         let Value::Array(blocks) = content else {
-            return Err(self.error(path, "must be a nonempty tool_use array"));
+            return Err(self.error(path, "must be a nonempty assistant content array"));
         };
         if blocks.is_empty() {
-            return Err(self.error(path, "must be a nonempty tool_use array"));
+            return Err(self.error(path, "must be a nonempty assistant content array"));
         }
-        if blocks.len() > self.limits.calls_per_turn {
-            return Err(self.error(
-                path,
-                format_args!(
-                    "exceeds the maximum of {} calls per turn",
-                    self.limits.calls_per_turn
-                ),
-            ));
+        // This independently caps text and tool counts before either filtered
+        // reference vector can grow.
+        self.precheck_anthropic_content_array(blocks, path)?;
+
+        let mut text_blocks = Vec::new();
+        let mut tool_blocks = Vec::new();
+        for (index, value) in blocks.iter().enumerate() {
+            let block_path = format!("{path}[{index}]");
+            let block = self.object(value, &block_path)?;
+            let kind = self.required_string(block, "type", &block_path)?;
+            match kind {
+                "text" => text_blocks.push(value),
+                "tool_use" => tool_blocks.push(value),
+                _ => {
+                    return Err(
+                        self.error(&format!("{block_path}.type"), "has an unsupported value")
+                    );
+                }
+            }
         }
 
+        let text = if text_blocks.is_empty() {
+            None
+        } else {
+            Some(self.text_block_content(&text_blocks, path, true)?)
+        };
+        let calls = self.anthropic_call_blocks(&tool_blocks, path)?;
+        Ok((text, calls))
+    }
+
+    fn anthropic_call_blocks(
+        &mut self,
+        blocks: &[&Value],
+        path: &str,
+    ) -> Result<Vec<HistoricalCall>, ToolHistoryError> {
+        debug_assert!(!blocks.is_empty());
+        debug_assert!(blocks.len() <= self.limits.calls_per_turn);
         let mut calls = Vec::with_capacity(blocks.len());
         for (index, value) in blocks.iter().enumerate() {
             let block_path = format!("{path}[{index}]");
@@ -688,39 +731,52 @@ impl<'a> Normalizer<'a> {
                 Ok(text.clone())
             }
             Value::Array(blocks) => {
-                let next_text_blocks = self.checked_text_blocks(blocks.len(), path)?;
-                if require_nonempty_blocks && blocks.is_empty() {
-                    return Err(self.error(path, "must be a string or nonempty text-block array"));
-                }
-                let mut total = 0usize;
-                for (index, value) in blocks.iter().enumerate() {
-                    let block_path = format!("{path}[{index}]");
-                    let block = self.object(value, &block_path)?;
-                    self.ensure_fields(block, &["type", "text"], &block_path)?;
-                    self.require_exact_string(block, "type", "text", &block_path)?;
-                    let text = self.required_string(block, "text", &block_path)?;
-                    total = total
-                        .checked_add(text.len())
-                        .ok_or_else(|| self.error(path, "text byte accounting overflow"))?;
-                    self.checked_text_bytes(total, path)?;
-                }
-                let next_text_bytes = self.checked_text_bytes(total, path)?;
-                let mut normalized = String::with_capacity(total);
-                for (index, value) in blocks.iter().enumerate() {
-                    let text = value
-                        .as_object()
-                        .and_then(|block| block.get("text"))
-                        .and_then(Value::as_str)
-                        .expect("the first pass validated every canonical text block");
-                    self.inspect_text(text, &format!("{path}[{index}].text"))?;
-                    normalized.push_str(text);
-                }
-                self.text_bytes = next_text_bytes;
-                self.text_blocks = next_text_blocks;
-                Ok(normalized)
+                // Reject attacker-sized direct arrays before allocating the
+                // proportional reference vector used by the shared validator.
+                self.checked_text_blocks(blocks.len(), path)?;
+                let blocks = blocks.iter().collect::<Vec<_>>();
+                self.text_block_content(&blocks, path, require_nonempty_blocks)
             }
             _ => Err(self.error(path, "must be a string or canonical text-block array")),
         }
+    }
+
+    fn text_block_content(
+        &mut self,
+        blocks: &[&Value],
+        path: &str,
+        require_nonempty_blocks: bool,
+    ) -> Result<String, ToolHistoryError> {
+        let next_text_blocks = self.checked_text_blocks(blocks.len(), path)?;
+        if require_nonempty_blocks && blocks.is_empty() {
+            return Err(self.error(path, "must be a string or nonempty text-block array"));
+        }
+        let mut total = 0usize;
+        for (index, value) in blocks.iter().enumerate() {
+            let block_path = format!("{path}[{index}]");
+            let block = self.object(value, &block_path)?;
+            self.ensure_fields(block, &["type", "text"], &block_path)?;
+            self.require_exact_string(block, "type", "text", &block_path)?;
+            let text = self.required_string(block, "text", &block_path)?;
+            total = total
+                .checked_add(text.len())
+                .ok_or_else(|| self.error(path, "text byte accounting overflow"))?;
+            self.checked_text_bytes(total, path)?;
+        }
+        let next_text_bytes = self.checked_text_bytes(total, path)?;
+        let mut normalized = String::with_capacity(total);
+        for (index, value) in blocks.iter().enumerate() {
+            let text = value
+                .as_object()
+                .and_then(|block| block.get("text"))
+                .and_then(Value::as_str)
+                .expect("the first pass validated every canonical text block");
+            self.inspect_text(text, &format!("{path}[{index}].text"))?;
+            normalized.push_str(text);
+        }
+        self.text_bytes = next_text_bytes;
+        self.text_blocks = next_text_blocks;
+        Ok(normalized)
     }
 
     fn inspect_text(&self, text: &str, path: &str) -> Result<(), ToolHistoryError> {
@@ -1626,7 +1682,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_semantics_and_rich_blocks_are_rejected() {
+    fn anthropic_mixed_assistant_blocks_normalize_and_rich_blocks_are_rejected() {
         let registry = permissive_registry(&["echo"]);
         let mixed = json!([
             {
@@ -1634,11 +1690,24 @@ mod tests {
                 "content": [
                     {"type": "text", "text": "preface"},
                     anthropic_call("call-1", "echo", json!({})),
+                    {"type": "text", "text": "after"},
                 ],
             },
             {"role": "user", "content": [anthropic_result("call-1", None)]},
         ]);
-        assert!(normalize_anthropic(&registry, None, &mixed).is_err());
+        let normalized = serde_json::to_value(
+            normalize_anthropic(&registry, None, &mixed).expect("mixed assistant batch normalizes"),
+        )
+        .unwrap();
+        assert_eq!(normalized[0]["role"], "assistant");
+        assert_eq!(normalized[0]["content"], "prefaceafter");
+        assert_eq!(normalized[0]["tool_calls"][0]["id"], "call-1");
+        assert_eq!(
+            normalized[0]["tool_calls"][0]["function"],
+            json!({"name": "echo", "arguments": {}})
+        );
+        assert_eq!(normalized[1]["role"], "tool");
+        assert_eq!(normalized[1]["tool_call_id"], "call-1");
 
         for block in [
             json!({"type": "image", "source": {}}),
@@ -1903,6 +1972,37 @@ mod tests {
             );
             assert_eq!(result.is_ok(), succeeds);
         }
+
+        let anthropic_mixed = json!([
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "before"},
+                    anthropic_call("mixed", "echo", json!({})),
+                    {"type": "text", "text": "after"},
+                ],
+            },
+            {"role": "user", "content": [anthropic_result("mixed", None)]},
+        ]);
+        for (text_blocks, calls_per_turn, succeeds) in [(2, 1, true), (1, 1, false), (2, 0, false)]
+        {
+            let result = registry.normalize_anthropic_history_with_limits(
+                AnthropicHistoryInput {
+                    system: None,
+                    messages: &anthropic_mixed,
+                },
+                HistoryLimits {
+                    aggregate_text_blocks: text_blocks,
+                    calls_per_turn,
+                    ..PRODUCTION_LIMITS
+                },
+            );
+            assert_eq!(
+                result.is_ok(),
+                succeeds,
+                "text_blocks={text_blocks}, calls_per_turn={calls_per_turn}"
+            );
+        }
     }
 
     #[test]
@@ -1956,6 +2056,46 @@ mod tests {
         let history = json!([{"role": "user", "content": many_empty_blocks}]);
         let error = normalize_anthropic(&registry, None, &history).unwrap_err();
         assert!(error.to_string().contains("scan budget"));
+    }
+
+    #[test]
+    fn direct_text_arrays_reject_block_overflow_before_reference_collection() {
+        let registry = permissive_registry(&[]);
+        let blocks = json!([
+            {"type": "text", "text": "a"},
+            {"type": "text", "text": "b"},
+            {"type": "text", "text": "c"},
+        ]);
+        let limits = HistoryLimits {
+            aggregate_text_blocks: 2,
+            ..PRODUCTION_LIMITS
+        };
+
+        let openai = json!([{"role": "user", "content": blocks.clone()}]);
+        let openai_error = registry
+            .normalize_openai_history_with_limits(OpenAiHistoryInput { messages: &openai }, limits)
+            .unwrap_err();
+        assert!(
+            openai_error
+                .to_string()
+                .contains("maximum of 2 text blocks")
+        );
+
+        let anthropic_messages = json!([]);
+        let anthropic_error = registry
+            .normalize_anthropic_history_with_limits(
+                AnthropicHistoryInput {
+                    system: Some(&blocks),
+                    messages: &anthropic_messages,
+                },
+                limits,
+            )
+            .unwrap_err();
+        assert!(
+            anthropic_error
+                .to_string()
+                .contains("maximum of 2 text blocks")
+        );
     }
 
     #[test]
