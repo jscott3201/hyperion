@@ -8,8 +8,8 @@
 //!
 //! The 413 context-overflow check (`prompt_tokens + max_tokens > context`)
 //! lives here, distinct from the 32 MiB body-size 413 (B5's
-//! `DefaultBodyLimit`). Auto-mode requests retain exactly the two native
-//! delimiter IDs needed by selective response decoding.
+//! `DefaultBodyLimit`). Auto-mode requests retain the three native control
+//! IDs needed by selective response decoding.
 
 use std::sync::Arc;
 
@@ -26,6 +26,7 @@ use crate::tool_schema::{
 
 const TOOL_CALL_OPEN_SPECIAL: &str = "<|tool_call>";
 const TOOL_CALL_CLOSE_SPECIAL: &str = "<tool_call|>";
+const TOOL_CALL_QUOTE_SPECIAL: &str = "<|\"|>";
 
 /// The context window (tokens) used for the 413 overflow check. The 12B's
 /// `max_position_embeddings` (262_144); passed in from the loaded geometry so
@@ -50,8 +51,8 @@ pub struct PreparedPrompt {
     /// The request's single compiled declaration registry, reused for output
     /// validation after it supplied the rendered declarations.
     pub tool_registry: Arc<ToolRegistry>,
-    /// Native tool-call special IDs retained by the response decoder. Empty
-    /// for explicit-none/text-only requests.
+    /// Native tool-call delimiter and quote IDs retained by the response
+    /// decoder. Empty for explicit-none/text-only requests.
     pub preserved_special_ids: Vec<u32>,
 }
 
@@ -66,7 +67,7 @@ pub enum PrepareError {
     /// Tool declarations or controls failed bounded registry compilation →
     /// 400. The public display text does not expose the source error.
     ToolSchema(ToolSchemaError),
-    /// A required native tool-call delimiter is absent from the tokenizer.
+    /// A required native tool-call control is absent from the tokenizer.
     ToolDelimitersUnavailable,
     /// Provider history failed bounded normalization → 400. The public display
     /// text does not expose the source error.
@@ -331,7 +332,7 @@ fn normalize_anthropic_for_count(
 /// - `PrepareError::ToolsUnsupported` — hidden declarations are present
 ///   without an explicit `none`.
 /// - `PrepareError::ToolDelimitersUnavailable` — auto mode cannot resolve the
-///   two native tool-call delimiters.
+///   native tool-call delimiters or quote marker.
 /// - `PrepareError::ToolSchema` / `PrepareError::ToolHistory` — bounded tool
 ///   declaration/history validation failed.
 /// - `PrepareError::Render` — the chat template rejected the conversation.
@@ -495,6 +496,9 @@ fn finalize(
             env.tokenizer
                 .token_to_id(TOOL_CALL_CLOSE_SPECIAL)
                 .ok_or(PrepareError::ToolDelimitersUnavailable)?,
+            env.tokenizer
+                .token_to_id(TOOL_CALL_QUOTE_SPECIAL)
+                .ok_or(PrepareError::ToolDelimitersUnavailable)?,
         ]
     } else {
         Vec::new()
@@ -544,7 +548,8 @@ mod tests {
         {"id": 0, "content": "<eos>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
         {"id": 1, "content": "<bos>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
         {"id": 6, "content": "<|tool_call>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
-        {"id": 7, "content": "<tool_call|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+        {"id": 7, "content": "<tool_call|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+        {"id": 8, "content": "<|\"|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
       ],
       "normalizer": null,
       "pre_tokenizer": {"type": "Whitespace"},
@@ -552,7 +557,7 @@ mod tests {
       "decoder": null,
       "model": {
         "type": "WordLevel",
-        "vocab": {"<eos>": 0, "<bos>": 1, "DECL": 2, "user": 3, "hi": 4, "[UNK]": 5, "<|tool_call>": 6, "<tool_call|>": 7},
+        "vocab": {"<eos>": 0, "<bos>": 1, "DECL": 2, "user": 3, "hi": 4, "[UNK]": 5, "<|tool_call>": 6, "<tool_call|>": 7, "<|\"|>": 8},
         "unk_token": "[UNK]"
       }
     }"#;
@@ -812,7 +817,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(prepared.tool_registry.mode(), ToolMode::Auto);
-        assert_eq!(prepared.preserved_special_ids, vec![6, 7]);
+        assert_eq!(prepared.preserved_special_ids, vec![6, 7, 8]);
         assert_eq!(prepared.engine_request.prompt_tokens.first(), Some(&2));
     }
 

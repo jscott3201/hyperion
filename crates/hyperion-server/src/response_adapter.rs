@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
 
 use crate::dialect::Dialect;
-use crate::tool_call::{ToolCallEvent, ToolCallParser, ToolCallStats};
+use crate::tool_call::{ToolCall, ToolCallEvent, ToolCallParser, ToolCallStats};
 use crate::tool_schema::{ToolMode, ToolRegistry};
 
 /// Process-wide response nonce. Combined with the per-response call index so
@@ -83,13 +83,15 @@ impl ToolResponseAdapter {
                 vec![ResponseEvent::Text(fragment.to_owned())]
             };
         };
+        let registry = &self.registry;
+        let mut admission = |call: &ToolCall| registry.validate_generated(call).is_ok();
+        let events = parser.push_with_admission(fragment, &mut admission);
         adapt_events(
-            &self.registry,
             self.dialect,
             self.response_nonce,
             &mut self.next_call_index,
             &mut self.accepted_calls,
-            parser.push(fragment),
+            events,
         )
     }
 
@@ -101,13 +103,15 @@ impl ToolResponseAdapter {
         let Some(parser) = self.parser.as_mut() else {
             return Vec::new();
         };
+        let registry = &self.registry;
+        let mut admission = |call: &ToolCall| registry.validate_generated(call).is_ok();
+        let events = parser.finish_with_admission(&mut admission);
         adapt_events(
-            &self.registry,
             self.dialect,
             self.response_nonce,
             &mut self.next_call_index,
             &mut self.accepted_calls,
-            parser.finish(),
+            events,
         )
     }
 
@@ -147,7 +151,6 @@ impl ToolResponseAdapter {
 }
 
 fn adapt_events(
-    registry: &ToolRegistry,
     dialect: Dialect,
     response_nonce: u64,
     next_call_index: &mut usize,
@@ -159,9 +162,6 @@ fn adapt_events(
         .map(|event| match event {
             ToolCallEvent::Text(text) => ResponseEvent::Text(text),
             ToolCallEvent::Call(call) => {
-                if registry.validate_generated(&call).is_err() {
-                    return ResponseEvent::Text(call.raw);
-                }
                 let id = match dialect {
                     Dialect::OpenAi => {
                         format!("call_{response_nonce}_{}", *next_call_index + 1)
@@ -281,13 +281,54 @@ mod tests {
     #[test]
     fn validation_failure_round_trips_exact_raw_text() {
         let raw = format!("{TOOL_CALL_OPENER}lookup{{\"query\":7}}{TOOL_CALL_CLOSER}");
+        for split in 0..=raw.len() {
+            let mut adapter = ToolResponseAdapter::new(registry(), Dialect::Anthropic);
+            assert_eq!(
+                coalesce_text(collect(&mut adapter, &[&raw[..split], &raw[split..]])),
+                vec![ResponseEvent::Text(raw.clone())],
+                "split {split}"
+            );
+            assert!(!adapter.has_calls());
+            assert_eq!(adapter.stats().parsed, 1);
+            assert_eq!(adapter.stats().repaired, 1);
+            assert_eq!(adapter.stats().deduped, 0);
+            assert_eq!(adapter.stats().call_limit_exceeded, 0);
+        }
+
+        let incomplete = raw.strip_suffix(TOOL_CALL_CLOSER).unwrap();
         let mut adapter = ToolResponseAdapter::new(registry(), Dialect::Anthropic);
         assert_eq!(
-            collect(&mut adapter, &[&raw]),
-            vec![ResponseEvent::Text(raw)]
+            collect(&mut adapter, &[incomplete]),
+            vec![ResponseEvent::Text(incomplete.to_owned())]
         );
-        assert!(!adapter.has_calls());
-        assert_eq!(adapter.stats().parsed, 1);
+        assert_eq!(adapter.stats(), ToolCallStats::default());
+    }
+
+    #[test]
+    fn invalid_calls_neither_dedupe_nor_consume_the_call_limit() {
+        let invalid = format!("{TOOL_CALL_OPENER}lookup{{query:7}}{TOOL_CALL_CLOSER}");
+        let valid = format!("{TOOL_CALL_OPENER}lookup{{query:<|\"|>ok<|\"|>}}{TOOL_CALL_CLOSER}");
+        let mut adapter =
+            ToolResponseAdapter::with_limits(registry(), Dialect::OpenAi, 1, 64 * 1024);
+        let invalids = std::iter::repeat_n(invalid.as_str(), 12).collect::<Vec<_>>();
+        let mut fragments = invalids;
+        fragments.push(valid.as_str());
+
+        let events = collect(&mut adapter, &fragments);
+        assert_eq!(events.len(), 13);
+        assert!(
+            events[..12]
+                .iter()
+                .all(|event| { matches!(event, ResponseEvent::Text(text) if text == &invalid) })
+        );
+        assert!(
+            matches!(&events[12], ResponseEvent::Call(call) if call.arguments == json!({"query": "ok"}))
+        );
+        assert_eq!(adapter.stats().parsed, 13);
+        assert_eq!(adapter.stats().wellformed, 13);
+        assert_eq!(adapter.stats().repaired, 0);
+        assert_eq!(adapter.stats().deduped, 0);
+        assert_eq!(adapter.stats().call_limit_exceeded, 0);
     }
 
     #[test]

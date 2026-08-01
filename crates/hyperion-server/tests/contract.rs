@@ -56,9 +56,10 @@ const MINIMAL_TOKENIZER_JSON: &str = r#"{
 }"#;
 
 /// A model-free BPE tokenizer whose Fuse decoder concatenates native tool
-/// controls and call material exactly as Gemma 4 emits them. Only opener and
-/// closer are meant to survive selective response decoding; channel/EOS are
-/// marked special so the live adapter can prove they remain hidden.
+/// controls and call material exactly as Gemma 4 emits them. Opener, closer,
+/// and native quote markers must survive selective response decoding;
+/// channel/EOS are marked special so the live adapter can prove they remain
+/// hidden.
 const TOOL_TOKENIZER_JSON: &str = r#"{
   "version": "1.0",
   "truncation": null,
@@ -68,6 +69,7 @@ const TOOL_TOKENIZER_JSON: &str = r#"{
     {"id": 1, "content": "<bos>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
     {"id": 5, "content": "<|tool_call>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
     {"id": 6, "content": "<tool_call|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 8, "content": "<|\"|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
     {"id": 9, "content": "<|channel>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
   ],
   "normalizer": null,
@@ -91,10 +93,13 @@ const TOOL_TOKENIZER_JSON: &str = r#"{
       "[UNK]": 4,
       "<|tool_call>": 5,
       "<tool_call|>": 6,
-      "call:lookup{query:<|\"|>hi<|\"|>}": 7,
-      "call:lookup{query:<|\"|>bye<|\"|>}": 8,
+      "call:lookup{query:": 7,
+      "<|\"|>": 8,
       "<|channel>": 9,
-      "call:lookup{query:7}": 10
+      "hi": 10,
+      "bye": 11,
+      "}": 12,
+      "call:lookup{query:7}": 13
     },
     "merges": []
   }
@@ -350,6 +355,56 @@ fn streamed_text(body: &str, dialect: &str) -> String {
             _ => None,
         })
         .collect()
+}
+
+fn anthropic_stream_content(body: &str) -> serde_json::Value {
+    let events = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap());
+    let mut blocks = Vec::<serde_json::Value>::new();
+    let mut partial_inputs = Vec::<String>::new();
+
+    for event in events {
+        let Some(index) = event["index"].as_u64().map(|index| index as usize) else {
+            continue;
+        };
+        while blocks.len() <= index {
+            blocks.push(serde_json::Value::Null);
+            partial_inputs.push(String::new());
+        }
+        match event["type"].as_str() {
+            Some("content_block_start") => {
+                blocks[index] = event["content_block"].clone();
+            }
+            Some("content_block_delta") if event["delta"]["type"] == "text_delta" => {
+                let fragment = event["delta"]["text"].as_str().unwrap();
+                let block = blocks[index].as_object_mut().unwrap();
+                let mut text = block
+                    .get("text")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                text.push_str(fragment);
+                block.insert("text".to_owned(), serde_json::Value::String(text));
+            }
+            Some("content_block_delta") if event["delta"]["type"] == "input_json_delta" => {
+                partial_inputs[index].push_str(event["delta"]["partial_json"].as_str().unwrap());
+            }
+            _ => {}
+        }
+    }
+
+    for (index, partial) in partial_inputs.into_iter().enumerate() {
+        if !partial.is_empty() {
+            blocks[index]
+                .as_object_mut()
+                .unwrap()
+                .insert("input".to_owned(), serde_json::from_str(&partial).unwrap());
+        }
+    }
+    assert!(blocks.iter().all(|block| !block.is_null()));
+    serde_json::Value::Array(blocks)
 }
 
 #[tokio::test]
@@ -712,9 +767,15 @@ async fn omitted_or_auto_tool_choice_reaches_engine_for_both_dialects() {
 }
 
 #[tokio::test]
-async fn auto_without_native_delimiters_fails_before_engine() {
+async fn auto_without_native_quote_fails_before_engine() {
     let control = fresh_control();
     let calls = Arc::new(AtomicUsize::new(0));
+    let tokenizer_without_quote = TOOL_TOKENIZER_JSON
+        .replace(
+            "    {\"id\": 8, \"content\": \"<|\\\"|>\", \"single_word\": false, \"lstrip\": false, \"rstrip\": false, \"normalized\": false, \"special\": true},\n",
+            "",
+        )
+        .replace("      \"<|\\\"|>\": 8,\n", "");
     let server = test_server_with_engine(
         Arc::new(CountingEngine {
             calls: calls.clone(),
@@ -723,7 +784,7 @@ async fn auto_without_native_delimiters_fails_before_engine() {
         None,
         4096,
         &control,
-        MINIMAL_TOKENIZER_JSON,
+        &tokenizer_without_quote,
     );
     let body = serde_json::json!({
         "messages": [{"role": "user", "content": "hi"}],
@@ -750,7 +811,7 @@ async fn non_streaming_native_tool_shapes_are_provider_compatible() {
     let openai_control = fresh_control();
     let openai = test_server_with_tokenizer(
         StubEngine {
-            tokens: vec![9, 5, 7, 6],
+            tokens: vec![9, 5, 7, 8, 10, 8, 12, 6],
             block_after: None,
         },
         None,
@@ -778,8 +839,12 @@ async fn non_streaming_native_tool_shapes_are_provider_compatible() {
     assert_eq!(choice["finish_reason"], "tool_calls");
     assert!(choice["message"]["content"].is_null());
     let call = &choice["message"]["tool_calls"][0];
-    let id = call["id"].as_str().unwrap();
+    let id = call["id"].as_str().unwrap().to_owned();
     assert!(id.starts_with("call_") && id.ends_with("_1"));
+    assert!(
+        call.get("index").is_none(),
+        "non-streaming tool calls remain valid history without an index"
+    );
     assert_eq!(call["type"], "function");
     assert_eq!(call["function"]["name"], "lookup");
     let arguments: serde_json::Value =
@@ -787,10 +852,30 @@ async fn non_streaming_native_tool_shapes_are_provider_compatible() {
     assert_eq!(arguments, serde_json::json!({"query": "hi"}));
     assert!(!body.contains("<|channel>"));
 
+    let replay_body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "hi"},
+            choice["message"].clone(),
+            {"role": "tool", "tool_call_id": id, "content": "ok"},
+        ],
+        "tools": [openai_tool()],
+        "tool_choice": "none"
+    })
+    .to_string();
+    let (status, replay) = send(
+        openai.router(),
+        Method::POST,
+        "/v1/chat/completions",
+        &[("content-type", "application/json")],
+        &replay_body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "OpenAI response replay: {replay}");
+
     let anthropic_control = fresh_control();
     let anthropic = test_server_with_tokenizer(
         StubEngine {
-            tokens: vec![2, 5, 7, 6, 3],
+            tokens: vec![2, 5, 7, 8, 10, 8, 12, 6, 3],
             block_after: None,
         },
         None,
@@ -820,11 +905,39 @@ async fn non_streaming_native_tool_shapes_are_provider_compatible() {
     assert_eq!(response["content"][0]["text"], "hello");
     let call = &response["content"][1];
     assert_eq!(call["type"], "tool_use");
-    let id = call["id"].as_str().unwrap();
+    let id = call["id"].as_str().unwrap().to_owned();
     assert!(id.starts_with("toolu_") && id.ends_with("_1"));
     assert_eq!(call["name"], "lookup");
     assert_eq!(call["input"], serde_json::json!({"query": "hi"}));
     assert_eq!(response["content"][2]["text"], "world");
+
+    let replay_body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": response["content"].clone()},
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": id, "content": "ok"}],
+            },
+        ],
+        "max_tokens": 8,
+        "tools": [anthropic_tool()],
+        "tool_choice": {"type": "none"}
+    })
+    .to_string();
+    let (status, replay) = send(
+        anthropic.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        &replay_body,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "Anthropic response replay: {replay}"
+    );
 }
 
 #[tokio::test]
@@ -832,7 +945,7 @@ async fn streaming_native_tool_shapes_preserve_mixed_order_and_indices() {
     let openai_control = fresh_control();
     let openai = test_server_with_tokenizer(
         StubEngine {
-            tokens: vec![2, 5, 7, 6, 3, 5, 8, 6],
+            tokens: vec![2, 5, 7, 8, 10, 8, 12, 6, 3, 5, 7, 8, 11, 8, 12, 6],
             block_after: None,
         },
         None,
@@ -890,7 +1003,7 @@ async fn streaming_native_tool_shapes_preserve_mixed_order_and_indices() {
     let anthropic_control = fresh_control();
     let anthropic = test_server_with_tokenizer(
         StubEngine {
-            tokens: vec![2, 5, 7, 6, 3, 5, 8, 6],
+            tokens: vec![2, 5, 7, 8, 10, 8, 12, 6, 3, 5, 7, 8, 11, 8, 12, 6],
             block_after: None,
         },
         None,
@@ -955,6 +1068,45 @@ async fn streaming_native_tool_shapes_preserve_mixed_order_and_indices() {
         event["type"] == "message_delta" && event["delta"]["stop_reason"] == "tool_use"
     }));
     assert_eq!(streamed_text(&anthropic_sse, "anthropic"), "helloworld");
+
+    let content = anthropic_stream_content(&anthropic_sse);
+    let results = content
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|block| block["type"] == "tool_use")
+        .map(|block| {
+            serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": block["id"].clone(),
+                "content": "ok",
+            })
+        })
+        .collect::<Vec<_>>();
+    let replay_body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": content},
+            {"role": "user", "content": results},
+        ],
+        "max_tokens": 16,
+        "tools": [anthropic_tool()],
+        "tool_choice": {"type": "none"}
+    })
+    .to_string();
+    let (status, replay) = send(
+        anthropic.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        &replay_body,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "streamed Anthropic response replay: {replay}"
+    );
 }
 
 #[tokio::test]
@@ -962,7 +1114,7 @@ async fn invalid_calls_round_trip_and_duplicate_stats_aggregate_once() {
     let invalid_control = fresh_control();
     let invalid = test_server_with_tokenizer(
         StubEngine {
-            tokens: vec![5, 10, 6],
+            tokens: vec![5, 13, 6],
             block_after: None,
         },
         None,
@@ -995,7 +1147,7 @@ async fn invalid_calls_round_trip_and_duplicate_stats_aggregate_once() {
     let duplicate_control = fresh_control();
     let duplicate = test_server_with_tokenizer(
         StubEngine {
-            tokens: vec![5, 7, 6, 5, 7, 6],
+            tokens: vec![5, 7, 8, 10, 8, 12, 6, 5, 7, 8, 10, 8, 12, 6],
             block_after: None,
         },
         None,
