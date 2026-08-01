@@ -2993,7 +2993,7 @@ async fn real_http_sse_matches_m2_golden() {
 
     let config = std::fs::read_to_string(artifact.join("config.json"))
         .expect("artifact identity: 12B config.json is readable");
-    let geometry = hyperion_model::geometry::Geometry::from_text_config_str(&config)
+    let geometry = hyperion_model::geometry::Geometry::from_config_str(&config)
         .expect("artifact identity: 12B geometry parses");
     let tokenizer = TokenizerHandle::from_file(&artifact.join("tokenizer.json"))
         .expect("artifact identity: tokenizer loads");
