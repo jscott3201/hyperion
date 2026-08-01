@@ -16,6 +16,8 @@
 //!   shutdown) (B6).
 //! - [`tool_call`] — transport-neutral incremental Gemma 4 tool-call parsing,
 //!   bounded dedupe, finite repair, and raw-fidelity telemetry.
+//! - [`history`] — bounded OpenAI/Anthropic tool-history normalization into
+//!   renderer-safe, transport-neutral message chains.
 //! - [`tool_schema`] — bounded provider tool normalization and generated-call
 //!   schema validation, kept independent of the HTTP adapters.
 //! - [`server`] — the axum router, the single-flight `Semaphore(1)` → 429, the
@@ -25,6 +27,7 @@ pub mod auth;
 pub mod control;
 pub mod dialect;
 pub mod engine;
+pub mod history;
 pub mod prepare;
 pub mod server;
 pub mod sse;

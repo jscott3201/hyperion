@@ -12,9 +12,9 @@ use crate::tool_call::ToolCall;
 const MAX_DECLARATIONS: usize = 128;
 const MAX_DECLARATION_BYTES: usize = 512 * 1024;
 const MAX_SCHEMA_NODES: usize = 4_096;
-const MAX_DEPTH: usize = 48;
-const MAX_ARGUMENT_NODES: usize = 4_096;
-const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_DEPTH: usize = 48;
+pub(crate) const MAX_ARGUMENT_NODES: usize = 4_096;
+pub(crate) const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
 
 const RESERVED_CONTROLS: &[&str] = &[
     "<bos>",
@@ -144,11 +144,19 @@ impl ToolRegistry {
     }
 
     pub fn validate_generated(&self, call: &ToolCall) -> Result<(), ToolValidationError> {
-        let schema = self.validators.get(&call.name).ok_or_else(|| {
-            ToolValidationError(format!("tool call $.name: unknown tool {:?}", call.name))
+        self.validate_call_arguments(&call.name, &call.arguments)
+    }
+
+    pub(crate) fn validate_call_arguments(
+        &self,
+        name: &str,
+        arguments: &Value,
+    ) -> Result<(), ToolValidationError> {
+        let schema = self.validators.get(name).ok_or_else(|| {
+            ToolValidationError(format!("tool call $.name: unknown tool {name:?}"))
         })?;
-        validate_argument_budget(&call.arguments)?;
-        schema.validate(&call.arguments, "$.arguments")
+        validate_argument_budget(arguments)?;
+        schema.validate(arguments, "$.arguments")
     }
 
     fn compile_openai(tools: &[Value], mode: ToolMode) -> Result<Self, ToolSchemaError> {
@@ -965,7 +973,7 @@ fn inspect_schema_tree(
     Ok(())
 }
 
-fn validate_tool_name(name: &str, path: &str) -> Result<(), ToolSchemaError> {
+pub(crate) fn validate_tool_name(name: &str, path: &str) -> Result<(), ToolSchemaError> {
     if name.is_empty()
         || name.len() > 64
         || !name
@@ -999,16 +1007,20 @@ fn validate_argument_key(key: &str, path: &str) -> Result<(), ToolValidationErro
 }
 
 fn reject_reserved(value: &str, path: &str) -> Result<(), ToolSchemaError> {
-    if let Some(control) = RESERVED_CONTROLS
-        .iter()
-        .find(|control| value.contains(**control))
-    {
+    if let Some(control) = reserved_control(value) {
         return Err(error(
             path,
             format_args!("contains reserved control token {control:?}"),
         ));
     }
     Ok(())
+}
+
+pub(crate) fn reserved_control(value: &str) -> Option<&'static str> {
+    RESERVED_CONTROLS
+        .iter()
+        .copied()
+        .find(|control| value.contains(control))
 }
 
 fn expect_object<'a>(
