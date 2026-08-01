@@ -3324,10 +3324,9 @@ fn canonical_server_result(first: &Value, final_turn: &Value) -> Result<Value, E
 }
 
 fn assemble_server_chunks(chunks: &[Value]) -> Result<Value, Error> {
-    validate_server_chunk_stream(chunks)?;
+    let tool_calls = validate_server_chunk_stream(chunks)?;
     let mut content = String::new();
     let mut reasoning = String::new();
-    let mut tool_calls = Vec::<Value>::new();
     let mut finish_reasons = Vec::<Value>::new();
     let mut usage = Value::Null;
     for chunk in chunks {
@@ -3356,15 +3355,6 @@ fn assemble_server_chunks(chunks: &[Value]) -> Result<Value, Error> {
                 if let Some(piece) = reasoning_piece {
                     reasoning.push_str(piece);
                 }
-                if let Some(calls) = delta.get("tool_calls").filter(|value| !value.is_null()) {
-                    tool_calls.extend(
-                        calls
-                            .as_array()
-                            .ok_or_else(|| Error::new("server SSE tool_calls is not an array"))?
-                            .iter()
-                            .cloned(),
-                    );
-                }
             }
             if let Some(reason) = choice.get("finish_reason").filter(|value| !value.is_null()) {
                 if !reason.is_string() {
@@ -3383,13 +3373,160 @@ fn assemble_server_chunks(chunks: &[Value]) -> Result<Value, Error> {
     }))
 }
 
-fn validate_server_chunk_stream(chunks: &[Value]) -> Result<(), Error> {
+#[derive(Default)]
+struct PartialSseToolCall {
+    id: Option<String>,
+    call_type: Option<String>,
+    name: Option<String>,
+    arguments: String,
+    saw_arguments: bool,
+}
+
+const MAX_SSE_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
+
+#[derive(Default)]
+struct SseToolCallAssembler {
+    calls: BTreeMap<u64, PartialSseToolCall>,
+}
+
+impl SseToolCallAssembler {
+    fn merge(&mut self, value: &Value) -> Result<(), Error> {
+        if !object_has_only_keys(value, &["index", "id", "type", "function"])
+            || value.get("index").is_none()
+        {
+            return Err(Error::new("server SSE tool-call delta has invalid keys"));
+        }
+        let index = value
+            .get("index")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| Error::new("server SSE tool-call delta index is not an integer"))?;
+        if index >= 8 {
+            return Err(Error::new(
+                "server SSE tool-call delta index is outside 0..8",
+            ));
+        }
+        if !self.calls.contains_key(&index) && self.calls.len() >= 8 {
+            return Err(Error::new("server SSE has more than eight tool calls"));
+        }
+        let call = self.calls.entry(index).or_default();
+        if let Some(id) = value.get("id") {
+            let id = id
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| Error::new("server SSE tool-call delta id is invalid"))?;
+            merge_identity(&mut call.id, id, "id")?;
+        }
+        if let Some(call_type) = value.get("type") {
+            let call_type = call_type
+                .as_str()
+                .filter(|call_type| *call_type == "function")
+                .ok_or_else(|| Error::new("server SSE tool-call delta type is invalid"))?;
+            merge_identity(&mut call.call_type, call_type, "type")?;
+        }
+        if let Some(function) = value.get("function") {
+            if !object_has_only_keys(function, &["name", "arguments"])
+                || function.as_object().is_none_or(serde_json::Map::is_empty)
+            {
+                return Err(Error::new(
+                    "server SSE tool-call function delta has invalid keys",
+                ));
+            }
+            if let Some(name) = function.get("name") {
+                let name = name
+                    .as_str()
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| Error::new("server SSE tool-call delta name is invalid"))?;
+                merge_identity(&mut call.name, name, "name")?;
+            }
+            if let Some(arguments) = function.get("arguments") {
+                let arguments = arguments.as_str().ok_or_else(|| {
+                    Error::new("server SSE tool-call delta arguments are not a string")
+                })?;
+                let retained_len = call
+                    .arguments
+                    .len()
+                    .checked_add(arguments.len())
+                    .ok_or_else(|| Error::new("server SSE tool-call arguments length overflow"))?;
+                if retained_len > MAX_SSE_TOOL_ARGUMENT_BYTES {
+                    return Err(Error::new(format!(
+                        "server SSE tool-call arguments exceed {MAX_SSE_TOOL_ARGUMENT_BYTES} bytes"
+                    )));
+                }
+                call.arguments.push_str(arguments);
+                call.saw_arguments = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Vec<Value>, Error> {
+        let mut materialized = Vec::with_capacity(self.calls.len());
+        for (expected, (index, call)) in self.calls.into_iter().enumerate() {
+            if index != expected as u64 {
+                return Err(Error::new(
+                    "server SSE tool-call indices are not contiguous from zero",
+                ));
+            }
+            let id = call.id.ok_or_else(|| {
+                Error::new(format!("server SSE tool call {index} lacks final id"))
+            })?;
+            let call_type = call.call_type.ok_or_else(|| {
+                Error::new(format!("server SSE tool call {index} lacks final type"))
+            })?;
+            let name = call.name.ok_or_else(|| {
+                Error::new(format!("server SSE tool call {index} lacks final name"))
+            })?;
+            if !call.saw_arguments {
+                return Err(Error::new(format!(
+                    "server SSE tool call {index} lacks final arguments"
+                )));
+            }
+            let parsed: Value = serde_json::from_str(&call.arguments).map_err(|error| {
+                Error::new(format!(
+                    "server SSE tool call {index} arguments are invalid JSON: {error}"
+                ))
+            })?;
+            if !parsed.is_object() {
+                return Err(Error::new(format!(
+                    "server SSE tool call {index} arguments are not an object"
+                )));
+            }
+            let value = json!({
+                "index": index,
+                "id": id,
+                "type": call_type,
+                "function": {"name": name, "arguments": call.arguments},
+            });
+            if !valid_sse_tool_call(&value) {
+                return Err(Error::new(
+                    "materialized server SSE tool call has an invalid final schema",
+                ));
+            }
+            materialized.push(value);
+        }
+        Ok(materialized)
+    }
+}
+
+fn merge_identity(slot: &mut Option<String>, fragment: &str, field: &str) -> Result<(), Error> {
+    if slot.as_deref().is_some_and(|current| current != fragment) {
+        return Err(Error::new(format!(
+            "server SSE tool-call delta has conflicting {field}"
+        )));
+    }
+    slot.get_or_insert_with(|| fragment.to_owned());
+    Ok(())
+}
+
+fn validate_server_chunk_stream(chunks: &[Value]) -> Result<Vec<Value>, Error> {
     if chunks.is_empty() {
         return Err(Error::new("server SSE emitted no JSON chunks"));
     }
     let mut identity = None::<(String, String, String, u64)>;
     let mut usage_indexes = Vec::new();
-    let mut finish_reasons = 0_u32;
+    let mut finish_reason = None::<String>;
+    let mut tool_calls = SseToolCallAssembler::default();
+    let mut saw_tool_delta = false;
     for (index, chunk) in chunks.iter().enumerate() {
         if !object_has_only_keys(
             chunk,
@@ -3472,6 +3609,11 @@ fn validate_server_chunk_stream(chunks: &[Value]) -> Result<(), Error> {
             usage_indexes.push(index);
             continue;
         }
+        if finish_reason.is_some() {
+            return Err(Error::new(
+                "server SSE choice chunk appeared after the finish reason",
+            ));
+        }
         if chunk.get("usage").is_some_and(|usage| !usage.is_null())
             || string_field(chunk, "object")? != "chat.completion.chunk"
         {
@@ -3486,10 +3628,11 @@ fn validate_server_chunk_stream(chunks: &[Value]) -> Result<(), Error> {
             return Err(Error::new("server SSE choice keys or index are invalid"));
         }
         if let Some(reason) = choice.get("finish_reason").filter(|value| !value.is_null()) {
-            if !reason.is_string() {
-                return Err(Error::new("server SSE finish reason is not a string"));
-            }
-            finish_reasons += 1;
+            let reason = reason
+                .as_str()
+                .filter(|reason| !reason.is_empty())
+                .ok_or_else(|| Error::new("server SSE finish reason is not a string"))?;
+            finish_reason = Some(reason.to_owned());
         }
         let delta = choice
             .get("delta")
@@ -3520,19 +3663,28 @@ fn validate_server_chunk_stream(chunks: &[Value]) -> Result<(), Error> {
             let calls = calls
                 .as_array()
                 .ok_or_else(|| Error::new("server SSE delta.tool_calls is not an array"))?;
-            if calls.iter().any(|call| !valid_sse_tool_call(call)) {
-                return Err(Error::new(
-                    "server SSE tool call or function has an invalid nested schema",
-                ));
+            for call in calls {
+                saw_tool_delta = true;
+                tool_calls.merge(call)?;
             }
         }
     }
-    if usage_indexes != [chunks.len() - 1] || finish_reasons != 1 {
+    let finish_reason = finish_reason.ok_or_else(|| {
+        Error::new("server SSE requires one finish reason and one terminal usage chunk")
+    })?;
+    if usage_indexes != [chunks.len() - 1] {
         return Err(Error::new(
             "server SSE requires one finish reason and one terminal usage chunk",
         ));
     }
-    Ok(())
+    if (saw_tool_delta && finish_reason != "tool_calls")
+        || (!saw_tool_delta && finish_reason == "tool_calls")
+    {
+        return Err(Error::new(
+            "server SSE tool deltas and finish reason are inconsistent",
+        ));
+    }
+    tool_calls.finish()
 }
 
 fn object_has_only_keys(value: &Value, allowed: &[&str]) -> bool {
@@ -5571,6 +5723,355 @@ mod tests {
         mistyped_arguments[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] =
             json!({});
         assert!(validate_server_chunk_stream(&mistyped_arguments).is_err());
+    }
+
+    fn synthetic_sse_chunk(delta: Value, finish_reason: Value) -> Value {
+        json!({
+            "id": "chatcmpl-synthetic",
+            "system_fingerprint": "mlx-lm-0.31.3",
+            "object": "chat.completion.chunk",
+            "model": "default_model",
+            "created": 1,
+            "choices": [{"index": 0, "finish_reason": finish_reason, "delta": delta}],
+        })
+    }
+
+    fn synthetic_usage_chunk() -> Value {
+        json!({
+            "id": "chatcmpl-synthetic",
+            "system_fingerprint": "mlx-lm-0.31.3",
+            "object": "chat.completion",
+            "model": "default_model",
+            "created": 1,
+            "choices": [],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+        })
+    }
+
+    fn assemble_tool_deltas(deltas: Vec<Value>) -> Result<Value, Error> {
+        let final_index = deltas.len().saturating_sub(1);
+        let mut chunks = deltas
+            .into_iter()
+            .enumerate()
+            .map(|(index, delta)| {
+                synthetic_sse_chunk(
+                    json!({"tool_calls": [delta]}),
+                    if index == final_index {
+                        json!("tool_calls")
+                    } else {
+                        Value::Null
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        chunks.push(synthetic_usage_chunk());
+        assemble_server_chunks(&chunks)
+    }
+
+    #[test]
+    fn server_sse_assembles_sparse_and_interleaved_tool_deltas_by_index() {
+        let assembled = assemble_tool_deltas(vec![
+            json!({"index": 1, "function": {"arguments": "{\"second\":"}}),
+            json!({"index": 0, "id": "call-zero", "type": "function", "function": {"name": "get_points"}}),
+            json!({"index": 1, "id": "call-one", "type": "function", "function": {"name": "lookup_rule"}}),
+            json!({"index": 0, "id": "call-zero", "function": {"name": "get_points", "arguments": "{\"filter\":"}}),
+            json!({"index": 0, "function": {"arguments": ""}}),
+            json!({"index": 1, "function": {"arguments": "1}"}}),
+            json!({"index": 0, "function": {"arguments": "\"site:HQ\"}"}}),
+        ])
+        .unwrap();
+        assert_eq!(
+            assembled["tool_calls"],
+            json!([
+                {
+                    "index": 0,
+                    "id": "call-zero",
+                    "type": "function",
+                    "function": {"name": "get_points", "arguments": "{\"filter\":\"site:HQ\"}"},
+                },
+                {
+                    "index": 1,
+                    "id": "call-one",
+                    "type": "function",
+                    "function": {"name": "lookup_rule", "arguments": "{\"second\":1}"},
+                },
+            ])
+        );
+        assert_eq!(assembled["finish_reasons"], json!(["tool_calls"]));
+    }
+
+    #[test]
+    fn server_sse_full_tool_delta_remains_byte_identical() {
+        let call = json!({
+            "index": 0,
+            "id": "call-synthetic",
+            "type": "function",
+            "function": {"name": "get_points", "arguments": "{\"filter\":\"site:HQ\"}"},
+        });
+        let assembled = assemble_tool_deltas(vec![call.clone()]).unwrap();
+        assert_eq!(assembled["tool_calls"], json!([call]));
+    }
+
+    #[test]
+    fn server_sse_rejects_tool_delta_conflicts_and_invalid_partial_shapes() {
+        let base = [
+            json!({"index": 0, "id": "call-a", "type": "function", "function": {"name": "get_points", "arguments": "{}"}}),
+        ];
+        let cases = [
+            (
+                vec![base[0].clone(), json!({"index": 0, "id": "call-b"})],
+                "conflicting id",
+            ),
+            (
+                vec![
+                    base[0].clone(),
+                    json!({"index": 0, "function": {"name": "lookup_rule"}}),
+                ],
+                "conflicting name",
+            ),
+            (vec![json!({"index": 0, "extra": true})], "invalid keys"),
+            (vec![json!({"index": "0"})], "index is not an integer"),
+            (vec![json!({"index": 8})], "outside 0..8"),
+            (vec![json!({"index": 0, "id": null})], "id is invalid"),
+            (vec![json!({"index": 0, "type": null})], "type is invalid"),
+            (
+                vec![json!({"index": 0, "type": "computer"})],
+                "type is invalid",
+            ),
+            (
+                vec![json!({"index": 0, "function": null})],
+                "function delta has invalid keys",
+            ),
+            (
+                vec![json!({"index": 0, "function": {}})],
+                "function delta has invalid keys",
+            ),
+            (
+                vec![json!({"index": 0, "function": {"name": null}})],
+                "name is invalid",
+            ),
+            (
+                vec![json!({"index": 0, "function": {"arguments": null}})],
+                "arguments are not a string",
+            ),
+        ];
+        for (deltas, expected) in cases {
+            let error = assemble_tool_deltas(deltas).unwrap_err().to_string();
+            assert!(
+                error.contains(expected),
+                "{error:?} did not contain {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_sse_bounds_tool_call_count_before_materialization() {
+        let deltas = (0..=8)
+            .map(|index| {
+                json!({
+                    "index": index,
+                    "id": format!("call-{index}"),
+                    "type": "function",
+                    "function": {"name": "lookup_rule", "arguments": "{}"},
+                })
+            })
+            .collect();
+        assert!(
+            assemble_tool_deltas(deltas)
+                .unwrap_err()
+                .to_string()
+                .contains("outside 0..8")
+        );
+    }
+
+    #[test]
+    fn server_sse_bounds_retained_argument_bytes_before_mutation() {
+        let at_limit = format!(
+            "{{\"x\":\"{}\"}}",
+            "a".repeat(MAX_SSE_TOOL_ARGUMENT_BYTES - 8)
+        );
+        assert_eq!(at_limit.len(), MAX_SSE_TOOL_ARGUMENT_BYTES);
+        let assembled = assemble_tool_deltas(vec![json!({
+            "index": 0,
+            "id": "call-zero",
+            "type": "function",
+            "function": {"name": "lookup_rule", "arguments": at_limit},
+        })])
+        .unwrap();
+        assert_eq!(
+            assembled["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap()
+                .len(),
+            MAX_SSE_TOOL_ARGUMENT_BYTES
+        );
+
+        let mut assembler = SseToolCallAssembler::default();
+        assembler
+            .merge(&json!({
+                "index": 0,
+                "id": "call-zero",
+                "type": "function",
+                "function": {"name": "lookup_rule"},
+            }))
+            .unwrap();
+        let over_limit = format!(
+            "{{\"x\":\"{}\"}}",
+            "a".repeat(MAX_SSE_TOOL_ARGUMENT_BYTES - 7)
+        );
+        assert_eq!(over_limit.len(), MAX_SSE_TOOL_ARGUMENT_BYTES + 1);
+        assert!(
+            serde_json::from_str::<Value>(&over_limit)
+                .unwrap()
+                .is_object()
+        );
+        let error = assembler
+            .merge(&json!({"index": 0, "function": {"arguments": over_limit}}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceed 65536 bytes"));
+        assert!(assembler.calls[&0].arguments.is_empty());
+        assert!(!assembler.calls[&0].saw_arguments);
+    }
+
+    #[test]
+    fn server_sse_materializes_multiple_calls_from_one_delta_in_index_order() {
+        let chunks = vec![
+            synthetic_sse_chunk(
+                json!({"tool_calls": [
+                    {"index": 1, "id": "call-one", "type": "function", "function": {"name": "lookup_rule", "arguments": "{\"rule_id\":\"R1\"}"}},
+                    {"index": 0, "id": "call-zero", "type": "function", "function": {"name": "get_points", "arguments": "{\"filter\":\"site:HQ\"}"}},
+                ]}),
+                json!("tool_calls"),
+            ),
+            synthetic_usage_chunk(),
+        ];
+        let assembled = assemble_server_chunks(&chunks).unwrap();
+        assert_eq!(
+            assembled["tool_calls"],
+            json!([
+                {"index": 0, "id": "call-zero", "type": "function", "function": {"name": "get_points", "arguments": "{\"filter\":\"site:HQ\"}"}},
+                {"index": 1, "id": "call-one", "type": "function", "function": {"name": "lookup_rule", "arguments": "{\"rule_id\":\"R1\"}"}},
+            ])
+        );
+    }
+
+    #[test]
+    fn server_sse_rejects_incomplete_or_non_object_materialized_calls() {
+        let cases = [
+            (
+                vec![
+                    json!({"index": 1, "id": "call-one", "type": "function", "function": {"name": "lookup_rule", "arguments": "{}"}}),
+                ],
+                "not contiguous",
+            ),
+            (
+                vec![
+                    json!({"index": 0, "type": "function", "function": {"name": "lookup_rule", "arguments": "{}"}}),
+                ],
+                "lacks final id",
+            ),
+            (
+                vec![
+                    json!({"index": 0, "id": "call-zero", "function": {"name": "lookup_rule", "arguments": "{}"}}),
+                ],
+                "lacks final type",
+            ),
+            (
+                vec![
+                    json!({"index": 0, "id": "call-zero", "type": "function", "function": {"arguments": "{}"}}),
+                ],
+                "lacks final name",
+            ),
+            (
+                vec![
+                    json!({"index": 0, "id": "call-zero", "type": "function", "function": {"name": "lookup_rule"}}),
+                ],
+                "lacks final arguments",
+            ),
+            (
+                vec![
+                    json!({"index": 0, "id": "call-zero", "type": "function", "function": {"name": "lookup_rule", "arguments": ""}}),
+                ],
+                "invalid JSON",
+            ),
+            (
+                vec![
+                    json!({"index": 0, "id": "call-zero", "type": "function", "function": {"name": "lookup_rule", "arguments": "{"}}),
+                ],
+                "invalid JSON",
+            ),
+            (
+                vec![
+                    json!({"index": 0, "id": "call-zero", "type": "function", "function": {"name": "lookup_rule", "arguments": "null"}}),
+                ],
+                "not an object",
+            ),
+            (
+                vec![
+                    json!({"index": 0, "id": "call-zero", "type": "function", "function": {"name": "lookup_rule", "arguments": "[]"}}),
+                ],
+                "not an object",
+            ),
+            (
+                vec![
+                    json!({"index": 0, "id": "call-zero", "type": "function", "function": {"name": "lookup_rule", "arguments": "1"}}),
+                ],
+                "not an object",
+            ),
+        ];
+        for (deltas, expected) in cases {
+            let error = assemble_tool_deltas(deltas).unwrap_err().to_string();
+            assert!(
+                error.contains(expected),
+                "{error:?} did not contain {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_sse_enforces_finish_reason_and_terminal_usage_protocol() {
+        let usage = synthetic_usage_chunk();
+        let tool = json!({"tool_calls": [{"index": 0, "id": "call-zero", "type": "function", "function": {"name": "lookup_rule", "arguments": "{}"}}]});
+
+        let after_finish = vec![
+            synthetic_sse_chunk(json!({}), json!("stop")),
+            synthetic_sse_chunk(json!({"content": "late"}), Value::Null),
+            usage.clone(),
+        ];
+        assert!(
+            assemble_server_chunks(&after_finish)
+                .unwrap_err()
+                .to_string()
+                .contains("after the finish reason")
+        );
+
+        let wrong_tool_finish = vec![synthetic_sse_chunk(tool, json!("stop")), usage.clone()];
+        assert!(
+            assemble_server_chunks(&wrong_tool_finish)
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent")
+        );
+
+        let no_tools = vec![
+            synthetic_sse_chunk(json!({}), json!("tool_calls")),
+            usage.clone(),
+        ];
+        assert!(
+            assemble_server_chunks(&no_tools)
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent")
+        );
+
+        let usage_not_last = vec![usage, synthetic_sse_chunk(json!({}), json!("stop"))];
+        assert!(
+            assemble_server_chunks(&usage_not_last)
+                .unwrap_err()
+                .to_string()
+                .contains("terminal usage")
+        );
     }
 
     #[test]
