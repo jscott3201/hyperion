@@ -36,6 +36,27 @@ use hyperion_model::geometry::Geometry;
 /// slicing.
 pub const PREFILL_CHUNK: usize = 2048;
 
+// `hyp_decode_block_sampled` resets its local RNG state from `config.seed` on
+// every FFI call, then advances it with this LCG once per decoded token. The
+// Rust engine calls native with `n_tokens=1`, so it must carry the same state
+// across calls: prefill consumes the request seed, decode token 2 consumes the
+// first successor, and so on. Keep these constants identical to model.cc's
+// native per-step sampling contract.
+const NATIVE_SAMPLING_LCG_MULTIPLIER: u64 = 6_364_136_223_846_793_005;
+const NATIVE_SAMPLING_LCG_INCREMENT: u64 = 1_442_695_040_888_963_407;
+
+#[must_use]
+fn next_sampling_seed(seed: u64) -> u64 {
+    seed.wrapping_mul(NATIVE_SAMPLING_LCG_MULTIPLIER)
+        .wrapping_add(NATIVE_SAMPLING_LCG_INCREMENT)
+}
+
+fn advance_sampling_seed(sampling: &mut Option<HypSamplingConfig>) {
+    if let Some(config) = sampling {
+        config.seed = next_sampling_seed(config.seed);
+    }
+}
+
 /// A single-flight generation is busy — the second concurrent request is
 /// rejected with HTTP 429 (06 §Concurrency). This guard is the model-free
 /// primitive the axum layer will sit a `Semaphore(1)` on top of.
@@ -397,35 +418,37 @@ impl Engine {
                 message: "prompt_tokens is empty".into(),
             }));
         }
+        // A zero completion budget is a successful no-op. Return before
+        // allocating a per-request KV or invoking native prefill.
+        if request.max_tokens == 0 {
+            return Ok(Vec::new());
+        }
+        let mut sampling = request.sampling;
         let mut generation = Generation {
             kvstate: KvState::create(&self.model)?,
         };
         if cancel.is_cancelled() {
             return Err(EngineError::Cancelled);
         }
-        let prefill = self.prefill(
-            &mut generation,
-            &request.prompt_tokens,
-            request.sampling.as_ref(),
-        )?;
+        let prefill = self.prefill(&mut generation, &request.prompt_tokens, sampling.as_ref())?;
+        advance_sampling_seed(&mut sampling);
         if cancel.is_cancelled() {
             return Err(EngineError::Cancelled);
         }
         let mut generated = Vec::with_capacity(request.max_tokens as usize);
-        if request.max_tokens > 0 {
-            generated.push(prefill.id);
-            if cancel.is_cancelled() {
-                return Err(EngineError::Cancelled);
-            }
-            if request.eos_token_id == Some(prefill.id) {
-                return Ok(generated);
-            }
+        generated.push(prefill.id);
+        if cancel.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
+        if request.eos_token_id == Some(prefill.id) {
+            return Ok(generated);
         }
         while generated.len() < request.max_tokens as usize {
             if cancel.is_cancelled() {
                 return Err(EngineError::Cancelled);
             }
-            let step = self.decode_step(&mut generation, request.sampling.as_ref())?;
+            let step = self.decode_step(&mut generation, sampling.as_ref())?;
+            advance_sampling_seed(&mut sampling);
             if cancel.is_cancelled() {
                 return Err(EngineError::Cancelled);
             }
@@ -473,6 +496,26 @@ impl Engine {
             }));
         }
 
+        // No KV state or native prefill is needed when the caller requested no
+        // completion tokens. A successful stream still consists of exactly its
+        // terminal usage event; a pre-cancelled request or dropped receiver is
+        // still reported as cancellation.
+        if request.max_tokens == 0 {
+            let usage = Usage {
+                prompt_tokens: u32::try_from(request.prompt_tokens.len()).unwrap_or(u32::MAX),
+                completion_tokens: 0,
+            };
+            if cancel.is_cancelled() {
+                return Err(EngineError::Cancelled);
+            }
+            if tx.blocking_send(StepEvent::Done(usage)).is_err() {
+                return Err(EngineError::Cancelled);
+            }
+            return Ok(usage);
+        }
+
+        let mut sampling = request.sampling;
+
         // Per-request KV (reset-around-every-generation). A fresh KvState
         // means no cross-request leakage; drop at the end of the scope frees it.
         let mut generation = Generation {
@@ -482,25 +525,19 @@ impl Engine {
             return Err(EngineError::Cancelled);
         }
 
-        let prefill = self.prefill(
-            &mut generation,
-            &request.prompt_tokens,
-            request.sampling.as_ref(),
-        )?;
+        let prefill = self.prefill(&mut generation, &request.prompt_tokens, sampling.as_ref())?;
+        advance_sampling_seed(&mut sampling);
         if cancel.is_cancelled() {
             return Err(EngineError::Cancelled);
         }
 
-        let mut completion_tokens = 0u32;
+        let mut completion_tokens = 1u32;
         let prefill_is_eos = request.eos_token_id == Some(prefill.id);
-        if request.max_tokens > 0 {
-            if tx.blocking_send(StepEvent::Token(prefill)).is_err() {
-                return Err(EngineError::Cancelled);
-            }
-            completion_tokens = 1;
-            if cancel.is_cancelled() {
-                return Err(EngineError::Cancelled);
-            }
+        if tx.blocking_send(StepEvent::Token(prefill)).is_err() {
+            return Err(EngineError::Cancelled);
+        }
+        if cancel.is_cancelled() {
+            return Err(EngineError::Cancelled);
         }
         while completion_tokens < request.max_tokens && !prefill_is_eos {
             if cancel.is_cancelled() {
@@ -510,7 +547,8 @@ impl Engine {
             // last token is already in the KV from prefill (or the prior step),
             // so no token is fed back here. The sampled id is read out and
             // streamed; the native side advances the offset for the next call.
-            let step = self.decode_step(&mut generation, request.sampling.as_ref())?;
+            let step = self.decode_step(&mut generation, sampling.as_ref())?;
+            advance_sampling_seed(&mut sampling);
             if cancel.is_cancelled() {
                 return Err(EngineError::Cancelled);
             }
@@ -699,6 +737,37 @@ mod tests {
         let twin = token.clone();
         token.cancel();
         assert!(twin.is_cancelled(), "a cloned token must observe the fire");
+    }
+
+    #[test]
+    fn sampling_seed_sequence_matches_native_per_step_contract() {
+        // Exact values independently pin at least three transitions, including
+        // the implicit u64 modulo arithmetic used by model.cc.
+        let mut seed = 17;
+        let expected = [
+            17,
+            17_399_290_477_736_686_412,
+            604_063_801_117_309_355,
+            6_215_382_037_137_340_766,
+            1_645_788_613_595_576_533,
+        ];
+        for expected_seed in expected {
+            assert_eq!(seed, expected_seed);
+            seed = next_sampling_seed(seed);
+        }
+    }
+
+    #[test]
+    fn sampling_seed_transition_wraps_and_greedy_has_no_state() {
+        assert_eq!(
+            next_sampling_seed(u64::MAX),
+            13_525_302_890_751_722_018,
+            "native LCG arithmetic must wrap modulo 2^64"
+        );
+
+        let mut greedy = None;
+        advance_sampling_seed(&mut greedy);
+        assert!(greedy.is_none(), "greedy mode must remain stateless");
     }
 
     #[test]
@@ -969,13 +1038,58 @@ mod tests {
             .token_id
     }
 
+    /// Obtain an entire sampled sequence through direct native calls on one
+    /// fresh KV. This intentionally advances a test-local copy of the seed
+    /// with literal model.cc constants instead of calling the production seed
+    /// helper, so it catches a Rust engine that resets or mis-advances the seed.
+    fn direct_native_sampled_tokens(
+        engine: &Engine,
+        prompt: &[u32],
+        mut sampling: HypSamplingConfig,
+        max_tokens: u32,
+    ) -> Vec<u32> {
+        assert!(max_tokens > 0, "direct native oracle requires a token");
+        let kvstate = KvState::create(&engine.model).expect("create direct-sampled KV");
+        let stream = HypTokenStream::from_slice(prompt, true);
+        kvstate
+            .prefill_chunk_sampled(&engine.model, &stream, Some(&sampling), &engine.step)
+            .expect("sampled native prefill");
+        let mut tokens = vec![
+            engine
+                .step
+                .fields()
+                .expect("read direct sampled prefill fields")
+                .token_id,
+        ];
+
+        while tokens.len() < max_tokens as usize {
+            // Literal independent oracle for model.cc's wrapping u64 update.
+            sampling.seed = sampling
+                .seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            kvstate
+                .decode_block_sampled(&engine.model, 1, Some(&sampling), &engine.step)
+                .expect("sampled native decode");
+            tokens.push(
+                engine
+                    .step
+                    .fields()
+                    .expect("read direct sampled decode fields")
+                    .token_id,
+            );
+        }
+        tokens
+    }
+
     /// Real-tensor end-to-end proof of the engine wiring (load → prefill token 1
     /// → decode → fields-read → loop) on the committed tiny fixture. It compares
-    /// `Engine` against an independent direct native prefill, covers total
-    /// completion budgets 0/1/N, prefill EOS, sampled prefill, streaming usage,
-    /// and a receiver dropped before the prefill token send. `#[ignore]` so PR
-    /// CI compiles but skips it; the self-hosted M5 gate may run it. The rigorous
-    /// byte-identity-vs-12B-CLI comparison remains the real HTTP parity gate.
+    /// `Engine` against independent direct native calls, covers total completion
+    /// budgets 0/1/N, zero-budget Done-only streaming, prefill EOS, a multi-step
+    /// sampled sequence, streaming usage, and receiver-drop cancellation.
+    /// `#[ignore]` so PR CI compiles but skips it; the self-hosted M5 gate may run
+    /// it. The rigorous byte-identity-vs-12B-CLI comparison remains the real HTTP
+    /// parity gate.
     #[test]
     #[ignore = "requires the committed tiny fixture + a Metal device (self-hosted M5)"]
     fn engine_drives_greedy_on_tiny_fixture() {
@@ -1026,6 +1140,32 @@ mod tests {
                 .is_empty(),
             "max_tokens=0 must emit no completion tokens"
         );
+        let (zero_tx, mut zero_rx) = tokio::sync::mpsc::channel(1);
+        let zero_usage = engine
+            .stream(&zero_token_request, &cancel, zero_tx)
+            .expect("zero-token stream");
+        assert_eq!(
+            zero_usage,
+            Usage {
+                prompt_tokens: 4,
+                completion_tokens: 0,
+            }
+        );
+        assert!(matches!(
+            zero_rx.blocking_recv(),
+            Some(StepEvent::Done(done)) if done == zero_usage
+        ));
+        assert!(
+            zero_rx.blocking_recv().is_none(),
+            "zero budget must emit exactly one Done event"
+        );
+
+        let (zero_drop_tx, zero_drop_rx) = tokio::sync::mpsc::channel(1);
+        drop(zero_drop_rx);
+        assert!(matches!(
+            engine.stream(&zero_token_request, &cancel, zero_drop_tx),
+            Err(EngineError::Cancelled)
+        ));
         let prefill_eos_request = EngineRequest {
             eos_token_id: Some(native_prefill),
             ..request.clone()
@@ -1043,17 +1183,22 @@ mod tests {
             min_p: 0.0,
             seed: 17,
         };
-        let native_sampled_prefill =
-            direct_native_prefill_token(&engine, &request.prompt_tokens, Some(&sampling));
+        let sampled_max_tokens = 4;
+        let native_sampled = direct_native_sampled_tokens(
+            &engine,
+            &request.prompt_tokens,
+            sampling,
+            sampled_max_tokens,
+        );
         let sampled_request = EngineRequest {
-            max_tokens: 1,
+            max_tokens: sampled_max_tokens,
             sampling: Some(sampling),
             ..request.clone()
         };
         assert_eq!(
             engine.drive(&sampled_request, &cancel).unwrap(),
-            vec![native_sampled_prefill],
-            "sampled Engine prefill must use the request sampling config"
+            native_sampled,
+            "sampled Engine must match independent direct native calls across steps"
         );
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
