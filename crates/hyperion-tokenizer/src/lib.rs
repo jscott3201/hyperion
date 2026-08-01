@@ -106,6 +106,15 @@ pub struct StreamingDecoder {
     prefix_index: usize,
 }
 
+fn reject_replacement_character(text: &str) -> Result<(), TokenizerError> {
+    if text.contains('\u{FFFD}') {
+        return Err(TokenizerError::Decode(
+            "streaming decoder produced Unicode replacement character".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 impl StreamingDecoder {
     /// Push one generated token ID, returning only newly safe decoded text.
     pub fn push(&mut self, id: u32) -> Result<Option<String>, TokenizerError> {
@@ -148,6 +157,10 @@ impl StreamingDecoder {
         )
         .map_err(|e| TokenizerError::Decode(e.to_string()))?;
 
+        if let Some(text) = fragment.as_deref() {
+            reject_replacement_character(text)?;
+        }
+
         if ids.len() > MAX_RETAINED_TOKEN_IDS {
             return Err(TokenizerError::Decode(format!(
                 "streaming decoder retained token limit exceeded (maximum {MAX_RETAINED_TOKEN_IDS})"
@@ -180,14 +193,16 @@ impl StreamingDecoder {
             .tokenizer
             .decode(&self.ids, self.skip_special_tokens)
             .map_err(|e| TokenizerError::Decode(e.to_string()))?;
-        decoded
+        let suffix = decoded
             .strip_prefix(&self.prefix)
             .map(str::to_owned)
             .ok_or_else(|| {
                 TokenizerError::Decode(
                     "streaming decoder EOF output did not match emitted prefix".to_string(),
                 )
-            })
+            })?;
+        reject_replacement_character(&suffix)?;
+        Ok(suffix)
     }
 }
 
@@ -322,9 +337,12 @@ impl TokenizerHandle {
 #[cfg(test)]
 mod tests {
     use tokenizers::AddedToken;
+    use tokenizers::decoders::DecoderWrapper;
     use tokenizers::decoders::byte_fallback::ByteFallback;
+    use tokenizers::decoders::sequence::Sequence;
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::pre_tokenizers::metaspace::{Metaspace, PrependScheme};
 
     use super::*;
 
@@ -367,6 +385,87 @@ mod tests {
         handle(tokenizer)
     }
 
+    fn gemma_like() -> TokenizerHandle {
+        let vocab = [
+            ("<eos>", 0),
+            ("<bos>", 1),
+            ("▁Hello", 2),
+            ("▁world", 3),
+            ("▁SentencePiece", 4),
+            ("▁spacing", 5),
+            ("▁こんにちは", 6),
+            ("▁世界", 7),
+            ("▁مرحبا", 8),
+            ("ASCII", 9),
+            ("<0xF0>", 10),
+            ("<0x9F>", 11),
+            ("<0x98>", 12),
+            ("<0x80>", 13),
+            ("▁bytes", 14),
+            ("<0x62>", 15),
+            ("<0x79>", 16),
+            ("<0x74>", 17),
+            ("<0x65>", 18),
+            ("<0x73>", 19),
+            ("<0xC3>", 20),
+            ("<0xA9>", 21),
+            ("<0xE7>", 22),
+            ("<0x95>", 23),
+            ("<0x8C>", 24),
+            ("<0xE2>", 25),
+            ("<0x96>", 26),
+            ("<0x81>", 27),
+            ("<tool>", 28),
+        ]
+        .into_iter()
+        .map(|(token, id)| (token.to_string(), id))
+        .collect::<Vocab>();
+        let model = BPE::builder()
+            .vocab_and_merges(vocab, Vec::new())
+            .byte_fallback(true)
+            .build()
+            .expect("Gemma-like BPE builds");
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_decoder(Some(Sequence::new(vec![
+            DecoderWrapper::ByteFallback(ByteFallback::default()),
+            DecoderWrapper::Metaspace(Metaspace::new('▁', PrependScheme::Always, true)),
+        ])));
+        tokenizer
+            .add_special_tokens([
+                AddedToken::from("<eos>", true),
+                AddedToken::from("<bos>", true),
+                AddedToken::from("<tool>", true),
+            ])
+            .expect("Gemma-like special tokens register");
+        handle(tokenizer)
+    }
+
+    fn mixed_256_ids() -> Vec<u32> {
+        let pattern = [2, 3, 6, 7, 8, 10, 11, 12, 13, 15, 16, 17, 20, 21, 28, 9];
+        pattern.repeat(16)
+    }
+
+    fn collect_fragments(
+        tokenizer: &TokenizerHandle,
+        ids: &[u32],
+        policy: SpecialTokenPolicy,
+    ) -> Result<Vec<String>, TokenizerError> {
+        let mut decoder = tokenizer.streaming_decoder(policy);
+        let mut fragments = Vec::new();
+        for id in ids {
+            if let Some(fragment) = decoder.push(*id)?
+                && !fragment.is_empty()
+            {
+                fragments.push(fragment);
+            }
+        }
+        let suffix = decoder.finish()?;
+        if !suffix.is_empty() {
+            fragments.push(suffix);
+        }
+        Ok(fragments)
+    }
+
     fn collect_stream(
         tokenizer: &TokenizerHandle,
         ids: &[u32],
@@ -381,6 +480,81 @@ mod tests {
         }
         output.push_str(&decoder.finish()?);
         Ok(output)
+    }
+
+    #[test]
+    fn gemma_like_streaming_matches_one_shot_parity_matrix() {
+        struct Case {
+            name: &'static str,
+            ids: Vec<u32>,
+            policy: SpecialTokenPolicy,
+        }
+
+        let tokenizer = gemma_like();
+        let cases = [
+            Case {
+                name: "ASCII",
+                ids: vec![2, 3, 9],
+                policy: SpecialTokenPolicy::Skip,
+            },
+            Case {
+                name: "SentencePiece spacing",
+                ids: vec![4, 5, 2, 3],
+                policy: SpecialTokenPolicy::Skip,
+            },
+            Case {
+                name: "multilingual",
+                ids: vec![6, 7, 8],
+                policy: SpecialTokenPolicy::Skip,
+            },
+            Case {
+                name: "emoji split across fallback IDs",
+                ids: vec![2, 10, 11, 12, 13],
+                policy: SpecialTokenPolicy::Skip,
+            },
+            Case {
+                name: "byte-heavy valid UTF-8 ending in fallback IDs",
+                ids: vec![15, 16, 17, 18, 19, 20, 21, 22, 23, 24],
+                policy: SpecialTokenPolicy::Skip,
+            },
+            Case {
+                name: "special-token Skip",
+                ids: vec![2, 28, 3],
+                policy: SpecialTokenPolicy::Skip,
+            },
+            Case {
+                name: "special-token Preserve",
+                ids: vec![2, 28, 3],
+                policy: SpecialTokenPolicy::Preserve,
+            },
+            Case {
+                name: "exactly 256 mixed IDs",
+                ids: mixed_256_ids(),
+                policy: SpecialTokenPolicy::Preserve,
+            },
+        ];
+
+        for case in cases {
+            if case.name == "exactly 256 mixed IDs" {
+                assert_eq!(case.ids.len(), 256, "fixture length");
+            }
+            let skip_special_tokens = case.policy.skip_special_tokens();
+            let expected = tokenizer
+                .inner
+                .decode(&case.ids, skip_special_tokens)
+                .unwrap();
+            assert!(!expected.contains('\u{FFFD}'), "{} reference", case.name);
+            let fragments = collect_fragments(&tokenizer, &case.ids, case.policy)
+                .unwrap_or_else(|error| panic!("{} failed: {error}", case.name));
+            assert!(
+                fragments
+                    .iter()
+                    .all(|fragment| !fragment.contains('\u{FFFD}')),
+                "{} emitted replacement: {fragments:?}",
+                case.name
+            );
+            assert_eq!(fragments.concat(), expected, "{} parity", case.name);
+        }
     }
 
     #[test]
@@ -481,9 +655,15 @@ mod tests {
             }
         }
         output.push_str(&decoder.finish().unwrap());
-        assert_eq!(output, "hello <|tool_call> <|\"|> <tool_call|> world");
+        let filtered = ids
+            .into_iter()
+            .filter(|id| ![4, 5].contains(id))
+            .collect::<Vec<_>>();
+        let expected = tokenizer.inner.decode(&filtered, false).unwrap();
+        assert_eq!(output, expected);
         assert!(!output.contains("<eos>"));
         assert!(!output.contains("<|channel>"));
+        assert!(!output.contains('\u{FFFD}'));
     }
 
     #[test]
@@ -596,24 +776,60 @@ mod tests {
     }
 
     #[test]
-    fn finish_is_lossless_for_incomplete_fallback_and_empty_generation() {
+    fn finish_rejects_incomplete_fallback_and_accepts_empty_generation() {
         let tokenizer = byte_fallback(&[("<0xE5>", 0), ("hello", 1)]);
         let mut incomplete = tokenizer.streaming_decoder(SpecialTokenPolicy::Skip);
         assert_eq!(incomplete.push(0).unwrap(), None);
-        assert_eq!(incomplete.finish().unwrap(), "�");
+        let error = incomplete.finish().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "decode error: streaming decoder produced Unicode replacement character"
+        );
 
         let empty = tokenizer.streaming_decoder(SpecialTokenPolicy::Skip);
         assert_eq!(empty.finish().unwrap(), "");
     }
 
     #[test]
-    fn finish_does_not_duplicate_prior_fragments() {
+    fn finish_rejects_incomplete_fallback_after_prior_fragment() {
         let tokenizer = byte_fallback(&[("hello", 0), ("<0xE5>", 1)]);
         let mut decoder = tokenizer.streaming_decoder(SpecialTokenPolicy::Skip);
         assert_eq!(decoder.push(0).unwrap().as_deref(), Some("hello"));
         assert_eq!(decoder.push(1).unwrap(), None);
-        assert_eq!(decoder.finish().unwrap(), "�");
+        let error = decoder.finish().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "decode error: streaming decoder produced Unicode replacement character"
+        );
         // `finish` consumes the decoder, so a second finish is impossible.
+    }
+
+    #[test]
+    fn malformed_fallback_before_text_fails_transactionally() {
+        let tokenizer = byte_fallback(&[("<0xE5>", 0), ("hello", 1), ("<0x8F>", 2), ("<0xAB>", 3)]);
+        let mut decoder = tokenizer.streaming_decoder(SpecialTokenPolicy::Skip);
+        assert_eq!(decoder.push(0).unwrap(), None);
+        let ids = decoder.ids.clone();
+        let prefix = decoder.prefix.clone();
+        let prefix_index = decoder.prefix_index;
+
+        let error = decoder.push(1).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "decode error: streaming decoder produced Unicode replacement character"
+        );
+        assert_eq!(decoder.ids, ids, "rejected push retains prior IDs");
+        assert_eq!(decoder.prefix, prefix, "rejected push retains prior prefix");
+        assert_eq!(
+            decoder.prefix_index, prefix_index,
+            "rejected push retains prior prefix index"
+        );
+
+        assert_eq!(decoder.push(2).unwrap(), None);
+        let fragment = decoder.push(3).unwrap().expect("completed scalar emits");
+        assert_eq!(fragment, "叫");
+        assert!(!fragment.contains('\u{FFFD}'));
+        assert_eq!(decoder.finish().unwrap(), "");
     }
 
     #[test]
