@@ -29,6 +29,7 @@ use hyperion_tokenizer::renderer::ChatTemplate;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tower::ServiceExt;
 
 /// A minimal HuggingFace `tokenizer.json` with a tiny WordLevel vocab that
@@ -237,6 +238,58 @@ fn fresh_control() -> ControlState {
     c
 }
 
+fn openai_tool() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "lookup",
+            "description": "look something up",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": false
+            },
+            "strict": false
+        }
+    })
+}
+
+fn anthropic_tool() -> serde_json::Value {
+    serde_json::json!({
+        "name": "lookup",
+        "description": "look something up",
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": false
+        },
+        "strict": false
+    })
+}
+
+struct CountingEngine {
+    calls: Arc<AtomicUsize>,
+    tokens: Vec<u32>,
+}
+
+impl EngineDriver for CountingEngine {
+    fn stream(
+        &self,
+        request: &EngineRequest,
+        cancel: &CancelToken,
+        tx: tokio::sync::mpsc::Sender<StepEvent>,
+    ) -> Result<Usage, EngineError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        StubEngine {
+            tokens: self.tokens.clone(),
+            block_after: None,
+        }
+        .stream(request, cancel, tx)
+    }
+}
+
 fn streamed_text(body: &str, dialect: &str) -> String {
     body.lines()
         .filter_map(|line| line.strip_prefix("data: "))
@@ -430,9 +483,8 @@ async fn missing_max_tokens_400_anthropic() {
         r#"{"messages":[{"role":"user","content":"hi"}]}"#,
     )
     .await;
-    // max_tokens missing → 400 (Anthropic requires it). (prepare_anthropic
-    // checks max_tokens after parse; render happens first — but the trivial
-    // template renders, then the missing-max_tokens gate fires.)
+    // max_tokens missing → 400 before template rendering (Anthropic requires
+    // it for generation).
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -448,12 +500,17 @@ async fn tools_unsupported_400_openai() {
         4096,
         &control,
     );
+    let request_body = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [openai_tool()]
+    })
+    .to_string();
     let (status, body) = send(
         srv.router(),
         Method::POST,
         "/v1/chat/completions",
         &[("content-type", "application/json")],
-        r#"{"messages":[{"role":"user","content":"hi"}],"tools":[]}"#,
+        &request_body,
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -461,6 +518,266 @@ async fn tools_unsupported_400_openai() {
         body.contains("tool calling") || body.contains("invalid_request_error"),
         "tools 400: {body}"
     );
+}
+
+#[tokio::test]
+async fn explicit_none_with_resolved_history_reaches_engine_for_both_dialects() {
+    let control = fresh_control();
+    let openai_calls = Arc::new(AtomicUsize::new(0));
+    let openai_server = test_server_with_engine(
+        Arc::new(CountingEngine {
+            calls: openai_calls.clone(),
+            tokens: vec![2],
+        }),
+        None,
+        4096,
+        &control,
+        MINIMAL_TOKENIZER_JSON,
+    );
+    let openai_body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"query\":\"hi\"}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "world"}
+        ],
+        "tools": [openai_tool()],
+        "tool_choice": "none"
+    })
+    .to_string();
+    let (status, body) = send(
+        openai_server.router(),
+        Method::POST,
+        "/v1/chat/completions",
+        &[("content-type", "application/json")],
+        &openai_body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "OpenAI history: {body}");
+    assert_eq!(openai_calls.load(Ordering::SeqCst), 1);
+
+    let anthropic_calls = Arc::new(AtomicUsize::new(0));
+    let anthropic_server = test_server_with_engine(
+        Arc::new(CountingEngine {
+            calls: anthropic_calls.clone(),
+            tokens: vec![2],
+        }),
+        None,
+        4096,
+        &control,
+        MINIMAL_TOKENIZER_JSON,
+    );
+    let anthropic_body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "lookup",
+                "input": {"query": "hi"}
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": "world"
+            }]}
+        ],
+        "max_tokens": 4,
+        "tools": [anthropic_tool()],
+        "tool_choice": {"type": "none"}
+    })
+    .to_string();
+    let (status, body) = send(
+        anthropic_server.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        &anthropic_body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "Anthropic history: {body}");
+    assert_eq!(anthropic_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn omitted_or_auto_tool_choice_rejects_before_engine_for_both_dialects() {
+    let control = fresh_control();
+    let openai_calls = Arc::new(AtomicUsize::new(0));
+    let openai_server = test_server_with_engine(
+        Arc::new(CountingEngine {
+            calls: openai_calls.clone(),
+            tokens: vec![2],
+        }),
+        None,
+        4096,
+        &control,
+        MINIMAL_TOKENIZER_JSON,
+    );
+    let openai_body = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [openai_tool()]
+    })
+    .to_string();
+    let (status, body) = send(
+        openai_server.router(),
+        Method::POST,
+        "/v1/chat/completions",
+        &[("content-type", "application/json")],
+        &openai_body,
+    )
+    .await;
+    let envelope: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(envelope["error"]["type"], "invalid_request_error");
+    assert_eq!(openai_calls.load(Ordering::SeqCst), 0);
+
+    let anthropic_calls = Arc::new(AtomicUsize::new(0));
+    let anthropic_server = test_server_with_engine(
+        Arc::new(CountingEngine {
+            calls: anthropic_calls.clone(),
+            tokens: vec![2],
+        }),
+        None,
+        4096,
+        &control,
+        MINIMAL_TOKENIZER_JSON,
+    );
+    let anthropic_body = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 4,
+        "tools": [anthropic_tool()],
+        "tool_choice": {"type": "auto"}
+    })
+    .to_string();
+    let (status, body) = send(
+        anthropic_server.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        &anthropic_body,
+    )
+    .await;
+    let envelope: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(envelope["type"], "error");
+    assert_eq!(envelope["error"]["type"], "invalid_request_error");
+    assert_eq!(anthropic_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn malformed_tool_schema_and_history_are_fixed_non_reflective_400s() {
+    let control = fresh_control();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let server = test_server_with_engine(
+        Arc::new(CountingEngine {
+            calls: calls.clone(),
+            tokens: vec![2],
+        }),
+        None,
+        4096,
+        &control,
+        MINIMAL_TOKENIZER_JSON,
+    );
+    let schema_body = serde_json::json!({
+        "messages": [],
+        "tools": [{"SENTINEL_SCHEMA_KEY": "SENTINEL_SCHEMA_VALUE"}],
+        "tool_choice": "none"
+    })
+    .to_string();
+    let (status, body) = send(
+        server.router(),
+        Method::POST,
+        "/v1/chat/completions",
+        &[("content-type", "application/json")],
+        &schema_body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("invalid tool schema"), "schema 400: {body}");
+    assert!(!body.contains("SENTINEL"), "schema source leaked: {body}");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let history_body = serde_json::json!({
+        "messages": [
+            {"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "toolu_SENTINEL_ID",
+                "name": "SENTINEL_HISTORY_NAME",
+                "input": {"query": "SENTINEL_HISTORY_VALUE"}
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_SENTINEL_ID",
+                "content": "SENTINEL_RESULT_VALUE"
+            }]}
+        ],
+        "max_tokens": 4,
+        "tools": [anthropic_tool()],
+        "tool_choice": {"type": "none"}
+    })
+    .to_string();
+    let (status, body) = send(
+        server.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        &history_body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("invalid tool history"), "history 400: {body}");
+    assert!(!body.contains("SENTINEL"), "history source leaked: {body}");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn anthropic_count_tokens_accepts_auto_tools_and_resolved_history_without_max_tokens() {
+    let control = fresh_control();
+    let server = test_server(
+        StubEngine {
+            tokens: vec![],
+            block_after: None,
+        },
+        None,
+        4096,
+        &control,
+    );
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "lookup",
+                "input": {"query": "hi"}
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": "world"
+            }]}
+        ],
+        "tools": [anthropic_tool()],
+        "tool_choice": {"type": "auto"}
+    })
+    .to_string();
+    let (status, response) = send(
+        server.router(),
+        Method::POST,
+        "/v1/messages/count_tokens",
+        &[("content-type", "application/json")],
+        &body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "count_tokens: {response}");
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert!(response["input_tokens"].is_number());
 }
 
 #[tokio::test]
