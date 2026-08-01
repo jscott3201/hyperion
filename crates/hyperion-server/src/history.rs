@@ -9,13 +9,15 @@ use hyperion_tokenizer::renderer::ChatMessage;
 use serde_json::{Map, Value};
 
 use crate::tool_call::decode_unique_json;
-use crate::tool_schema::{ToolRegistry, reserved_control};
+use crate::tool_schema::{
+    MAX_ARGUMENT_BYTES, MAX_ARGUMENT_NODES, MAX_DEPTH, ToolRegistry, reserved_control,
+    validate_tool_name,
+};
 
 const MAX_SOURCE_MESSAGES: usize = 4_096;
 const MAX_CALLS_PER_TURN: usize = 8;
 const MAX_EXTERNAL_ID_BYTES: usize = 256;
 const MAX_RAW_ARGUMENT_BYTES: usize = 64 * 1024;
-const MAX_COMPACT_ARGUMENT_BYTES: usize = 64 * 1024;
 const MAX_AGGREGATE_ARGUMENT_BYTES: usize = 512 * 1024;
 const MAX_AGGREGATE_TEXT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_AGGREGATE_TEXT_BLOCKS: usize = 4_096;
@@ -63,7 +65,7 @@ const PRODUCTION_LIMITS: HistoryLimits = HistoryLimits {
     calls_per_turn: MAX_CALLS_PER_TURN,
     external_id_bytes: MAX_EXTERNAL_ID_BYTES,
     raw_argument_bytes: MAX_RAW_ARGUMENT_BYTES,
-    compact_argument_bytes: MAX_COMPACT_ARGUMENT_BYTES,
+    compact_argument_bytes: MAX_ARGUMENT_BYTES,
     aggregate_argument_bytes: MAX_AGGREGATE_ARGUMENT_BYTES,
     aggregate_text_bytes: MAX_AGGREGATE_TEXT_BYTES,
     aggregate_text_blocks: MAX_AGGREGATE_TEXT_BLOCKS,
@@ -349,6 +351,9 @@ impl<'a> Normalizer<'a> {
             )?;
             self.ensure_fields(function, &["name", "arguments"], &function_path)?;
             let name = self.required_string(function, "name", &function_path)?;
+            let name_path = format!("{function_path}.name");
+            validate_tool_name(name, &name_path)
+                .map_err(|_| self.error(&name_path, "must match the declared tool-name grammar"))?;
             let arguments_path = format!("{function_path}.arguments");
             let raw_arguments = self.required_string(function, "arguments", &function_path)?;
             if raw_arguments.len() > self.limits.raw_argument_bytes {
@@ -542,6 +547,9 @@ impl<'a> Normalizer<'a> {
             let id = self.required_string(block, "id", &block_path)?;
             self.register_call_id(id, &format!("{block_path}.id"))?;
             let name = self.required_string(block, "name", &block_path)?;
+            let name_path = format!("{block_path}.name");
+            validate_tool_name(name, &name_path)
+                .map_err(|_| self.error(&name_path, "must match the declared tool-name grammar"))?;
             let input_path = format!("{block_path}.input");
             let arguments = block
                 .get("input")
@@ -786,6 +794,148 @@ impl<'a> Normalizer<'a> {
         Ok(())
     }
 
+    fn preflight_arguments(
+        &self,
+        arguments: &Value,
+        key_string_maximum: usize,
+        path: &str,
+    ) -> Result<(), ToolHistoryError> {
+        if !arguments.is_object() {
+            return Err(self.error(path, "must be an object"));
+        }
+
+        let initial_capacity = (MAX_DEPTH + 1).min(MAX_ARGUMENT_NODES);
+        let mut stack = Vec::with_capacity(initial_capacity);
+        stack.push((arguments, 0usize));
+        let mut nodes = 0usize;
+        let mut key_string_bytes = 0usize;
+
+        while let Some((value, depth)) = stack.pop() {
+            if depth > MAX_DEPTH {
+                return Err(self.error(
+                    path,
+                    format_args!("exceeds the maximum argument depth of {MAX_DEPTH}"),
+                ));
+            }
+            nodes = nodes
+                .checked_add(1)
+                .ok_or_else(|| self.error(path, "argument node accounting overflow"))?;
+            if nodes > MAX_ARGUMENT_NODES {
+                return Err(self.error(
+                    path,
+                    format_args!("exceeds the maximum of {MAX_ARGUMENT_NODES} argument nodes"),
+                ));
+            }
+
+            match value {
+                Value::Object(object) => {
+                    let child_depth = self.reserve_argument_children(
+                        &mut stack,
+                        object.len(),
+                        depth,
+                        nodes,
+                        path,
+                    )?;
+                    for key in object.keys() {
+                        key_string_bytes = self.checked_argument_leaf_bytes(
+                            key_string_bytes,
+                            key.len(),
+                            key_string_maximum,
+                            path,
+                        )?;
+                    }
+                    for child in object.values() {
+                        stack.push((child, child_depth));
+                    }
+                }
+                Value::Array(values) => {
+                    let child_depth = self.reserve_argument_children(
+                        &mut stack,
+                        values.len(),
+                        depth,
+                        nodes,
+                        path,
+                    )?;
+                    for child in values {
+                        stack.push((child, child_depth));
+                    }
+                }
+                Value::String(value) => {
+                    key_string_bytes = self.checked_argument_leaf_bytes(
+                        key_string_bytes,
+                        value.len(),
+                        key_string_maximum,
+                        path,
+                    )?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn reserve_argument_children(
+        &self,
+        stack: &mut Vec<(&Value, usize)>,
+        child_count: usize,
+        depth: usize,
+        processed_nodes: usize,
+        path: &str,
+    ) -> Result<usize, ToolHistoryError> {
+        if child_count == 0 {
+            return Ok(depth);
+        }
+        if depth >= MAX_DEPTH {
+            return Err(self.error(
+                path,
+                format_args!("exceeds the maximum argument depth of {MAX_DEPTH}"),
+            ));
+        }
+        let pending_nodes = stack
+            .len()
+            .checked_add(child_count)
+            .ok_or_else(|| self.error(path, "argument pending-node accounting overflow"))?;
+        let minimum_nodes = processed_nodes
+            .checked_add(pending_nodes)
+            .ok_or_else(|| self.error(path, "argument node accounting overflow"))?;
+        if minimum_nodes > MAX_ARGUMENT_NODES {
+            return Err(self.error(
+                path,
+                format_args!("exceeds the maximum of {MAX_ARGUMENT_NODES} argument nodes"),
+            ));
+        }
+        stack.try_reserve_exact(child_count).map_err(|_| {
+            self.error(
+                path,
+                "could not reserve the bounded argument traversal stack",
+            )
+        })?;
+        depth
+            .checked_add(1)
+            .ok_or_else(|| self.error(path, "argument depth accounting overflow"))
+    }
+
+    fn checked_argument_leaf_bytes(
+        &self,
+        current: usize,
+        amount: usize,
+        maximum: usize,
+        path: &str,
+    ) -> Result<usize, ToolHistoryError> {
+        let total = current
+            .checked_add(amount)
+            .ok_or_else(|| self.error(path, "argument key/string byte accounting overflow"))?;
+        if total > maximum {
+            return Err(self.error(
+                path,
+                format_args!(
+                    "exceeds the preflight maximum of {maximum} argument key/string bytes"
+                ),
+            ));
+        }
+        Ok(total)
+    }
+
     fn validate_arguments(
         &mut self,
         name: &str,
@@ -798,6 +948,7 @@ impl<'a> Normalizer<'a> {
             .checked_sub(self.argument_bytes)
             .ok_or_else(|| self.error(path, "aggregate argument byte accounting underflow"))?;
         let sizing_limit = self.limits.compact_argument_bytes.min(remaining_aggregate);
+        self.preflight_arguments(arguments, sizing_limit, path)?;
         let compact_bytes = match bounded_compact_json_bytes(arguments, sizing_limit) {
             Ok(bytes) => bytes,
             Err(CompactJsonSizeError::LimitExceeded)
@@ -1808,14 +1959,11 @@ mod tests {
     }
 
     #[test]
-    fn compact_argument_limit_precedes_schema_traversal() {
+    fn argument_leaf_preflight_precedes_serialization_and_schema_traversal() {
         let registry = permissive_registry(&["echo"]);
         let mut keyed = Map::new();
-        keyed.insert(
-            "x".repeat(MAX_COMPACT_ARGUMENT_BYTES + 1),
-            Value::Bool(true),
-        );
-        let oversized_value = "x".repeat(MAX_COMPACT_ARGUMENT_BYTES + 1);
+        keyed.insert("x".repeat(2 * 1024 * 1024), Value::Bool(true));
+        let oversized_value = "x".repeat(2 * 1024 * 1024);
 
         for arguments in [Value::Object(keyed), json!({"value": oversized_value})] {
             let history = anthropic_batch(
@@ -1826,9 +1974,69 @@ mod tests {
             assert!(
                 error
                     .to_string()
-                    .contains("compact JSON exceeds the maximum of 65536 bytes")
+                    .contains("preflight maximum of 65536 argument key/string bytes")
             );
         }
+    }
+
+    #[test]
+    fn deeply_nested_arguments_fail_without_recursive_serialization_or_teardown() {
+        let registry = permissive_registry(&["echo"]);
+        let mut nested = Value::Null;
+        for _ in 0..10_000 {
+            nested = Value::Array(vec![nested]);
+        }
+        let mut arguments = Map::new();
+        arguments.insert("value".to_owned(), nested);
+        let mut block = Map::new();
+        block.insert("type".to_owned(), Value::String("tool_use".to_owned()));
+        block.insert("id".to_owned(), Value::String("call-1".to_owned()));
+        block.insert("name".to_owned(), Value::String("echo".to_owned()));
+        block.insert("input".to_owned(), Value::Object(arguments));
+        let mut message = Map::new();
+        message.insert("role".to_owned(), Value::String("assistant".to_owned()));
+        message.insert(
+            "content".to_owned(),
+            Value::Array(vec![Value::Object(block)]),
+        );
+        let history = Value::Array(vec![Value::Object(message)]);
+
+        let result = normalize_anthropic(&registry, None, &history);
+        std::mem::forget(history);
+        match result {
+            Err(error) => assert!(error.to_string().contains("maximum argument depth of 48")),
+            Ok(output) => {
+                std::mem::forget(output);
+                panic!("deep arguments unexpectedly normalized");
+            }
+        }
+    }
+
+    #[test]
+    fn call_name_grammar_precedes_all_argument_sizing() {
+        let registry = permissive_registry(&["echo"]);
+        let raw_arguments = "x".repeat(MAX_RAW_ARGUMENT_BYTES + 1);
+        let name_65 = "n".repeat(65);
+        let openai = openai_batch(
+            vec![openai_call("call-1", &name_65, &raw_arguments)],
+            vec![openai_result("call-1", json!(""))],
+        );
+        let error = normalize_openai(&registry, &openai).unwrap_err();
+        assert!(error.to_string().contains("tool-name grammar"));
+        assert!(!error.to_string().contains(name_65.as_str()));
+
+        let huge_name = "n".repeat(2 * 1024 * 1024);
+        let anthropic = anthropic_batch(
+            vec![anthropic_call(
+                "call-1",
+                &huge_name,
+                json!({"value": "x".repeat(2 * 1024 * 1024)}),
+            )],
+            vec![anthropic_result("call-1", None)],
+        );
+        let error = normalize_anthropic(&registry, None, &anthropic).unwrap_err();
+        assert!(error.to_string().contains("tool-name grammar"));
+        assert!(!error.to_string().contains(huge_name.as_str()));
     }
 
     #[test]

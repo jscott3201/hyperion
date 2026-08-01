@@ -12,9 +12,9 @@ use crate::tool_call::ToolCall;
 const MAX_DECLARATIONS: usize = 128;
 const MAX_DECLARATION_BYTES: usize = 512 * 1024;
 const MAX_SCHEMA_NODES: usize = 4_096;
-const MAX_DEPTH: usize = 48;
-const MAX_ARGUMENT_NODES: usize = 4_096;
-const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_DEPTH: usize = 48;
+pub(crate) const MAX_ARGUMENT_NODES: usize = 4_096;
+pub(crate) const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
 
 const RESERVED_CONTROLS: &[&str] = &[
     "<bos>",
@@ -973,7 +973,7 @@ fn inspect_schema_tree(
     Ok(())
 }
 
-fn validate_tool_name(name: &str, path: &str) -> Result<(), ToolSchemaError> {
+pub(crate) fn validate_tool_name(name: &str, path: &str) -> Result<(), ToolSchemaError> {
     if name.is_empty()
         || name.len() > 64
         || !name
