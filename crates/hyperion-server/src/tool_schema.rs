@@ -144,11 +144,19 @@ impl ToolRegistry {
     }
 
     pub fn validate_generated(&self, call: &ToolCall) -> Result<(), ToolValidationError> {
-        let schema = self.validators.get(&call.name).ok_or_else(|| {
-            ToolValidationError(format!("tool call $.name: unknown tool {:?}", call.name))
+        self.validate_call_arguments(&call.name, &call.arguments)
+    }
+
+    pub(crate) fn validate_call_arguments(
+        &self,
+        name: &str,
+        arguments: &Value,
+    ) -> Result<(), ToolValidationError> {
+        let schema = self.validators.get(name).ok_or_else(|| {
+            ToolValidationError(format!("tool call $.name: unknown tool {name:?}"))
         })?;
-        validate_argument_budget(&call.arguments)?;
-        schema.validate(&call.arguments, "$.arguments")
+        validate_argument_budget(arguments)?;
+        schema.validate(arguments, "$.arguments")
     }
 
     fn compile_openai(tools: &[Value], mode: ToolMode) -> Result<Self, ToolSchemaError> {
@@ -999,16 +1007,20 @@ fn validate_argument_key(key: &str, path: &str) -> Result<(), ToolValidationErro
 }
 
 fn reject_reserved(value: &str, path: &str) -> Result<(), ToolSchemaError> {
-    if let Some(control) = RESERVED_CONTROLS
-        .iter()
-        .find(|control| value.contains(**control))
-    {
+    if let Some(control) = reserved_control(value) {
         return Err(error(
             path,
             format_args!("contains reserved control token {control:?}"),
         ));
     }
     Ok(())
+}
+
+pub(crate) fn reserved_control(value: &str) -> Option<&'static str> {
+    RESERVED_CONTROLS
+        .iter()
+        .copied()
+        .find(|control| value.contains(control))
 }
 
 fn expect_object<'a>(

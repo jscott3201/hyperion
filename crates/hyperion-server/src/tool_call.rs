@@ -521,9 +521,7 @@ fn parse_candidate(raw: &str, stale_opener: bool) -> Option<ParsedCandidate> {
         });
     }
 
-    let arguments = serde_json::from_str::<UniqueJsonValue>(argument_source)
-        .ok()?
-        .0;
+    let arguments = decode_unique_json(argument_source).ok()?;
     if !arguments.is_object() {
         return None;
     }
@@ -557,6 +555,10 @@ fn native_syntax_has_external_whitespace(source: &str) -> bool {
 }
 
 struct UniqueJsonValue(Value);
+
+pub(crate) fn decode_unique_json(source: &str) -> serde_json::Result<Value> {
+    serde_json::from_str::<UniqueJsonValue>(source).map(|value| value.0)
+}
 
 impl<'de> Deserialize<'de> for UniqueJsonValue {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
