@@ -59,6 +59,17 @@ Decision derive_device_budget(const DeviceInfo& device_info) {
     return Decision{true, budget, {}};
 }
 
+RuntimeEnvironmentDecision evaluate_runtime_environment(
+    bool has_mlx_sdpa_blocks_override) {
+    if (has_mlx_sdpa_blocks_override) {
+        return RuntimeEnvironmentDecision{
+            false,
+            "MLX_SDPA_BLOCKS is unsupported because it invalidates governor workspace accounting",
+        };
+    }
+    return RuntimeEnvironmentDecision{true, ""};
+}
+
 Decision evaluate(
     bool has_gpu,
     std::uint32_t apple_gpu_family,

@@ -82,6 +82,17 @@ int main(int argc, char** argv) {
             missing_device_budget.reason == zero_device_budget.reason,
         "invalid device recommendation data must use one generic rejection reason");
 
+    const auto clean_runtime_environment =
+        hyperion::platform::evaluate_runtime_environment(false);
+    const auto overridden_runtime_environment =
+        hyperion::platform::evaluate_runtime_environment(true);
+    require(clean_runtime_environment.supported,
+        "an unset MLX_SDPA_BLOCKS environment must be supported");
+    require(!overridden_runtime_environment.supported &&
+            std::string_view(overridden_runtime_environment.reason).find("MLX_SDPA_BLOCKS") !=
+                std::string_view::npos,
+        "an inherited MLX_SDPA_BLOCKS override must fail closed with a specific reason");
+
     require(
         !hyperion::platform::evaluate(
              true, 1009, Version{26, 6, 0}, Version{0, 32, 0}, "0.32.0", recommended)

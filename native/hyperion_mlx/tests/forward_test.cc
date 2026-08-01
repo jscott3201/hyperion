@@ -145,9 +145,13 @@ void test_step_telemetry_accumulator() {
     constexpr auto kUnlimited = std::numeric_limits<std::uint64_t>::max();
     hyperion::governor::Governor probe(geometry, kUnlimited, kUnlimited);
     const auto p1 = probe.evaluate(
-        1, 0, kvstate, hyperion::governor::StepKind::Prefill);
+        hyperion::governor::AdmissionInput{
+            1, 0, hyperion::governor::StepKind::Prefill, false},
+        kvstate);
     const auto p2 = probe.evaluate(
-        2, 0, kvstate, hyperion::governor::StepKind::Prefill);
+        hyperion::governor::AdmissionInput{
+            2, 0, hyperion::governor::StepKind::Prefill, false},
+        kvstate);
     require(p2.predicted_peak_bytes > p1.predicted_peak_bytes,
             "telemetry accumulator: two-token proposal predicts above one-token proposal");
 
@@ -157,9 +161,13 @@ void test_step_telemetry_accumulator() {
     hyperion::governor::Governor thresholded(
         geometry, kUnlimited, p1.predicted_peak_bytes);
     const auto accepted = thresholded.evaluate(
-        1, 0, kvstate, hyperion::governor::StepKind::Prefill);
+        hyperion::governor::AdmissionInput{
+            1, 0, hyperion::governor::StepKind::Prefill, false},
+        kvstate);
     const auto soft_paused = thresholded.evaluate(
-        2, 0, kvstate, hyperion::governor::StepKind::Prefill);
+        hyperion::governor::AdmissionInput{
+            2, 0, hyperion::governor::StepKind::Prefill, false},
+        kvstate);
     require(accepted.admission == hyperion::governor::Admission::Accepted,
             "telemetry accumulator: real one-token retry is accepted");
     require(soft_paused.admission == hyperion::governor::Admission::SoftPaused,
@@ -168,6 +176,8 @@ void test_step_telemetry_accumulator() {
     hyperion::model::StepTelemetryAccumulator telemetry;
     require(telemetry.peak_mlx_bytes() == 0,
             "telemetry accumulator: no admission attempt starts at zero");
+    require(telemetry.successful_governor_state() == HYP_GOVERNOR_READY,
+            "telemetry accumulator: no pressure starts READY");
     const auto observed_soft_paused = telemetry.observe(soft_paused);
     const auto observed_retry = telemetry.observe(accepted);
     require(observed_soft_paused.admission == hyperion::governor::Admission::SoftPaused &&
@@ -175,6 +185,8 @@ void test_step_telemetry_accumulator() {
             "telemetry accumulator: observe returns each production decision unchanged");
     require(telemetry.peak_mlx_bytes() == soft_paused.predicted_peak_bytes,
             "telemetry accumulator: real handled soft-pause remains max after smaller retry");
+    require(telemetry.successful_governor_state() == HYP_GOVERNOR_SOFT_PAUSED,
+            "telemetry accumulator: handled pressure remains visible on successful execution");
     std::cerr << "forward_test: StepTelemetryAccumulator keeps real soft-pause P2="
               << soft_paused.predicted_peak_bytes << " over accepted retry P1="
               << accepted.predicted_peak_bytes << '\n';

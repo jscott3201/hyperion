@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -398,6 +399,14 @@ HypStatus hyp_model_load(HypModel model,
         return hyperion::model::fail(HYP_STATUS_NOT_FOUND, "weights artifact directory not found");
     }
 
+    const auto runtime_environment =
+        hyperion::platform::evaluate_runtime_environment(
+            std::getenv("MLX_SDPA_BLOCKS") != nullptr);
+    if (!runtime_environment.supported) {
+        return hyperion::model::fail(
+            HYP_STATUS_UNSUPPORTED, runtime_environment.reason);
+    }
+
     try {
         const auto device_budget = hyperion::platform::derive_device_budget(
             mx::device_info(mx::Device::gpu));
@@ -605,7 +614,7 @@ HypStatus hyp_prefill_chunk(HypModel model,
         kvstate->last_token = sample.token_id;
         hyperion::model::write_step_result(
             out_result, sample, sample.near_tie ? 1u : 0u,
-            HYP_GOVERNOR_READY, telemetry.snapshot(*kvstate->kv));
+            telemetry.successful_governor_state(), telemetry.snapshot(*kvstate->kv));
         return hyperion::model::ok();
     } catch (const std::bad_alloc&) {
         return hyperion::model::fail(
@@ -717,7 +726,7 @@ HypStatus hyp_decode_block(HypModel model,
         // would treat the just-allocated bucket as settled and charge it a second time.
         hyperion::model::write_step_result(
             out_result, sample, near_tie_events,
-            HYP_GOVERNOR_READY, telemetry.snapshot(*kvstate->kv));
+            telemetry.successful_governor_state(), telemetry.snapshot(*kvstate->kv));
         execution_guard.disarm();
         return hyperion::model::ok();
     } catch (const std::bad_alloc&) {
@@ -840,7 +849,8 @@ HypStatus hyp_prefill_chunk_sampled(HypModel model,
         kvstate->offset = total;
         kvstate->last_token = sample.token_id;
         hyperion::model::write_step_result_sampled(
-            out_result, sample, HYP_GOVERNOR_READY, telemetry.snapshot(*kvstate->kv));
+            out_result, sample, telemetry.successful_governor_state(),
+            telemetry.snapshot(*kvstate->kv));
         return hyperion::model::ok();
     } catch (const std::bad_alloc&) {
         return hyperion::model::fail(HYP_STATUS_INTERNAL, "native allocation failed outside predictive governor admission");
@@ -881,7 +891,8 @@ HypStatus hyp_decode_block_sampled(HypModel model,
     if (n_tokens == 0) {
         hyperion::model::ForwardPass::StochasticSample sample{};
         hyperion::model::write_step_result_sampled(
-            out_result, sample, HYP_GOVERNOR_READY, telemetry.snapshot(*kvstate->kv));
+            out_result, sample, telemetry.successful_governor_state(),
+            telemetry.snapshot(*kvstate->kv));
         return hyperion::model::ok();
     }
     const auto operation_plan =

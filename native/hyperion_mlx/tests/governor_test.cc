@@ -327,7 +327,8 @@ int main() {
 
     // At offset 0 with 0 tokens, the prediction reports the current zero-byte global
     // allocation and charges no allocation or attention transient.
-    const auto empty_zero = gov.evaluate(0, 0, kvstate, StepKind::Prefill);
+    const auto empty_zero = gov.evaluate(
+        AdmissionInput{0, 0, StepKind::Prefill, false}, kvstate);
     require(empty_zero.admission == Admission::Accepted,
         "zero-token step at offset 0 must be accepted");
     require(empty_zero.predicted_peak_bytes >= kWorkspaceReserveBytes,
@@ -337,7 +338,8 @@ int main() {
 
     // The first token allocates one full 256-token K+V bucket. Persistent telemetry
     // reports that projected bucket, and admission charges the full new allocation.
-    auto decision = gov.evaluate(1, 0, kvstate, StepKind::Prefill);
+    auto decision = gov.evaluate(
+        AdmissionInput{1, 0, StepKind::Prefill, false}, kvstate);
     require(decision.admission == Admission::Accepted,
         "single prefill token at offset 0 must be accepted");
     require(decision.global_kv_bytes == kGlobalBucketBytes,
@@ -352,8 +354,8 @@ int main() {
     Governor soft_gov(
         geometry, std::numeric_limits<std::uint64_t>::max(),
         empty_zero.predicted_peak_bytes);
-    const auto soft_first_bucket =
-        soft_gov.evaluate(1, 0, kvstate, StepKind::Prefill);
+    const auto soft_first_bucket = soft_gov.evaluate(
+        AdmissionInput{1, 0, StepKind::Prefill, false}, kvstate);
     require(soft_first_bucket.admission == Admission::SoftPaused,
         "first bucket must soft-pause when it exceeds only the soft watermark");
     require(soft_first_bucket.global_kv_bytes == kGlobalBucketBytes,
@@ -361,7 +363,8 @@ int main() {
 
     // More tokens in the same proposed bucket do not add another KV allocation;
     // only the query-width attention transient changes.
-    const auto two_token_first_bucket = gov.evaluate(2, 0, kvstate, StepKind::Prefill);
+    const auto two_token_first_bucket = gov.evaluate(
+        AdmissionInput{2, 0, StepKind::Prefill, false}, kvstate);
     require(two_token_first_bucket.global_kv_bytes == kGlobalBucketBytes,
         "within-bucket proposal must retain one projected global KV bucket");
     require(
@@ -380,9 +383,11 @@ int main() {
         hyperion::model::build_dispatch(geometry),
         hyperion::model::kDefaultGammaMax, mx::bfloat16, s);
     const auto lazy_originals_zero = gov.evaluate(
-        0, 0, materialized_originals_state, StepKind::Prefill);
+        AdmissionInput{0, 0, StepKind::Prefill, false},
+        materialized_originals_state);
     const auto lazy_originals_growth = gov.evaluate(
-        1, 0, materialized_originals_state, StepKind::Prefill);
+        AdmissionInput{1, 0, StepKind::Prefill, false},
+        materialized_originals_state);
     require(
         lazy_originals_growth.predicted_peak_bytes -
                 lazy_originals_zero.predicted_peak_bytes ==
@@ -400,9 +405,11 @@ int main() {
             "explicit local-original eval must make every retained input available");
     }
     const auto available_originals_zero = gov.evaluate(
-        0, 0, materialized_originals_state, StepKind::Prefill);
+        AdmissionInput{0, 0, StepKind::Prefill, false},
+        materialized_originals_state);
     const auto available_originals_growth = gov.evaluate(
-        1, 0, materialized_originals_state, StepKind::Prefill);
+        AdmissionInput{1, 0, StepKind::Prefill, false},
+        materialized_originals_state);
     require(
         available_originals_growth.predicted_peak_bytes -
                 available_originals_zero.predicted_peak_bytes ==
@@ -417,12 +424,16 @@ int main() {
         hyperion::model::kDefaultGammaMax,
         mx::bfloat16,
         s);
-    const auto multistep_zero = gov.evaluate(0, 0, multistep_kvstate, StepKind::Decode);
+    const auto multistep_zero = gov.evaluate(
+        AdmissionInput{0, 0, StepKind::Decode, false}, multistep_kvstate);
     require(
         multistep_zero.predicted_peak_bytes ==
-            gov.evaluate(0, 0, multistep_kvstate, StepKind::Prefill).predicted_peak_bytes,
+            gov.evaluate(
+                AdmissionInput{0, 0, StepKind::Prefill, false},
+                multistep_kvstate).predicted_peak_bytes,
         "zero-token decode must retain a zero-width attention transient");
-    const auto multistep = gov.evaluate(513, 0, multistep_kvstate, StepKind::Decode);
+    const auto multistep = gov.evaluate(
+        AdmissionInput{513, 0, StepKind::Decode, true}, multistep_kvstate);
     require(multistep.global_kv_bytes == 3 * kGlobalBucketBytes,
         "513-token proposal must project three global KV buckets");
     require(
@@ -434,14 +445,17 @@ int main() {
                     .operation_peak_bytes,
         "multi-step decode must charge sequential replacements and one q=1 transient");
     require(
-        predict_peak(513, 0, multistep_kvstate, geometry, StepKind::Decode) ==
+        predict_peak(
+            AdmissionInput{513, 0, StepKind::Decode, true},
+            multistep_kvstate,
+            geometry) ==
             multistep.predicted_peak_bytes,
         "predict_peak must use the same sequential decode replacement sum");
 
     // Prefill appends the same 513 tokens once and therefore allocates only the final
     // three-bucket replacement. This StepKind distinction is load-bearing.
-    const auto multistep_prefill =
-        gov.evaluate(513, 0, multistep_kvstate, StepKind::Prefill);
+    const auto multistep_prefill = gov.evaluate(
+        AdmissionInput{513, 0, StepKind::Prefill, false}, multistep_kvstate);
     require(multistep_prefill.global_kv_bytes == 3 * kGlobalBucketBytes,
         "513-token prefill must project the same final three-bucket allocation");
     require(
@@ -484,10 +498,10 @@ int main() {
     require(!lazy_global_state.global[0].keys().is_available() &&
             !lazy_global_state.global[0].values().is_available(),
         "lazy global negative control must remain unavailable before admission");
-    const auto lazy_global_zero =
-        gov.evaluate(0, 256, lazy_global_state, StepKind::Decode);
-    const auto lazy_global_growth =
-        gov.evaluate(1, 256, lazy_global_state, StepKind::Decode);
+    const auto lazy_global_zero = gov.evaluate(
+        AdmissionInput{0, 256, StepKind::Decode, false}, lazy_global_state);
+    const auto lazy_global_growth = gov.evaluate(
+        AdmissionInput{1, 256, StepKind::Decode, true}, lazy_global_state);
     require(
         lazy_global_growth.predicted_peak_bytes -
                 lazy_global_zero.predicted_peak_bytes ==
@@ -541,7 +555,8 @@ int main() {
     // ── Halve-chunk behavior ──────────────────────────────────────────────────
 
     // A very large direct proposal must signal pressure rather than silently pass.
-    decision = gov.evaluate(1'000'000, 0, kvstate, StepKind::Prefill);
+    decision = gov.evaluate(
+        AdmissionInput{1'000'000, 0, StepKind::Prefill, false}, kvstate);
     require(decision.admission != Admission::Accepted ||
             decision.predicted_peak_bytes <= budget.soft_watermark_bytes,
         "a 1M-token chunk must not be accepted if it breaches the soft watermark");
@@ -618,8 +633,10 @@ int main() {
         mx::eval(kvstate.global[0].keys(), kvstate.global[0].values());
         mx::synchronize(s);
     }
-    const auto four_token_zero = gov.evaluate(0, 4, kvstate, StepKind::Decode);
-    const auto within_allocated_bucket = gov.evaluate(1, 4, kvstate, StepKind::Decode);
+    const auto four_token_zero = gov.evaluate(
+        AdmissionInput{0, 4, StepKind::Decode, false}, kvstate);
+    const auto within_allocated_bucket = gov.evaluate(
+        AdmissionInput{1, 4, StepKind::Decode, true}, kvstate);
     require(within_allocated_bucket.global_kv_bytes == kGlobalBucketBytes,
         "within allocated bucket must retain current persistent global KV bytes");
     require(
@@ -634,8 +651,8 @@ int main() {
     // writes before its later crossing. Charge the current-capacity COW candidate
     // in addition to the eventual two-bucket replacement. One-shot prefill grows
     // before writing and therefore has no analogous current-capacity candidate.
-    const auto later_decode_crossing =
-        gov.evaluate(253, 4, kvstate, StepKind::Decode);
+    const auto later_decode_crossing = gov.evaluate(
+        AdmissionInput{253, 4, StepKind::Decode, true}, kvstate);
     require(
         later_decode_crossing.predicted_peak_bytes ==
             four_token_zero.predicted_peak_bytes + 3 * kGlobalBucketBytes +
@@ -644,8 +661,8 @@ int main() {
                     geometry, AdmissionInput{253, 4, StepKind::Decode, true})
                     .operation_peak_bytes,
         "later decode crossing must charge current candidate plus replacement and local COW");
-    const auto one_shot_prefill_crossing =
-        gov.evaluate(253, 4, kvstate, StepKind::Prefill);
+    const auto one_shot_prefill_crossing = gov.evaluate(
+        AdmissionInput{253, 4, StepKind::Prefill, false}, kvstate);
     require(
         one_shot_prefill_crossing.predicted_peak_bytes ==
             four_token_zero.predicted_peak_bytes + 2 * kGlobalBucketBytes +
@@ -667,10 +684,12 @@ int main() {
 
     // At committed==capacity, zero tokens retain the current bucket. The next token
     // crosses the exact boundary and projects a two-bucket persistent allocation.
-    const auto boundary_zero = gov.evaluate(0, 256, kvstate, StepKind::Decode);
+    const auto boundary_zero = gov.evaluate(
+        AdmissionInput{0, 256, StepKind::Decode, false}, kvstate);
     require(boundary_zero.global_kv_bytes == kGlobalBucketBytes,
         "zero-token probe at an exact boundary must retain current capacity");
-    const auto boundary_crossing = gov.evaluate(1, 256, kvstate, StepKind::Decode);
+    const auto boundary_crossing = gov.evaluate(
+        AdmissionInput{1, 256, StepKind::Decode, true}, kvstate);
     require(boundary_crossing.global_kv_bytes == 2 * kGlobalBucketBytes,
         "first token beyond a full bucket must project the next capacity step");
     require(
@@ -684,8 +703,8 @@ int main() {
 
     // Starting at one full bucket, 513 sequential decode tokens cross replacements
     // of 2 + 3 + 4 buckets and finish with four persistent buckets.
-    const auto boundary_multicross =
-        gov.evaluate(513, 256, kvstate, StepKind::Decode);
+    const auto boundary_multicross = gov.evaluate(
+        AdmissionInput{513, 256, StepKind::Decode, true}, kvstate);
     require(boundary_multicross.global_kv_bytes == 4 * kGlobalBucketBytes,
         "boundary multi-cross decode must project four persistent buckets");
     require(
@@ -706,8 +725,8 @@ int main() {
                 geometry, AdmissionInput{1, 256, StepKind::Decode, true})
                 .operation_peak_bytes;
     Governor tight_gov(geometry, delta_only_ceiling, delta_only_ceiling);
-    const auto replacement_rejection =
-        tight_gov.evaluate(1, 256, kvstate, StepKind::Decode);
+    const auto replacement_rejection = tight_gov.evaluate(
+        AdmissionInput{1, 256, StepKind::Decode, true}, kvstate);
     require(replacement_rejection.admission == Admission::HardRejected,
         "full replacement allocation must reject a ceiling that delta-only charging would admit");
     require(replacement_rejection.global_kv_bytes == 2 * kGlobalBucketBytes,
@@ -730,10 +749,10 @@ int main() {
         two_global_state.global[1].keys(), two_global_state.global[1].values());
     Governor two_global_gov(
         two_global_geometry, budget.effective_bytes, budget.soft_watermark_bytes);
-    const auto two_global_zero =
-        two_global_gov.evaluate(0, 256, two_global_state, StepKind::Decode);
-    const auto one_grows =
-        two_global_gov.evaluate(1, 256, two_global_state, StepKind::Decode);
+    const auto two_global_zero = two_global_gov.evaluate(
+        AdmissionInput{0, 256, StepKind::Decode, false}, two_global_state);
+    const auto one_grows = two_global_gov.evaluate(
+        AdmissionInput{1, 256, StepKind::Decode, true}, two_global_state);
     const std::uint64_t kTwoGlobalOneTokenTransient = predict_transient(
         two_global_geometry,
         AdmissionInput{1, 256, StepKind::Decode, true})
@@ -752,7 +771,13 @@ int main() {
     // Proposals that exceed uint32 committed length / signed-int MLX capacity fail
     // closed instead of wrapping into a small capacity prediction.
     const auto overflow_rejection = gov.evaluate(
-        std::numeric_limits<std::uint32_t>::max(), 256, kvstate, StepKind::Decode);
+        AdmissionInput{
+            std::numeric_limits<std::uint32_t>::max(),
+            256,
+            StepKind::Decode,
+            true,
+        },
+        kvstate);
     require(overflow_rejection.admission == Admission::HardRejected,
         "unrepresentable capacity proposal must fail closed");
     require(
@@ -780,15 +805,17 @@ int main() {
     // ── predict_peak standalone ───────────────────────────────────────────────
 
     // predict_peak must match Governor::evaluate's predicted_peak_bytes.
-    const auto standalone = predict_peak(1, 0, kvstate, geometry, StepKind::Prefill);
-    decision = gov.evaluate(1, 0, kvstate, StepKind::Prefill);
+    const auto standalone = predict_peak(
+        AdmissionInput{1, 0, StepKind::Prefill, false}, kvstate, geometry);
+    decision = gov.evaluate(
+        AdmissionInput{1, 0, StepKind::Prefill, false}, kvstate);
     require(standalone == decision.predicted_peak_bytes,
         "predict_peak must match Governor::evaluate's predicted_peak_bytes");
 
-    const auto continuation_standalone =
-        predict_peak(2, 8, kvstate, geometry, StepKind::Prefill);
-    const auto continuation_decision =
-        gov.evaluate(2, 8, kvstate, StepKind::Prefill);
+    const auto continuation_standalone = predict_peak(
+        AdmissionInput{2, 8, StepKind::Prefill, false}, kvstate, geometry);
+    const auto continuation_decision = gov.evaluate(
+        AdmissionInput{2, 8, StepKind::Prefill, false}, kvstate);
     require(continuation_standalone == continuation_decision.predicted_peak_bytes,
         "predict_peak must include the same continuation-prefill scratch charge");
 

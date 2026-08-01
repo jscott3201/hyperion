@@ -156,6 +156,21 @@ int main(int argc, char** argv) {
         ModelWeights weights = load_model_weights(artifact, g, 64, 4, cpu);
         ForwardPass fwd(g, dispatch, weights, gpu);
 
+        // The production epilogue: tied lm_head -> softcap -> final-position slice ->
+        // host greedy scan. Keeping it above calibration lets the sentinel path measure
+        // the same final-chunk lifetime that the governor predicts.
+        auto epilogue = [&](const mx::array& h, int Lh) -> std::uint32_t {
+            mx::array logits = fwd.softcap(fwd.lm_head(h)); // [1, Lh, vocab]
+            mx::array last = mx::slice(
+                logits,
+                {0, Lh - 1, 0},
+                {1, Lh, static_cast<int>(logits.shape(2))},
+                {1, 1, 1},
+                gpu); // [1, 1, vocab]
+            auto sample = fwd.sample_greedy(last);
+            return sample.token_id;
+        };
+
         // ── M3 governor calibration mode (--calibrate-sentinels, 10:45-46). Runs a full ──
         // prefill at the 8K + 32K sentinels (offset 0), compares the governor's
         // predict_peak() (the LIVE quantized-weights path — NOT peak_within_budget, which
@@ -214,7 +229,11 @@ int main(int argc, char** argv) {
                     const int off1 = static_cast<int>(offset + take);
                     mx::array chunk_ids = mx::slice(ids_ctx, {off0}, {off1}, {1}, gpu);
                     mx::array h = fwd.forward(fwd.embed(chunk_ids), kvstate, offset);
-                    mx::eval(h); // force each chunk + the cache writes before the next
+                    if (offset + take == ctx) {
+                        (void)epilogue(h, static_cast<int>(take));
+                    } else {
+                        mx::eval(h); // force this chunk + cache writes before the next
+                    }
                     offset += take;
                 }
                 mx::synchronize(gpu);
@@ -243,20 +262,6 @@ int main(int argc, char** argv) {
             std::cout << "  ]\n}\n";
             return 0;
         }
-
-        // The epilogue (final-norm → tied lm_head → softcap → last-position → greedy).
-        // Mirrors forward_12b_decode_test. sample_greedy host-scans (the 2.3b lesson).
-        auto epilogue = [&](const mx::array& h, int Lh) -> std::uint32_t {
-            mx::array logits = fwd.softcap(fwd.lm_head(h)); // [1, Lh, vocab]
-            mx::array last = mx::slice(
-                logits,
-                {0, Lh - 1, 0},
-                {1, Lh, static_cast<int>(logits.shape(2))},
-                {1, 1, 1},
-                gpu); // [1, 1, vocab]
-            auto sample = fwd.sample_greedy(last);
-            return sample.token_id;
-        };
 
         // A full generate (prefill + n-1 decode) returning per-token monotonic offsets.
         // offsets[0] = TTFT (prefill → token 0); offsets[1..] = decode tokens.

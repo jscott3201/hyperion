@@ -34,6 +34,11 @@ struct Decision {
     std::string reason;
 };
 
+struct RuntimeEnvironmentDecision {
+    bool supported;
+    const char* reason;
+};
+
 using DeviceInfo =
     std::unordered_map<std::string, std::variant<std::string, std::size_t>>;
 
@@ -42,6 +47,12 @@ using DeviceInfo =
 /// Extract and validate MLX's public Metal recommendation, then derive the
 /// effective/soft budget. Missing, wrong-typed, and zero device data fail closed.
 [[nodiscard]] Decision derive_device_budget(const DeviceInfo& device_info);
+
+/// MLX 0.32.0 accepts any positive ``MLX_SDPA_BLOCKS`` value for the two-pass
+/// vector-attention workspace. The governor intentionally models the pinned
+/// source-selected maximum instead, so an inherited override must fail closed.
+[[nodiscard]] RuntimeEnvironmentDecision evaluate_runtime_environment(
+    bool has_mlx_sdpa_blocks_override);
 
 [[nodiscard]] Decision evaluate(
     bool has_gpu,

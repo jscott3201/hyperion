@@ -161,25 +161,6 @@ class Governor {
         const KvState& kvstate,
         const hyperion::model::KvGrowthPlan* operation_plan = nullptr) const;
 
-    /// Compatibility seam for non-prefill-loop probes. Decode always executes its
-    /// q=1 epilogue; prefill callers that can be final must use ``AdmissionInput``.
-    [[nodiscard]] GovernorDecision evaluate(
-        std::uint32_t n_tokens,
-        std::uint32_t offset,
-        const KvState& kvstate,
-        StepKind step_kind,
-        const hyperion::model::KvGrowthPlan* operation_plan = nullptr) const {
-        return evaluate(
-            AdmissionInput{
-                n_tokens,
-                offset,
-                step_kind,
-                step_kind == StepKind::Decode && n_tokens > 0,
-            },
-            kvstate,
-            operation_plan);
-    }
-
     /// Repeatedly halve a prefill proposal after either hard or soft pressure.
     /// Recomputes K lengths and final-chunk epilogue inclusion at every shape. A
     /// hard decision is terminal only at one token; soft-at-one is executable.
@@ -211,25 +192,6 @@ class Governor {
     const KvState& kvstate,
     const Geometry& geometry,
     const hyperion::model::KvGrowthPlan* operation_plan = nullptr);
-
-[[nodiscard]] inline std::uint64_t predict_peak(
-    std::uint32_t n_tokens,
-    std::uint32_t offset,
-    const KvState& kvstate,
-    const Geometry& geometry,
-    StepKind step_kind,
-    const hyperion::model::KvGrowthPlan* operation_plan = nullptr) {
-    return predict_peak(
-        AdmissionInput{
-            n_tokens,
-            offset,
-            step_kind,
-            step_kind == StepKind::Decode && n_tokens > 0,
-        },
-        kvstate,
-        geometry,
-        operation_plan);
-}
 
 /// Geometry/dispatch-aware transient phase prediction used by admission and the
 /// load-time G4 scaffold. It is independent of live MLX memory and KV allocation.

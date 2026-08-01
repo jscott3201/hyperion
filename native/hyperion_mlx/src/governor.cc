@@ -22,8 +22,9 @@ constexpr std::uint64_t kTransientSafetyDenominator = 4;
 
 constexpr std::uint64_t kMaxBytes = std::numeric_limits<std::uint64_t>::max();
 
-/// The pinned vector two-pass kernel selects at most 1024 blocks without an
-/// MLX_SDPA_BLOCKS override. Hyperion does not set that debug override.
+/// The pinned vector two-pass kernel selects at most 1024 blocks. Model-load
+/// policy rejects MLX_SDPA_BLOCKS because that debug override is otherwise
+/// unbounded and would invalidate this workspace ceiling.
 constexpr std::uint64_t kMaxFusedVectorBlocks = 1024;
 
 std::uint64_t saturating_add(std::uint64_t lhs, std::uint64_t rhs) {
