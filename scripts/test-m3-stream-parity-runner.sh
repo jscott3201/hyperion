@@ -111,6 +111,40 @@ m3_test_assert_static_identity() {
     /usr/bin/jq -e '
         .trust_boundary.active_same_uid_mutation_excluded == true and
         (.trust_boundary.statement | contains("active same-UID mutation")) and
+        .source.repository_root_binding == "<physical-repository-root>" and
+        (.source.git_dir_discovery | contains("linked-worktree gitfile")) and
+        .command.source_git.environment_launcher == "/usr/bin/env -i" and
+        .command.source_git.executable == "/usr/bin/git" and
+        .command.source_git.inherited_environment == "cleared" and
+        .command.source_git.environment.HOME == "<canonical-login-home>" and
+        .command.source_git.environment.PATH == "/usr/bin:/bin:/usr/sbin:/sbin" and
+        .command.source_git.environment.GIT_CONFIG_NOSYSTEM == "1" and
+        .command.source_git.environment.GIT_CONFIG_SYSTEM == "/dev/null" and
+        .command.source_git.environment.GIT_CONFIG_GLOBAL == "/dev/null" and
+        .command.source_git.environment.GIT_ATTR_NOSYSTEM == "1" and
+        .command.source_git.environment.GIT_TERMINAL_PROMPT == "0" and
+        .command.source_git.environment.GIT_PAGER == "" and
+        .command.source_git.environment.GIT_OPTIONAL_LOCKS == "0" and
+        .command.source_git.environment.GIT_NO_LAZY_FETCH == "1" and
+        .command.source_git.repository_binding.working_directory ==
+          "<physical-repository-root>" and
+        .command.source_git.repository_binding.work_tree ==
+          "<physical-repository-root>" and
+        .command.source_git.repository_binding.git_dir ==
+          "repository-native-linked-worktree-aware" and
+        (.command.source_git.global_options | index("--no-optional-locks")) != null and
+        (.command.source_git.command_line_config_overrides |
+          index("core.fsmonitor=false")) != null and
+        (.command.source_git.command_line_config_overrides |
+          index("core.untrackedCache=false")) != null and
+        (.command.source_git.command_line_config_overrides |
+          index("core.ignoreStat=false")) != null and
+        (.command.source_git.command_line_config_overrides |
+          index("core.hooksPath=/dev/null")) != null and
+        (.command.source_git.command_line_config_overrides |
+          index("diff.external=")) != null and
+        (.command.source_git.local_repository_config |
+          contains("command-line safety overrides")) and
         (.execution_identity.controlled_path |
           startswith("/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:"))
     ' "$m3_test_assert_evidence/manifest.json" >/dev/null
@@ -380,6 +414,114 @@ printf '%s\n' \
     'cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f  tokenizer.json' \
     'a62f4e85a47c0c136edaaa3a4f591fd6783717299a9def47e5ad03a49f6a5eb9  tokenizer_config.json' \
     >"$m3_test_owner_artifact/PAYLOAD_SHA256SUMS"
+
+# Hostile inherited Git routing, object, index, config, pager, prompt, and
+# helper state must not divert the physical source preflight. The invocation
+# must bind the real HEAD/tree, report a clean source, and reach the later
+# approved-manifest payload checksum failure without invoking a shim/helper.
+m3_test_hostile_git_evidence="$m3_test_scratch/hostile-git-evidence"
+m3_test_hostile_git_dir="$m3_test_scratch/hostile-git-dir"
+m3_test_hostile_git_work_tree="$m3_test_scratch/hostile-git-work-tree"
+m3_test_hostile_git_objects="$m3_test_scratch/hostile-git-objects"
+m3_test_hostile_git_alternates="$m3_test_scratch/hostile-git-alternates"
+m3_test_hostile_git_index="$m3_test_scratch/hostile-git-index"
+m3_test_hostile_git_global="$m3_test_scratch/hostile-git-global"
+m3_test_hostile_git_system="$m3_test_scratch/hostile-git-system"
+m3_test_hostile_git_helper="$m3_test_scratch/hostile-git-helper"
+m3_test_hostile_git_marker="$m3_test_scratch/hostile-git-helper-executed"
+/bin/mkdir -p \
+    "$m3_test_hostile_git_dir" \
+    "$m3_test_hostile_git_work_tree" \
+    "$m3_test_hostile_git_objects" \
+    "$m3_test_hostile_git_alternates"
+: >"$m3_test_hostile_git_index"
+printf '%s\n' \
+    '#!/bin/bash' \
+    "printf '%s\\n' 'hostile git helper executed' >'$m3_test_hostile_git_marker'" \
+    'exit 97' \
+    >"$m3_test_hostile_git_helper"
+/bin/chmod +x "$m3_test_hostile_git_helper"
+printf '%s\n' \
+    '[core]' \
+    "worktree = $m3_test_hostile_git_work_tree" \
+    "fsmonitor = $m3_test_hostile_git_helper" \
+    '[diff]' \
+    "external = $m3_test_hostile_git_helper" \
+    >"$m3_test_hostile_git_global"
+printf '%s\n' \
+    '[core]' \
+    "worktree = $m3_test_hostile_git_work_tree" \
+    >"$m3_test_hostile_git_system"
+m3_test_expected_source_sha=$(/usr/bin/env -i \
+    HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin TMPDIR="$TMPDIR" \
+    LANG=C LC_ALL=C \
+    /usr/bin/git --no-optional-locks -C "$m3_test_repo_root" \
+    --work-tree="$m3_test_repo_root" rev-parse --verify 'HEAD^{commit}')
+m3_test_expected_source_tree_sha=$(/usr/bin/env -i \
+    HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin TMPDIR="$TMPDIR" \
+    LANG=C LC_ALL=C \
+    /usr/bin/git --no-optional-locks -C "$m3_test_repo_root" \
+    --work-tree="$m3_test_repo_root" rev-parse --verify 'HEAD^{tree}')
+set +e
+PATH="$m3_test_fake_bin:$PATH" \
+    M3_TEST_FAKE_MARKER="$m3_test_fake_marker" \
+    HYPERION_12B_ARTIFACT="$m3_test_owner_artifact" \
+    GIT_DIR="$m3_test_hostile_git_dir" \
+    GIT_COMMON_DIR="$m3_test_hostile_git_dir" \
+    GIT_WORK_TREE="$m3_test_hostile_git_work_tree" \
+    GIT_INDEX_FILE="$m3_test_hostile_git_index" \
+    GIT_OBJECT_DIRECTORY="$m3_test_hostile_git_objects" \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES="$m3_test_hostile_git_alternates" \
+    GIT_CONFIG="$m3_test_hostile_git_global" \
+    GIT_CONFIG_GLOBAL="$m3_test_hostile_git_global" \
+    GIT_CONFIG_SYSTEM="$m3_test_hostile_git_system" \
+    GIT_CONFIG_NOSYSTEM=0 \
+    GIT_CONFIG_COUNT=2 \
+    GIT_CONFIG_KEY_0=core.fsmonitor \
+    GIT_CONFIG_VALUE_0="$m3_test_hostile_git_helper" \
+    GIT_CONFIG_KEY_1=core.worktree \
+    GIT_CONFIG_VALUE_1="$m3_test_hostile_git_work_tree" \
+    GIT_EXEC_PATH="$m3_test_fake_bin" \
+    GIT_EXTERNAL_DIFF="$m3_test_hostile_git_helper" \
+    GIT_PAGER="$m3_test_hostile_git_helper" \
+    GIT_ASKPASS="$m3_test_hostile_git_helper" \
+    GIT_TERMINAL_PROMPT=1 \
+    GIT_OPTIONAL_LOCKS=1 \
+    GIT_NO_LAZY_FETCH=0 \
+    scripts/run-m3-stream-parity.sh "$m3_test_hostile_git_evidence" \
+    >"$m3_test_scratch/hostile-git-invocation.log" 2>&1
+m3_test_hostile_git_status=$?
+set -e
+if (( m3_test_hostile_git_status != 1 )); then
+    echo "hostile-Git runner exit was $m3_test_hostile_git_status, expected 1" >&2
+    /usr/bin/sed -n '1,240p' "$m3_test_scratch/hostile-git-invocation.log" >&2
+    exit 1
+fi
+m3_test_assert_fake_unused
+if [[ -e "$m3_test_hostile_git_marker" ]]; then
+    echo "source preflight invoked a hostile inherited Git helper" >&2
+    exit 1
+fi
+if ! /usr/bin/grep -q 'FAILED' "$m3_test_hostile_git_evidence/identity.log"; then
+    echo "hostile-Git control did not reach the later artifact checksum failure" >&2
+    exit 1
+fi
+/usr/bin/jq -e \
+    --arg source_sha "$m3_test_expected_source_sha" \
+    --arg source_tree_sha "$m3_test_expected_source_tree_sha" '
+    .status == "failed" and
+    .failure_stage == "artifact_identity_preflight" and
+    .exit_status == 1 and
+    .source.sha == $source_sha and
+    .source.tree_sha == $source_tree_sha and
+    .source.clean == true and
+    .artifact.identity_kind == "owner_payload_sha256sums" and
+    .execution.build_exit_status == null and
+    .execution.direct_test_exit_status == null
+' "$m3_test_hostile_git_evidence/manifest.json" >/dev/null
+m3_test_assert_static_identity "$m3_test_hostile_git_evidence"
+m3_test_assert_log_hashes "$m3_test_hostile_git_evidence"
+
 set +e
 PATH="$m3_test_fake_bin:$PATH" \
     M3_TEST_FAKE_MARKER="$m3_test_fake_marker" \
@@ -572,4 +714,4 @@ m3_test_cleanup_race=
 m3_test_cleanup_original=
 
 printf '%s\n' \
-    'm3-stream-parity-runner-regression-pass: identity/environment/artifact/discovery/cleanup controls passed model-free'
+    'm3-stream-parity-runner-regression-pass: identity/environment/git-routing/artifact/discovery/cleanup controls passed model-free'

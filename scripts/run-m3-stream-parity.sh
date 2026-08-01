@@ -146,6 +146,7 @@ m3_ld=/usr/bin/ld
 m3_libtool=/usr/bin/libtool
 m3_install_name_tool=/usr/bin/install_name_tool
 m3_controlled_path="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:$m3_cargo_home/bin"
+m3_source_git_path=/usr/bin:/bin:/usr/sbin:/sbin
 m3_user_tmp=$("$m3_getconf" DARWIN_USER_TEMP_DIR)
 m3_user_tmp=$("$m3_python" -I -S -c '
 import os
@@ -156,6 +157,43 @@ if not os.path.isabs(path) or not os.path.isdir(path) or os.path.islink(path):
     raise SystemExit("canonical Darwin user temporary directory is unavailable")
 print(path)
 ' "$m3_user_tmp")
+
+# Keep every source-binding Git query on one fixed, linked-worktree-aware path.
+# Native discovery still resolves the repository's .git directory or gitfile,
+# while -C/--work-tree bind the physical source tree that Cargo will compile.
+m3_source_git() {
+    "$m3_env" -i \
+        HOME="$m3_login_home" \
+        PATH="$m3_source_git_path" \
+        TMPDIR="$m3_user_tmp" \
+        LANG=C LC_ALL=C \
+        GIT_CONFIG_NOSYSTEM=1 \
+        GIT_CONFIG_SYSTEM=/dev/null \
+        GIT_CONFIG_GLOBAL=/dev/null \
+        GIT_ATTR_NOSYSTEM=1 \
+        GIT_TERMINAL_PROMPT=0 \
+        GIT_PAGER= PAGER= \
+        GIT_OPTIONAL_LOCKS=0 \
+        GIT_NO_LAZY_FETCH=1 \
+        "$m3_git" \
+        --no-optional-locks \
+        -C "$m3_repo_root" \
+        --work-tree="$m3_repo_root" \
+        -c core.fsmonitor=false \
+        -c core.untrackedCache=false \
+        -c core.ignoreStat=false \
+        -c core.trustctime=true \
+        -c core.checkStat=default \
+        -c core.fileMode=true \
+        -c core.symlinks=true \
+        -c core.hooksPath=/dev/null \
+        -c core.pager= \
+        -c pager.status=false \
+        -c diff.external= \
+        -c diff.trustExitCode=false \
+        "$@"
+}
+
 m3_metal_driver=$("$m3_env" -i \
     HOME="$m3_login_home" \
     PATH=/usr/bin:/bin:/usr/sbin:/sbin \
@@ -305,6 +343,7 @@ m3_write_manifest() {
         --arg clang "$m3_clang_version" \
         --arg python3 "$m3_python_version" \
         --arg controlled_path "$m3_controlled_path" \
+        --arg source_git_path "$m3_source_git_path" \
         --arg user_tmp "$m3_user_tmp" \
         --argjson tools "$m3_tool_identities_json" \
         --arg preflight_sha "$m3_preflight_sha" \
@@ -324,7 +363,9 @@ m3_write_manifest() {
           source: {
             sha: (if $source_sha == "" then null else $source_sha end),
             tree_sha: (if $source_tree_sha == "" then null else $source_tree_sha end),
-            clean: $source_clean
+            clean: $source_clean,
+            repository_root_binding: "<physical-repository-root>",
+            git_dir_discovery: "repository-native .git directory or linked-worktree gitfile"
           },
           fixture: {
             path: $fixture_path,
@@ -353,6 +394,48 @@ m3_write_manifest() {
             ],
             environment: {
               HYPERION_12B_ARTIFACT: "<explicit-artifact-root>"
+            },
+            source_git: {
+              environment_launcher: "/usr/bin/env -i",
+              executable: "/usr/bin/git",
+              inherited_environment: "cleared",
+              environment: {
+                HOME: "<canonical-login-home>",
+                PATH: $source_git_path,
+                TMPDIR: $user_tmp,
+                LANG: "C",
+                LC_ALL: "C",
+                GIT_CONFIG_NOSYSTEM: "1",
+                GIT_CONFIG_SYSTEM: "/dev/null",
+                GIT_CONFIG_GLOBAL: "/dev/null",
+                GIT_ATTR_NOSYSTEM: "1",
+                GIT_TERMINAL_PROMPT: "0",
+                GIT_PAGER: "",
+                PAGER: "",
+                GIT_OPTIONAL_LOCKS: "0",
+                GIT_NO_LAZY_FETCH: "1"
+              },
+              repository_binding: {
+                working_directory: "<physical-repository-root>",
+                work_tree: "<physical-repository-root>",
+                git_dir: "repository-native-linked-worktree-aware"
+              },
+              global_options: ["--no-optional-locks"],
+              command_line_config_overrides: [
+                "core.fsmonitor=false",
+                "core.untrackedCache=false",
+                "core.ignoreStat=false",
+                "core.trustctime=true",
+                "core.checkStat=default",
+                "core.fileMode=true",
+                "core.symlinks=true",
+                "core.hooksPath=/dev/null",
+                "core.pager=",
+                "pager.status=false",
+                "diff.external=",
+                "diff.trustExitCode=false"
+              ],
+              local_repository_config: "loaded with the listed command-line safety overrides"
             },
             build_environment: {
               CARGO_TARGET_DIR: "<fresh-runner-target-root>",
@@ -829,20 +912,25 @@ m3_verify_selected_artifact() {
         }'
 }
 m3_failure_stage=source_preflight
-if [[ "$("$m3_git" rev-parse --show-toplevel)" != "$m3_repo_root" ]]; then
+if ! m3_git_toplevel=$(m3_source_git rev-parse --show-toplevel); then
+    m3_note "git repository discovery failed closed"
+    exit 1
+fi
+if [[ "$m3_git_toplevel" != "$m3_repo_root" ]]; then
     m3_note "runner must execute from its exact repository worktree"
     exit 1
 fi
 case "$m3_evidence_root" in
     "$m3_repo_root"/*)
         m3_evidence_relative=${m3_evidence_root#"$m3_repo_root"/}
-        if ! "$m3_git" check-ignore -q "$m3_evidence_relative"; then
+        if ! m3_source_git check-ignore -q -- "$m3_evidence_relative"; then
             m3_note "evidence inside the repository must be under a gitignored path"
             exit 1
         fi
         ;;
 esac
-if ! m3_git_status=$("$m3_git" status --porcelain=v1 --untracked-files=all); then
+if ! m3_git_status=$(m3_source_git status \
+    --porcelain=v1 --untracked-files=all --ignore-submodules=none); then
     m3_note "git status failed closed"
     exit 1
 fi
@@ -851,8 +939,11 @@ if [[ -n "$m3_git_status" ]]; then
     printf '%s\n' "$m3_git_status" >>"$m3_preflight_log"
     exit 1
 fi
-m3_source_sha=$("$m3_git" rev-parse HEAD)
-m3_source_tree_sha=$("$m3_git" rev-parse 'HEAD^{tree}')
+if ! m3_source_sha=$(m3_source_git rev-parse --verify 'HEAD^{commit}') || \
+   ! m3_source_tree_sha=$(m3_source_git rev-parse --verify 'HEAD^{tree}'); then
+    m3_note "source commit or tree binding failed closed"
+    exit 1
+fi
 m3_source_clean=true
 
 m3_failure_stage=artifact_identity_preflight
@@ -1270,12 +1361,18 @@ if [[ "$m3_post_artifact_identity" != "$m3_artifact_identity" ]]; then
 fi
 
 m3_failure_stage=source_postflight
-if [[ "$("$m3_git" rev-parse HEAD)" != "$m3_source_sha" || \
-      "$("$m3_git" rev-parse 'HEAD^{tree}')" != "$m3_source_tree_sha" ]]; then
+if ! m3_post_source_sha=$(m3_source_git rev-parse --verify 'HEAD^{commit}') || \
+   ! m3_post_source_tree_sha=$(m3_source_git rev-parse --verify 'HEAD^{tree}'); then
+    m3_note "postflight source commit or tree binding failed closed"
+    exit 1
+fi
+if [[ "$m3_post_source_sha" != "$m3_source_sha" || \
+      "$m3_post_source_tree_sha" != "$m3_source_tree_sha" ]]; then
     m3_note "source commit or tree changed across the real-model test"
     exit 1
 fi
-if ! m3_post_git_status=$("$m3_git" status --porcelain=v1 --untracked-files=all); then
+if ! m3_post_git_status=$(m3_source_git status \
+    --porcelain=v1 --untracked-files=all --ignore-submodules=none); then
     m3_note "postflight git status failed closed"
     exit 1
 fi
