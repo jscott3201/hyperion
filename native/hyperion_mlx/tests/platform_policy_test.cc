@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <string_view>
+#include <variant>
 
 using hyperion::platform::Version;
 
@@ -47,6 +48,39 @@ int main(int argc, char** argv) {
     require(
         capped.soft_watermark_bytes == 11'596'411'699ULL,
         "the capped soft watermark must be floor(effective * 0.9)");
+
+    hyperion::platform::DeviceInfo valid_device_info{
+        {"max_recommended_working_set_size", static_cast<std::size_t>(recommended)},
+    };
+    const auto device_budget =
+        hyperion::platform::derive_device_budget(valid_device_info);
+    require(device_budget.supported,
+        "a size_t device working-set recommendation must be accepted");
+    require(device_budget.budget.effective_bytes == accepted.budget.effective_bytes,
+        "device-info extraction must feed the existing budget derivation");
+
+    const auto missing_device_budget =
+        hyperion::platform::derive_device_budget({});
+    const auto wrong_type_device_budget =
+        hyperion::platform::derive_device_budget({
+            {"max_recommended_working_set_size", std::string("12713115648")},
+        });
+    const auto zero_device_budget =
+        hyperion::platform::derive_device_budget({
+            {"max_recommended_working_set_size", std::size_t{0}},
+        });
+    require(
+        !missing_device_budget.supported,
+        "missing device recommendation must fail closed");
+    require(
+        !wrong_type_device_budget.supported,
+        "wrong-typed device recommendation must fail closed");
+    require(
+        !zero_device_budget.supported,
+        "zero device recommendation must fail closed");
+    require(missing_device_budget.reason == wrong_type_device_budget.reason &&
+            missing_device_budget.reason == zero_device_budget.reason,
+        "invalid device recommendation data must use one generic rejection reason");
 
     require(
         !hyperion::platform::evaluate(

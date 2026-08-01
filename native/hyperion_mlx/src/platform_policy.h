@@ -1,8 +1,11 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <variant>
 
 namespace hyperion::platform {
 
@@ -31,7 +34,14 @@ struct Decision {
     std::string reason;
 };
 
+using DeviceInfo =
+    std::unordered_map<std::string, std::variant<std::string, std::size_t>>;
+
 [[nodiscard]] Budget derive_budget(std::uint64_t recommended_working_set_bytes);
+
+/// Extract and validate MLX's public Metal recommendation, then derive the
+/// effective/soft budget. Missing, wrong-typed, and zero device data fail closed.
+[[nodiscard]] Decision derive_device_budget(const DeviceInfo& device_info);
 
 [[nodiscard]] Decision evaluate(
     bool has_gpu,

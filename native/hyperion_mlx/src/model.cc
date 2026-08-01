@@ -103,6 +103,26 @@ class DirectKvExecutionGuard {
     bool armed_ = false;
 };
 
+governor::PrefillAdmissionResult admit_prefill_chunk(
+    const governor::Governor& governor,
+    std::uint32_t proposed_n_tokens,
+    std::uint32_t offset,
+    std::uint32_t total_tokens,
+    const KvState& kvstate,
+    const KvGrowthPlan* operation_plan,
+    StepTelemetryAccumulator& telemetry) {
+    auto result = governor.admit_prefill_to_fit(
+        proposed_n_tokens,
+        offset,
+        total_tokens,
+        kvstate,
+        operation_plan);
+    for (std::size_t i = 0; i < result.attempt_count; ++i) {
+        (void)telemetry.observe(result.attempts[i]);
+    }
+    return result;
+}
+
 } // namespace
 
 HypStatus fail(HypStatus status, const char* message) noexcept {
@@ -379,6 +399,12 @@ HypStatus hyp_model_load(HypModel model,
     }
 
     try {
+        const auto device_budget = hyperion::platform::derive_device_budget(
+            mx::device_info(mx::Device::gpu));
+        if (!device_budget.supported) {
+            return hyperion::model::fail(
+                HYP_STATUS_UNSUPPORTED, device_budget.reason.c_str());
+        }
         auto dispatch = std::make_unique<hyperion::model::DispatchTable>(
             hyperion::model::build_dispatch(geo));
         // CPU stream for the safetensors Load (no GPU kernel); GPU stream for compute.
@@ -394,17 +420,13 @@ HypStatus hyp_model_load(HypModel model,
         // geometry/dispatch/weights owned by this handle (lifetimes tied to the model).
         model->fwd = std::make_unique<hyperion::model::ForwardPass>(
             *model->geometry, *model->dispatch, *model->weights, gpu);
-        // M2-2.6b: build the predictive governor from the device-derived budget.
-        // The budget comes from the platform canary (derive_budget: 94.9% of
-        // recommended, clamped to 12 GiB, 90% soft watermark).
-        const std::uint64_t recommended =
-            /* the canary's recommended working set; re-evaluated at load */
-            12ULL * 1024ULL * 1024ULL * 1024ULL; // 12 GiB profile ceiling
-        const auto budget = hyperion::platform::derive_budget(recommended);
+        // M2-2.6b: build the predictive governor from MLX's public device data.
+        // Extraction above fails closed before weight loading for missing,
+        // wrong-typed, or zero recommendation data.
         model->governor = std::make_unique<hyperion::governor::Governor>(
             *model->geometry,
-            budget.effective_bytes,
-            budget.soft_watermark_bytes);
+            device_budget.budget.effective_bytes,
+            device_budget.budget.soft_watermark_bytes);
         model->stream = gpu;
         model->loaded = true;
         return hyperion::model::ok();
@@ -506,13 +528,19 @@ HypStatus hyp_prefill_chunk(HypModel model,
         auto settled_staging_plan = operation_plan;
         settled_staging_plan.requires_transaction = false;
         if (!operation_plan.representable) {
-            const auto decision = telemetry.observe(model->governor->evaluate(
-                std::min<std::uint32_t>(2048, tokens->count), 0, *kvstate->kv,
-                hyperion::governor::StepKind::Prefill, &operation_plan));
+            const auto admission = hyperion::model::admit_prefill_chunk(
+                *model->governor,
+                std::min<std::uint32_t>(2048, tokens->count),
+                0,
+                tokens->count,
+                *kvstate->kv,
+                &operation_plan,
+                telemetry);
             hyperion::model::write_step_result(
                 out_result, hyperion::model::ForwardPass::GreedySample{0, 0.0F, false},
                 0u, HYP_GOVERNOR_HARD_REJECT, telemetry.snapshot(*kvstate->kv));
-            return hyperion::model::fail(HYP_STATUS_OOM_GOVERNOR, decision.reason);
+            return hyperion::model::fail(
+                HYP_STATUS_OOM_GOVERNOR, admission.decision.reason);
         }
         hyperion::model::KvGrowthTransaction transaction(
             kvstate->kv, operation_plan);
@@ -531,44 +559,32 @@ HypStatus hyp_prefill_chunk(HypModel model,
         // The epilogue runs ONLY on the last chunk (intermediate chunks' hidden is discarded).
         // Chunking is bitwise-invariant: each token's hidden attends causally to [0, token]
         // regardless of the chunk split, so the final-position hidden (→ token 1) is stable.
-        // Governor admission (2.6b): predict the peak for each chunk; if it exceeds the
-        // soft watermark, halve the chunk (SoftPaused); if it exceeds the hard ceiling,
-        // reject (HardRejected → HYP_STATUS_OOM_GOVERNOR).
+        // Governor admission (2.6b): repeatedly halve either a hard- or soft-pressure
+        // proposal and re-evaluate its exact shape. Only hard pressure at one token
+        // rejects; soft pressure at one token remains advisory.
         constexpr std::uint32_t kPrefillChunkSize = 2048;
         hyperion::model::ForwardPass::GreedySample sample{0, 0.0F, false};
         std::uint32_t offset = 0;
         const std::uint32_t total = tokens->count;
         while (offset < total) {
             std::uint32_t take = std::min(kPrefillChunkSize, total - offset);
-            // Governor admission: predict the peak for this chunk at the current offset.
-            auto decision = telemetry.observe(model->governor->evaluate(
-                take, offset, transaction.state(),
-                hyperion::governor::StepKind::Prefill,
-                offset == 0 ? &operation_plan : &settled_staging_plan));
-            if (decision.admission == hyperion::governor::Admission::HardRejected) {
-                // Even 1 token would breach the ceiling — reject the whole prefill.
+            const auto admission = hyperion::model::admit_prefill_chunk(
+                *model->governor,
+                take,
+                offset,
+                total,
+                transaction.state(),
+                offset == 0 ? &operation_plan : &settled_staging_plan,
+                telemetry);
+            take = admission.n_tokens;
+            if (admission.decision.admission ==
+                hyperion::governor::Admission::HardRejected) {
+                // The shared shrink loop returns hard only after one token fails.
                 hyperion::model::write_step_result(
                     out_result, hyperion::model::ForwardPass::GreedySample{0, 0.0F, false},
                     0u, HYP_GOVERNOR_HARD_REJECT, telemetry.snapshot(*kvstate->kv));
                 return hyperion::model::fail(
-                    HYP_STATUS_OOM_GOVERNOR, decision.reason);
-            }
-            if (decision.admission == hyperion::governor::Admission::SoftPaused) {
-                // Halve the chunk and retry (down to 1 token; below that, hard reject).
-                take = std::max(std::uint32_t{1}, take / 2);
-                decision = telemetry.observe(model->governor->evaluate(
-                    take, offset, transaction.state(),
-                    hyperion::governor::StepKind::Prefill,
-                    offset == 0 ? &operation_plan : &settled_staging_plan));
-                if (decision.admission == hyperion::governor::Admission::HardRejected) {
-                    hyperion::model::write_step_result(
-                        out_result, hyperion::model::ForwardPass::GreedySample{0, 0.0F, false},
-                        0u, HYP_GOVERNOR_HARD_REJECT, telemetry.snapshot(*kvstate->kv));
-                    return hyperion::model::fail(
-                        HYP_STATUS_OOM_GOVERNOR, decision.reason);
-                }
-                // If still soft-paused at 1 token, proceed anyway (the governor's soft
-                // watermark is advisory; a single token is always safe to attempt).
+                    HYP_STATUS_OOM_GOVERNOR, admission.decision.reason);
             }
             const int off0 = static_cast<int>(offset);
             const int off1 = static_cast<int>(offset + take);
@@ -642,8 +658,14 @@ HypStatus hyp_decode_block(HypModel model,
     const auto operation_plan =
         hyperion::model::plan_kv_growth(*kvstate->kv, n_tokens);
     auto decision = telemetry.observe(model->governor->evaluate(
-        n_tokens, kvstate->offset, *kvstate->kv,
-        hyperion::governor::StepKind::Decode, &operation_plan));
+        hyperion::governor::AdmissionInput{
+            n_tokens,
+            kvstate->offset,
+            hyperion::governor::StepKind::Decode,
+            true,
+        },
+        *kvstate->kv,
+        &operation_plan));
     if (decision.admission == hyperion::governor::Admission::HardRejected) {
         hyperion::model::write_step_result(
             out_result, hyperion::model::ForwardPass::GreedySample{0, 0.0F, false}, 0u,
@@ -752,14 +774,20 @@ HypStatus hyp_prefill_chunk_sampled(HypModel model,
         auto settled_staging_plan = operation_plan;
         settled_staging_plan.requires_transaction = false;
         if (!operation_plan.representable) {
-            const auto decision = telemetry.observe(model->governor->evaluate(
-                std::min<std::uint32_t>(2048, tokens->count), 0, *kvstate->kv,
-                hyperion::governor::StepKind::Prefill, &operation_plan));
+            const auto admission = hyperion::model::admit_prefill_chunk(
+                *model->governor,
+                std::min<std::uint32_t>(2048, tokens->count),
+                0,
+                tokens->count,
+                *kvstate->kv,
+                &operation_plan,
+                telemetry);
             hyperion::model::ForwardPass::StochasticSample rejected{};
             hyperion::model::write_step_result_sampled(
                 out_result, rejected, HYP_GOVERNOR_HARD_REJECT,
                 telemetry.snapshot(*kvstate->kv));
-            return hyperion::model::fail(HYP_STATUS_OOM_GOVERNOR, decision.reason);
+            return hyperion::model::fail(
+                HYP_STATUS_OOM_GOVERNOR, admission.decision.reason);
         }
         hyperion::model::KvGrowthTransaction transaction(
             kvstate->kv, operation_plan);
@@ -775,30 +803,23 @@ HypStatus hyp_prefill_chunk_sampled(HypModel model,
         const std::uint32_t total = tokens->count;
         while (offset < total) {
             std::uint32_t take = std::min(kPrefillChunkSize, total - offset);
-            auto decision = telemetry.observe(model->governor->evaluate(
-                take, offset, transaction.state(),
-                hyperion::governor::StepKind::Prefill,
-                offset == 0 ? &operation_plan : &settled_staging_plan));
-            if (decision.admission == hyperion::governor::Admission::HardRejected) {
+            const auto admission = hyperion::model::admit_prefill_chunk(
+                *model->governor,
+                take,
+                offset,
+                total,
+                transaction.state(),
+                offset == 0 ? &operation_plan : &settled_staging_plan,
+                telemetry);
+            take = admission.n_tokens;
+            if (admission.decision.admission ==
+                hyperion::governor::Admission::HardRejected) {
                 hyperion::model::ForwardPass::StochasticSample rejected{};
                 hyperion::model::write_step_result_sampled(
                     out_result, rejected, HYP_GOVERNOR_HARD_REJECT,
                     telemetry.snapshot(*kvstate->kv));
-                return hyperion::model::fail(HYP_STATUS_OOM_GOVERNOR, decision.reason);
-            }
-            if (decision.admission == hyperion::governor::Admission::SoftPaused) {
-                take = std::max(std::uint32_t{1}, take / 2);
-                decision = telemetry.observe(model->governor->evaluate(
-                    take, offset, transaction.state(),
-                    hyperion::governor::StepKind::Prefill,
-                    offset == 0 ? &operation_plan : &settled_staging_plan));
-                if (decision.admission == hyperion::governor::Admission::HardRejected) {
-                    hyperion::model::ForwardPass::StochasticSample rejected{};
-                    hyperion::model::write_step_result_sampled(
-                        out_result, rejected, HYP_GOVERNOR_HARD_REJECT,
-                        telemetry.snapshot(*kvstate->kv));
-                    return hyperion::model::fail(HYP_STATUS_OOM_GOVERNOR, decision.reason);
-                }
+                return hyperion::model::fail(
+                    HYP_STATUS_OOM_GOVERNOR, admission.decision.reason);
             }
             const int off0 = static_cast<int>(offset);
             const int off1 = static_cast<int>(offset + take);
@@ -866,8 +887,14 @@ HypStatus hyp_decode_block_sampled(HypModel model,
     const auto operation_plan =
         hyperion::model::plan_kv_growth(*kvstate->kv, n_tokens);
     auto decision = telemetry.observe(model->governor->evaluate(
-        n_tokens, kvstate->offset, *kvstate->kv,
-        hyperion::governor::StepKind::Decode, &operation_plan));
+        hyperion::governor::AdmissionInput{
+            n_tokens,
+            kvstate->offset,
+            hyperion::governor::StepKind::Decode,
+            true,
+        },
+        *kvstate->kv,
+        &operation_plan));
     if (decision.admission == hyperion::governor::Admission::HardRejected) {
         hyperion::model::ForwardPass::StochasticSample sample{};
         hyperion::model::write_step_result_sampled(

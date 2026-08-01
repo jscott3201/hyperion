@@ -3,6 +3,7 @@
 #include "kv_cache.h"
 #include "platform_policy.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
@@ -18,6 +19,8 @@ using hyperion::model::LayerType;
 using hyperion::model::build_kv_state;
 using hyperion::model::KvState;
 using hyperion::governor::Admission;
+using hyperion::governor::AdmissionInput;
+using hyperion::governor::AttentionPath;
 using hyperion::governor::Governor;
 using hyperion::governor::GovernorDecision;
 using hyperion::governor::StepKind;
@@ -25,6 +28,7 @@ using hyperion::governor::kGlobalKvBytesPerToken;
 using hyperion::governor::kWorkspaceReserveBytes;
 using hyperion::governor::peak_within_budget;
 using hyperion::governor::predict_peak;
+using hyperion::governor::predict_transient;
 using hyperion::governor::throughput_optimum_context;
 
 namespace {
@@ -71,9 +75,186 @@ Geometry build_tiny_geometry() {
     return g;
 }
 
+void test_transient_model() {
+    const auto geometry = build_tiny_geometry();
+    const AdmissionInput fresh_two{2, 0, StepKind::Prefill, false};
+    const auto base = predict_transient(geometry, fresh_two);
+    require(base.global_phase_bytes > base.local_phase_bytes &&
+            base.attention_peak_bytes == base.global_phase_bytes,
+        "attention peak must select the max local/global phase");
+    require(base.operation_peak_bytes == base.attention_peak_bytes,
+        "non-final prefill must have no epilogue phase");
+
+    auto duplicated = geometry;
+    duplicated.layer_types.insert(
+        duplicated.layer_types.end(),
+        geometry.layer_types.begin(), geometry.layer_types.end());
+    duplicated.num_hidden_layers =
+        static_cast<std::uint32_t>(duplicated.layer_types.size());
+    const auto duplicate_prediction = predict_transient(duplicated, fresh_two);
+    require(duplicate_prediction.local_phase_bytes == base.local_phase_bytes &&
+            duplicate_prediction.global_phase_bytes == base.global_phase_bytes &&
+            duplicate_prediction.attention_peak_bytes == base.attention_peak_bytes,
+        "duplicating same-kind layers must not change a sequential attention transient");
+
+    auto local_only = geometry;
+    local_only.layer_types = {LayerType::Sliding};
+    local_only.num_hidden_layers = 1;
+
+    for (const std::uint32_t dim : {64u, 96u, 128u, 256u}) {
+        local_only.head_dim_local = dim;
+        require(
+            predict_transient(
+                local_only, AdmissionInput{8, 0, StepKind::Prefill, false})
+                    .local_path == AttentionPath::FusedVector,
+            "every pinned equal-dim vector boundary must dispatch fused");
+    }
+    for (const std::uint32_t dim : {64u, 80u, 128u}) {
+        local_only.head_dim_local = dim;
+        require(
+            predict_transient(
+                local_only, AdmissionInput{9, 0, StepKind::Prefill, false})
+                    .local_path == AttentionPath::FusedFull,
+            "every pinned equal-dim full boundary must dispatch fused");
+    }
+    local_only.head_dim_local = 512;
+    require(
+        predict_transient(
+            local_only, AdmissionInput{1, 0, StepKind::Prefill, false})
+                .local_path == AttentionPath::Fallback &&
+            predict_transient(
+                local_only, AdmissionInput{9, 0, StepKind::Prefill, false})
+                .local_path == AttentionPath::Fallback,
+        "unsupported equal head dimensions must fall back in vector and full modes");
+
+    local_only.head_dim_local = 96;
+    require(
+        predict_transient(
+            local_only, AdmissionInput{8, 0, StepKind::Prefill, false})
+                .local_path == AttentionPath::FusedVector,
+        "q<=8 head-dim 96 must use the pinned vector fused path");
+    require(
+        predict_transient(
+            local_only, AdmissionInput{9, 0, StepKind::Prefill, false})
+                .local_path == AttentionPath::Fallback,
+        "q>8 head-dim 96 must fall back (not full-fused)");
+    local_only.head_dim_local = 80;
+    require(
+        predict_transient(
+            local_only, AdmissionInput{8, 0, StepKind::Prefill, false})
+                .local_path == AttentionPath::Fallback,
+        "head-dim 80 must not use the vector fused path");
+    require(
+        predict_transient(
+            local_only, AdmissionInput{9, 0, StepKind::Prefill, false})
+                .local_path == AttentionPath::FusedFull,
+        "q>8 head-dim 80 must use the full fused path");
+    local_only.head_dim_local = 256;
+    require(
+        predict_transient(
+            local_only, AdmissionInput{8, 0, StepKind::Prefill, false})
+                .local_path == AttentionPath::FusedVector &&
+            predict_transient(
+                local_only, AdmissionInput{9, 0, StepKind::Prefill, false})
+                .local_path == AttentionPath::Fallback,
+        "head-dim 256 must cross from vector fused to fallback at q=9");
+
+    local_only.num_attention_heads = 8;
+    local_only.num_kv_heads_local = 1;
+    require(
+        predict_transient(
+            local_only, AdmissionInput{4, 0, StepKind::Prefill, false})
+                .local_path == AttentionPath::FusedVector &&
+            predict_transient(
+                local_only, AdmissionInput{5, 0, StepKind::Prefill, false})
+                .local_path == AttentionPath::Fallback,
+        "vector fused dispatch must enforce q*gqa <= 32");
+
+    local_only.num_attention_heads = 4;
+    local_only.num_kv_heads_local = 2;
+    const auto fallback_nine = predict_transient(
+        local_only, AdmissionInput{9, 0, StepKind::Prefill, false});
+    constexpr std::uint64_t kFallbackNineBytes =
+        (4ULL * 9 * 9 * 2 + 4ULL * 9 * 256 * 2 + 9ULL * 9) * 5 / 4;
+    require(fallback_nine.local_phase_bytes == kFallbackNineBytes,
+        "fallback phase must include BF16 scores/output and the explicit bool mask");
+    const auto fallback_ten = predict_transient(
+        local_only, AdmissionInput{10, 0, StepKind::Prefill, false});
+    require(fallback_ten.local_phase_bytes > fallback_nine.local_phase_bytes,
+        "fallback score and mask storage must grow with q and k");
+
+    local_only.sliding_window = 4096;
+    const auto long_vector = predict_transient(
+        local_only, AdmissionInput{1, 1023, StepKind::Decode, true});
+    constexpr std::uint64_t kVectorRows = 4ULL * 1 * 1024;
+    constexpr std::uint64_t kVectorWorkspace =
+        kVectorRows * (256ULL * 2 + 2ULL * sizeof(float));
+    constexpr std::uint64_t kLongVectorPhase =
+        (4ULL * 1 * 256 * 2 + 1ULL * 1024 + kVectorWorkspace) * 5 / 4;
+    require(long_vector.local_path == AttentionPath::FusedVector &&
+            long_vector.local_phase_bytes == kLongVectorPhase,
+        "long-context fused vector phase must include the pinned two-pass workspace");
+
+    auto local_dominates = geometry;
+    local_dominates.head_dim_local = 256;
+    const auto local_max = predict_transient(
+        local_dominates, AdmissionInput{9, 0, StepKind::Prefill, false});
+    require(local_max.local_phase_bytes > local_max.global_phase_bytes &&
+            local_max.attention_peak_bytes == local_max.local_phase_bytes,
+        "attention peak must select local when its fallback phase is larger");
+
+    auto epilogue_geometry = geometry;
+    epilogue_geometry.vocab_size = 1'000'000;
+    const auto non_final = predict_transient(
+        epilogue_geometry, AdmissionInput{4, 0, StepKind::Prefill, false});
+    const auto final = predict_transient(
+        epilogue_geometry, AdmissionInput{4, 0, StepKind::Prefill, true});
+    require(non_final.epilogue_phase_bytes == 0,
+        "non-final prefill chunk must not charge the logits epilogue");
+    require(final.epilogue_phase_bytes == 4ULL * 1'000'000 * 2 * 5 / 4 &&
+            final.operation_peak_bytes == final.epilogue_phase_bytes,
+        "final prefill must charge the full q*vocab BF16 logits phase");
+
+    const auto fresh_lengths = predict_transient(
+        geometry, AdmissionInput{5, 0, StepKind::Prefill, false});
+    require(fresh_lengths.local_kv_length == 5 &&
+            fresh_lengths.global_kv_length == 5,
+        "fresh prefill K length must equal q for both kinds");
+    const auto continuation_lengths = predict_transient(
+        geometry, AdmissionInput{5, 10, StepKind::Prefill, false});
+    require(continuation_lengths.local_kv_length == 13 &&
+            continuation_lengths.global_kv_length == 15,
+        "continuation K lengths must match assembled local and full global axes");
+    const auto decode_lengths = predict_transient(
+        geometry, AdmissionInput{5, 10, StepKind::Decode, true});
+    require(decode_lengths.local_kv_length == 8 &&
+            decode_lengths.global_kv_length == 15,
+        "sequential decode must use the final q=1 step's K lengths");
+
+    auto overflow_geometry = local_only;
+    overflow_geometry.num_attention_heads =
+        std::numeric_limits<std::uint32_t>::max();
+    overflow_geometry.num_kv_heads_local = 1;
+    overflow_geometry.head_dim_local = 512;
+    const auto saturated = predict_transient(
+        overflow_geometry,
+        AdmissionInput{
+            std::numeric_limits<std::uint32_t>::max(),
+            0,
+            StepKind::Prefill,
+            false,
+        });
+    require(
+        saturated.operation_peak_bytes ==
+            std::numeric_limits<std::uint64_t>::max(),
+        "unrepresentable transient geometry must saturate upward and fail closed");
+}
+
 } // namespace
 
 int main() {
+    test_transient_model();
+
     // Self-skip on CI (no GPU): the governor reads mx::get_active_memory() which
     // requires a live MLX device. If there's no GPU, exit 0 (like the other M5-gated
     // tests).
@@ -140,8 +321,9 @@ int main() {
     constexpr std::uint64_t kLocalStagingCowBytes =
         5ULL * 2 * 16 * 2 * 64 * 2; // layers * K+V * cap * heads * dim * BF16
     constexpr std::uint64_t kLocalLazyOriginalBytes = kLocalStagingCowBytes;
-    constexpr std::uint64_t kOneTokenTransient =
-        (5ULL * 1 * 64 * 4 * 2 + 1ULL * 1 * 128 * 4 * 2) * 5 / 4;
+    const std::uint64_t kOneTokenTransient = predict_transient(
+        geometry, AdmissionInput{1, 0, StepKind::Prefill, false})
+        .operation_peak_bytes;
 
     // At offset 0 with 0 tokens, the prediction reports the current zero-byte global
     // allocation and charges no allocation or attention transient.
@@ -186,7 +368,9 @@ int main() {
         two_token_first_bucket.predicted_peak_bytes ==
             empty_zero.predicted_peak_bytes + kGlobalBucketBytes +
                 kLocalStagingCowBytes + kLocalLazyOriginalBytes +
-                2 * kOneTokenTransient,
+                predict_transient(
+                    geometry, AdmissionInput{2, 0, StepKind::Prefill, false})
+                    .operation_peak_bytes,
         "within-bucket proposal must not charge per-logical-token KV growth");
 
     // The lazy-original term is conditional, not a permanent doubling. Pin the
@@ -245,7 +429,9 @@ int main() {
         multistep.predicted_peak_bytes ==
             multistep_zero.predicted_peak_bytes + 6 * kGlobalBucketBytes +
                 kLocalStagingCowBytes + kLocalLazyOriginalBytes +
-                kOneTokenTransient,
+                predict_transient(
+                    geometry, AdmissionInput{513, 0, StepKind::Decode, true})
+                    .operation_peak_bytes,
         "multi-step decode must charge sequential replacements and one q=1 transient");
     require(
         predict_peak(513, 0, multistep_kvstate, geometry, StepKind::Decode) ==
@@ -262,8 +448,30 @@ int main() {
         multistep_prefill.predicted_peak_bytes ==
             multistep_zero.predicted_peak_bytes + 3 * kGlobalBucketBytes +
                 kLocalStagingCowBytes + kLocalLazyOriginalBytes +
-                513 * kOneTokenTransient,
+                predict_transient(
+                    geometry, AdmissionInput{513, 0, StepKind::Prefill, false})
+                    .operation_peak_bytes,
         "multi-step prefill must charge only its one final replacement allocation");
+
+    // A whole-public-call plan controls the shallow transaction and its staging/COW
+    // lifetime, but replacement projection remains the current chunk's derived plan.
+    // The first token of a 513-token operation must therefore project one bucket,
+    // never pre-charge the operation's final three-bucket global capacity.
+    const auto whole_prefill_plan =
+        hyperion::model::plan_kv_growth(multistep_kvstate, 513);
+    const auto first_chunk_with_whole_plan = gov.evaluate(
+        AdmissionInput{1, 0, StepKind::Prefill, false},
+        multistep_kvstate,
+        &whole_prefill_plan);
+    const auto first_chunk_derived = gov.evaluate(
+        AdmissionInput{1, 0, StepKind::Prefill, false},
+        multistep_kvstate);
+    require(first_chunk_with_whole_plan.global_kv_bytes == kGlobalBucketBytes,
+        "whole-operation staging must not replace per-chunk global growth projection");
+    require(
+        first_chunk_with_whole_plan.predicted_peak_bytes ==
+            first_chunk_derived.predicted_peak_bytes,
+        "whole-operation and current-chunk growth plans must retain distinct lifetimes");
 
     // An unavailable non-empty global input is retained by the replacement graph
     // even at an exact boundary. It is not yet represented by settled memory, so
@@ -285,44 +493,118 @@ int main() {
                 lazy_global_zero.predicted_peak_bytes ==
             2 * kGlobalBucketBytes + kGlobalBucketBytes +
                 kLocalStagingCowBytes + kLocalLazyOriginalBytes +
-                kOneTokenTransient,
+                predict_transient(
+                    geometry, AdmissionInput{1, 256, StepKind::Decode, true})
+                    .operation_peak_bytes,
         "unavailable old global K+V must be charged at exact growth");
 
     // Multi-token continuation prefill assembles a bounded local K+V buffer from the
-    // retained prefix plus the current chunk. At offset 8 the tiny fixture retains the
-    // full window, so q=2 charges exactly 5 KiB once (not once per sliding layer).
-    const auto fresh_prefill = gov.evaluate(2, 0, kvstate, StepKind::Prefill);
-    const auto continuation_prefill = gov.evaluate(2, 8, kvstate, StepKind::Prefill);
+    // retained prefix plus the current chunk. It coexists with one local attention
+    // phase; neither component is multiplied by the number of sliding layers.
+    const auto fresh_transient = predict_transient(
+        geometry, AdmissionInput{2, 0, StepKind::Prefill, false});
+    const auto continuation_transient = predict_transient(
+        geometry, AdmissionInput{2, 8, StepKind::Prefill, false});
     constexpr std::uint64_t kExpectedContinuationCharge =
         2ULL * (8 + 2) * 2 * 64 * 2; // K+V * len * kv_heads * dim * bf16
     require(
-        continuation_prefill.predicted_peak_bytes ==
-            fresh_prefill.predicted_peak_bytes + kExpectedContinuationCharge,
-        "continuation prefill must charge the assembled local K+V scratch");
+        continuation_transient.local_phase_bytes ==
+            (4ULL * 2 * 64 * 2 + 2ULL * (8 + 2)) * 5 / 4 +
+                kExpectedContinuationCharge,
+        "continuation local phase must coexist with one assembled K+V scratch pair");
+    require(continuation_transient.local_phase_bytes > fresh_transient.local_phase_bytes,
+        "continuation local phase must grow beyond fresh-prefill attention");
     constexpr std::uint64_t kExpectedPartialPrefixCharge =
         2ULL * (4 + 2) * 2 * 64 * 2;
+    const auto partial_transient = predict_transient(
+        geometry, AdmissionInput{2, 4, StepKind::Prefill, false});
     require(
-        gov.evaluate(2, 4, kvstate, StepKind::Prefill).predicted_peak_bytes ==
-            fresh_prefill.predicted_peak_bytes + kExpectedPartialPrefixCharge,
+        partial_transient.local_phase_bytes ==
+            (4ULL * 2 * 64 * 2 + 2ULL * (4 + 2)) * 5 / 4 +
+                kExpectedPartialPrefixCharge,
         "continuation scratch must use the available prefix below the window");
     require(
-        gov.evaluate(1, 12, kvstate, StepKind::Prefill).predicted_peak_bytes ==
-            gov.evaluate(1, 0, kvstate, StepKind::Prefill).predicted_peak_bytes,
+        predict_transient(
+            geometry, AdmissionInput{1, 12, StepKind::Prefill, false})
+                .local_phase_bytes ==
+            (4ULL * 1 * 64 * 2 + 1ULL * geometry.sliding_window) * 5 / 4,
         "single-token prefill must not charge continuation-prefill scratch");
     require(
-        gov.evaluate(2, 8, kvstate, StepKind::Decode).predicted_peak_bytes ==
-            gov.evaluate(1, 8, kvstate, StepKind::Decode).predicted_peak_bytes,
-        "multi-token decode must retain the q=1 transient execution shape");
+        predict_transient(
+            geometry, AdmissionInput{2, 8, StepKind::Decode, true})
+                .global_kv_length == 10 &&
+            predict_transient(
+                geometry, AdmissionInput{1, 8, StepKind::Decode, true})
+                .global_kv_length == 9,
+        "multi-token decode peak must use the final sequential q=1 K length");
 
     // ── Halve-chunk behavior ──────────────────────────────────────────────────
 
-    // A very large prefill chunk should trigger SoftPaused (halve-chunk) or
-    // HardRejected if even 1 token breaches the ceiling. For the tiny geometry
-    // on the 12 GiB ceiling, a 1M-token chunk should at least SoftPause.
+    // A very large direct proposal must signal pressure rather than silently pass.
     decision = gov.evaluate(1'000'000, 0, kvstate, StepKind::Prefill);
     require(decision.admission != Admission::Accepted ||
             decision.predicted_peak_bytes <= budget.soft_watermark_bytes,
         "a 1M-token chunk must not be accepted if it breaches the soft watermark");
+
+    const auto prefill_one = gov.evaluate(
+        AdmissionInput{1, 0, StepKind::Prefill, false}, kvstate);
+    const auto prefill_two = gov.evaluate(
+        AdmissionInput{2, 0, StepKind::Prefill, false}, kvstate);
+
+    Governor hard_then_fit(
+        geometry,
+        prefill_two.predicted_peak_bytes,
+        prefill_two.predicted_peak_bytes);
+    const auto hard_fit = hard_then_fit.admit_prefill_to_fit(
+        8, 0, 16, kvstate);
+    require(hard_fit.n_tokens == 2 &&
+            hard_fit.decision.admission == Admission::Accepted &&
+            hard_fit.attempt_count == 3,
+        "hard pressure above one token must repeatedly halve until a shape fits");
+    require(hard_fit.attempts[0].admission == Admission::HardRejected &&
+            hard_fit.attempts[1].admission == Admission::HardRejected,
+        "every oversized hard proposal must be retained as a shrink attempt");
+
+    Governor soft_to_one(
+        geometry,
+        std::numeric_limits<std::uint64_t>::max(),
+        prefill_one.predicted_peak_bytes - 1);
+    const auto soft_fit = soft_to_one.admit_prefill_to_fit(
+        8, 0, 16, kvstate);
+    require(soft_fit.n_tokens == 1 &&
+            soft_fit.decision.admission == Admission::SoftPaused &&
+            soft_fit.attempt_count == 4,
+        "repeated soft pressure must reach an executable advisory one-token shape");
+
+    Governor hard_at_one(
+        geometry,
+        prefill_one.predicted_peak_bytes - 1,
+        prefill_one.predicted_peak_bytes - 1);
+    const auto hard_reject = hard_at_one.admit_prefill_to_fit(
+        4, 0, 16, kvstate);
+    require(hard_reject.n_tokens == 1 &&
+            hard_reject.decision.admission == Admission::HardRejected &&
+            hard_reject.attempt_count == 3,
+        "prefill may terminally reject only after the one-token shape is hard over budget");
+
+    auto large_vocab_geometry = geometry;
+    large_vocab_geometry.vocab_size = 1'000'000;
+    Governor large_vocab_probe(
+        large_vocab_geometry,
+        std::numeric_limits<std::uint64_t>::max(),
+        std::numeric_limits<std::uint64_t>::max());
+    const auto non_final_two = large_vocab_probe.evaluate(
+        AdmissionInput{2, 0, StepKind::Prefill, false}, kvstate);
+    Governor final_chunk_shrink(
+        large_vocab_geometry,
+        non_final_two.predicted_peak_bytes,
+        non_final_two.predicted_peak_bytes);
+    const auto final_recheck = final_chunk_shrink.admit_prefill_to_fit(
+        4, 0, 4, kvstate);
+    require(final_recheck.n_tokens == 2 &&
+            final_recheck.decision.admission == Admission::Accepted &&
+            final_recheck.attempt_count == 2,
+        "halving a rejected final chunk must re-evaluate the smaller shape as non-final");
 
     // ── Telemetry fields ──────────────────────────────────────────────────────
 
@@ -342,7 +624,10 @@ int main() {
         "within allocated bucket must retain current persistent global KV bytes");
     require(
         within_allocated_bucket.predicted_peak_bytes ==
-            four_token_zero.predicted_peak_bytes + kOneTokenTransient,
+            four_token_zero.predicted_peak_bytes +
+                predict_transient(
+                    geometry, AdmissionInput{1, 4, StepKind::Decode, true})
+                    .operation_peak_bytes,
         "within allocated bucket must charge zero KV allocation transient");
 
     // A sequential block that starts inside the bucket performs staged no-growth
@@ -355,7 +640,9 @@ int main() {
         later_decode_crossing.predicted_peak_bytes ==
             four_token_zero.predicted_peak_bytes + 3 * kGlobalBucketBytes +
                 kLocalStagingCowBytes + kLocalLazyOriginalBytes +
-                kOneTokenTransient,
+                predict_transient(
+                    geometry, AdmissionInput{253, 4, StepKind::Decode, true})
+                    .operation_peak_bytes,
         "later decode crossing must charge current candidate plus replacement and local COW");
     const auto one_shot_prefill_crossing =
         gov.evaluate(253, 4, kvstate, StepKind::Prefill);
@@ -363,8 +650,9 @@ int main() {
         one_shot_prefill_crossing.predicted_peak_bytes ==
             four_token_zero.predicted_peak_bytes + 2 * kGlobalBucketBytes +
                 kLocalStagingCowBytes + kLocalLazyOriginalBytes +
-                253 * kOneTokenTransient +
-                2ULL * (4 + 253) * 2 * 64 * 2,
+                predict_transient(
+                    geometry, AdmissionInput{253, 4, StepKind::Prefill, false})
+                    .operation_peak_bytes,
         "one-shot prefill crossing must not charge decode's current-capacity candidate");
 
     // Fill the remainder to the exact end of the first 256-token bucket.
@@ -389,7 +677,9 @@ int main() {
         boundary_crossing.predicted_peak_bytes ==
             boundary_zero.predicted_peak_bytes + 2 * kGlobalBucketBytes +
                 kLocalStagingCowBytes + kLocalLazyOriginalBytes +
-                kOneTokenTransient,
+                predict_transient(
+                    geometry, AdmissionInput{1, 256, StepKind::Decode, true})
+                    .operation_peak_bytes,
         "256 to 257 must charge replacement K+V plus local staging COW");
 
     // Starting at one full bucket, 513 sequential decode tokens cross replacements
@@ -402,7 +692,9 @@ int main() {
         boundary_multicross.predicted_peak_bytes ==
             boundary_zero.predicted_peak_bytes + 9 * kGlobalBucketBytes +
                 kLocalStagingCowBytes + kLocalLazyOriginalBytes +
-                kOneTokenTransient,
+                predict_transient(
+                    geometry, AdmissionInput{513, 256, StepKind::Decode, true})
+                    .operation_peak_bytes,
         "boundary multi-cross decode must charge replacements plus local staging COW");
 
     // A ceiling that would admit delta-only accounting must reject full replacement
@@ -410,7 +702,9 @@ int main() {
     const std::uint64_t delta_only_ceiling =
         boundary_zero.predicted_peak_bytes + kGlobalBucketBytes +
             kLocalStagingCowBytes + kLocalLazyOriginalBytes +
-            kOneTokenTransient;
+            predict_transient(
+                geometry, AdmissionInput{1, 256, StepKind::Decode, true})
+                .operation_peak_bytes;
     Governor tight_gov(geometry, delta_only_ceiling, delta_only_ceiling);
     const auto replacement_rejection =
         tight_gov.evaluate(1, 256, kvstate, StepKind::Decode);
@@ -440,8 +734,14 @@ int main() {
         two_global_gov.evaluate(0, 256, two_global_state, StepKind::Decode);
     const auto one_grows =
         two_global_gov.evaluate(1, 256, two_global_state, StepKind::Decode);
-    constexpr std::uint64_t kTwoGlobalOneTokenTransient =
-        (5ULL * 1 * 64 * 4 * 2 + 2ULL * 1 * 128 * 4 * 2) * 5 / 4;
+    const std::uint64_t kTwoGlobalOneTokenTransient = predict_transient(
+        two_global_geometry,
+        AdmissionInput{1, 256, StepKind::Decode, true})
+        .operation_peak_bytes;
+    require(kTwoGlobalOneTokenTransient == predict_transient(
+            geometry, AdmissionInput{1, 256, StepKind::Decode, true})
+            .operation_peak_bytes,
+        "duplicating a global layer must not change the per-phase transient");
     require(
         one_grows.predicted_peak_bytes ==
             two_global_zero.predicted_peak_bytes + 2 * kGlobalBucketBytes +
