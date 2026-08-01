@@ -192,6 +192,25 @@ m3_test_assert_static_identity() {
         .command.shell.privileged_mode_required == true and
         (.command.shell.inherited_startup_state | contains("BASH_ENV")) and
         (.command.shell.inherited_startup_state | contains("imported functions")) and
+        .command.developer_tools.selection.environment_launcher == "/usr/bin/env -i" and
+        .command.developer_tools.selection.executable == "/usr/bin/xcode-select" and
+        .command.developer_tools.selection.argv ==
+          ["/usr/bin/xcode-select", "--print-path"] and
+        .command.developer_tools.selection.inherited_environment == "cleared" and
+        .command.developer_tools.selection.DEVELOPER_DIR == null and
+        .command.developer_tools.pin.variable == "DEVELOPER_DIR" and
+        .command.developer_tools.pin.scopes == [
+          "xcrun_tool_discovery",
+          "source_git",
+          "runner_python_helpers",
+          "toolchain_queries",
+          "cargo_build",
+          "direct_test"
+        ] and
+        .command.developer_tools.xcrun.environment_launcher == "/usr/bin/env -i" and
+        .command.developer_tools.xcrun.executable == "/usr/bin/xcrun" and
+        .command.developer_tools.xcrun.inherited_environment == "cleared" and
+        .command.developer_tools.python_helpers.executable == "/usr/bin/python3" and
         .command.hashing.environment_launcher == "/usr/bin/env -i" and
         .command.hashing.executable == "/usr/bin/shasum" and
         .command.hashing.runtime == "/usr/bin/perl" and
@@ -220,6 +239,8 @@ m3_test_assert_static_identity() {
         .command.source_git.executable == "/usr/bin/git" and
         .command.source_git.inherited_environment == "cleared" and
         .command.source_git.environment.HOME == "<canonical-login-home>" and
+        .command.source_git.environment.DEVELOPER_DIR ==
+          .command.developer_tools.pin.canonical_value and
         .command.source_git.environment.PATH == "/usr/bin:/bin:/usr/sbin:/sbin" and
         .command.source_git.environment.GIT_CONFIG_NOSYSTEM == "1" and
         .command.source_git.environment.GIT_CONFIG_SYSTEM == "/dev/null" and
@@ -248,6 +269,16 @@ m3_test_assert_static_identity() {
           index("diff.external=")) != null and
         (.command.source_git.local_repository_config |
           contains("command-line safety overrides")) and
+        .command.toolchain_query_environment.DEVELOPER_DIR ==
+          .command.developer_tools.pin.canonical_value and
+        .command.build_environment.DEVELOPER_DIR ==
+          .command.developer_tools.pin.canonical_value and
+        .command.direct_test_environment.DEVELOPER_DIR ==
+          .command.developer_tools.pin.canonical_value and
+        .command.developer_tools.xcrun.DEVELOPER_DIR ==
+          .command.developer_tools.pin.canonical_value and
+        .command.developer_tools.python_helpers.DEVELOPER_DIR ==
+          .command.developer_tools.pin.canonical_value and
         (.execution_identity.controlled_path |
           startswith("/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:"))
     ' "$m3_test_assert_evidence/manifest.json" >/dev/null
@@ -259,6 +290,11 @@ m3_test_assert_static_identity() {
         (.execution_identity.xcode_binding as $binding |
           ($binding.developer_dir.invocation_path | startswith("/")) and
           ($binding.developer_dir.canonical_path | startswith("/")) and
+          $binding.environment_pin.DEVELOPER_DIR ==
+            $binding.developer_dir.canonical_path and
+          ($binding.postflight_verified | type) == "boolean" and
+          .command.developer_tools.pin.canonical_value ==
+            $binding.developer_dir.canonical_path and
           $binding.metal_driver.invocation_path ==
             $tools.metal_driver.invocation_path and
           $binding.metal_driver.canonical_path ==
@@ -285,9 +321,11 @@ m3_test_assert_static_identity() {
 # This invocation reaches fixed dirname/date/mkdir/python/shasum/jq work in the
 # new runner. The prior runner would execute at least the prepended dirname shim.
 m3_test_evidence="$m3_test_scratch/evidence"
+m3_test_hostile_developer_dir="$m3_test_scratch/hostile-developer-dir"
 set +e
 /usr/bin/env -u HYPERION_12B_ARTIFACT \
     PATH="$m3_test_fake_bin:$PATH" \
+    DEVELOPER_DIR="$m3_test_hostile_developer_dir" \
     M3_TEST_FAKE_MARKER="$m3_test_fake_marker" \
     scripts/run-m3-stream-parity.sh "$m3_test_evidence" \
     >"$m3_test_scratch/invocation.log" 2>&1
@@ -312,7 +350,7 @@ if [[ -s "$m3_test_evidence/identity.log" || \
     echo "missing-artifact runner wrote identity/build/test output before rejection" >&2
     exit 1
 fi
-/usr/bin/jq -e '
+/usr/bin/jq -e --arg hostile_developer_dir "$m3_test_hostile_developer_dir" '
     .schema == "hyperion.m3-stream-parity-evidence.v1" and
     .status == "failed" and
     .failure_stage == "artifact_environment" and
@@ -325,6 +363,8 @@ fi
     .artifact.identity_kind == null and
     .artifact.manifest_sha256 == null and
     .artifact.identity == null and
+    .command.developer_tools.pin.canonical_value != $hostile_developer_dir and
+    .execution_identity.xcode_binding.postflight_verified == false and
     .command.build_argv == [
       "cargo", "test", "--locked", "--offline",
       "-p", "hyperion-server", "--test", "contract",
@@ -951,15 +991,30 @@ printf '%s\n' '#!/bin/bash' 'exit 0' >"$m3_test_versioned_driver"
 /bin/chmod +x "$m3_test_versioned_driver"
 m3_test_versioned_developer_canonical=$(cd "$m3_test_versioned_developer" && pwd -P)
 m3_test_versioned_driver_canonical=$(cd "${m3_test_versioned_driver%/*}" && pwd -P)/metal
+m3_test_versioned_selection=$(/usr/bin/python3 -I -S \
+    "$m3_test_xcode_binding_helper" \
+    selection "$m3_test_versioned_developer")
+/usr/bin/jq -e \
+    --arg invocation "$m3_test_versioned_developer" \
+    --arg canonical "$m3_test_versioned_developer_canonical" '
+    .developer_dir.invocation_path == $invocation and
+    .developer_dir.canonical_path == $canonical and
+    has("environment_pin") == false and
+    has("metal_driver") == false
+' <<<"$m3_test_versioned_selection" >/dev/null
 m3_test_versioned_binding=$(/usr/bin/python3 -I -S \
     "$m3_test_xcode_binding_helper" \
-    "$m3_test_versioned_developer" "$m3_test_versioned_driver")
+    binding \
+    "$m3_test_versioned_developer" \
+    "$m3_test_versioned_developer_canonical" \
+    "$m3_test_versioned_driver")
 /usr/bin/jq -e \
     --arg invocation "$m3_test_versioned_developer" \
     --arg canonical "$m3_test_versioned_developer_canonical" \
     --arg driver "$m3_test_versioned_driver_canonical" '
     .developer_dir.invocation_path == $invocation and
     .developer_dir.canonical_path == $canonical and
+    .environment_pin.DEVELOPER_DIR == $canonical and
     .metal_driver.canonical_path == $driver
 ' <<<"$m3_test_versioned_binding" >/dev/null
 
@@ -968,22 +1023,46 @@ m3_test_unversioned_developer="$m3_test_xcode_layout/Xcode.app/Contents/Develope
 m3_test_unversioned_driver="$m3_test_unversioned_developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/metal"
 m3_test_unversioned_binding=$(/usr/bin/python3 -I -S \
     "$m3_test_xcode_binding_helper" \
-    "$m3_test_unversioned_developer" "$m3_test_unversioned_driver")
+    binding \
+    "$m3_test_unversioned_developer" \
+    "$m3_test_versioned_developer_canonical" \
+    "$m3_test_unversioned_driver")
 /usr/bin/jq -e \
     --arg invocation "$m3_test_unversioned_developer" \
     --arg canonical "$m3_test_versioned_developer_canonical" \
     --arg driver "$m3_test_versioned_driver_canonical" '
     .developer_dir.invocation_path == $invocation and
     .developer_dir.canonical_path == $canonical and
+    .environment_pin.DEVELOPER_DIR == $canonical and
     .metal_driver.canonical_path == $driver
 ' <<<"$m3_test_unversioned_binding" >/dev/null
+
+if /usr/bin/python3 -I -S "$m3_test_xcode_binding_helper" \
+    binding \
+    "$m3_test_unversioned_developer" \
+    "$m3_test_unversioned_developer" \
+    "$m3_test_unversioned_driver" \
+    >"$m3_test_scratch/xcode-noncanonical-pin.out" 2>&1
+then
+    echo "selected-Xcode binding accepted a noncanonical DEVELOPER_DIR pin" >&2
+    exit 1
+fi
+if ! /usr/bin/grep -q 'pinned DEVELOPER_DIR is not canonical' \
+    "$m3_test_scratch/xcode-noncanonical-pin.out"
+then
+    echo "selected-Xcode pin control did not report the noncanonical path" >&2
+    exit 1
+fi
 
 m3_test_boundary_driver="$m3_test_versioned_developer/Toolchains.evil/XcodeDefault.xctoolchain/usr/bin/metal"
 /bin/mkdir -p "${m3_test_boundary_driver%/*}"
 printf '%s\n' '#!/bin/bash' 'exit 0' >"$m3_test_boundary_driver"
 /bin/chmod +x "$m3_test_boundary_driver"
 if /usr/bin/python3 -I -S "$m3_test_xcode_binding_helper" \
-    "$m3_test_versioned_developer" "$m3_test_boundary_driver" \
+    binding \
+    "$m3_test_versioned_developer" \
+    "$m3_test_versioned_developer_canonical" \
+    "$m3_test_boundary_driver" \
     >"$m3_test_scratch/xcode-boundary.out" 2>&1
 then
     echo "selected-Xcode binding accepted a Toolchains prefix-boundary escape" >&2
@@ -1002,7 +1081,10 @@ m3_test_substitute_driver="$m3_test_substitute_developer/Toolchains/XcodeDefault
 printf '%s\n' '#!/bin/bash' 'exit 0' >"$m3_test_substitute_driver"
 /bin/chmod +x "$m3_test_substitute_driver"
 if /usr/bin/python3 -I -S "$m3_test_xcode_binding_helper" \
-    "$m3_test_versioned_developer" "$m3_test_substitute_driver" \
+    binding \
+    "$m3_test_versioned_developer" \
+    "$m3_test_versioned_developer_canonical" \
+    "$m3_test_substitute_driver" \
     >"$m3_test_scratch/xcode-substitution.out" 2>&1
 then
     echo "selected-Xcode binding accepted a driver from another Xcode app" >&2
@@ -1012,6 +1094,25 @@ if ! /usr/bin/grep -q 'escapes the selected Xcode toolchain' \
     "$m3_test_scratch/xcode-substitution.out"
 then
     echo "selected-Xcode substitution control did not report the escape" >&2
+    exit 1
+fi
+
+m3_test_substitute_developer_canonical=$(cd "$m3_test_substitute_developer" && pwd -P)
+if /usr/bin/python3 -I -S "$m3_test_xcode_binding_helper" \
+    binding \
+    "$m3_test_versioned_developer" \
+    "$m3_test_substitute_developer_canonical" \
+    "$m3_test_versioned_driver" \
+    >"$m3_test_scratch/xcode-pin-substitution.out" 2>&1
+then
+    echo "selected-Xcode binding accepted a substituted canonical pin" >&2
+    exit 1
+fi
+if ! /usr/bin/grep -q \
+    'pinned DEVELOPER_DIR does not match the selected Xcode developer directory' \
+    "$m3_test_scratch/xcode-pin-substitution.out"
+then
+    echo "selected-Xcode canonical-pin substitution was not reported" >&2
     exit 1
 fi
 

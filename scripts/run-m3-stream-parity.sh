@@ -42,6 +42,10 @@ do
     fi
 done
 
+# Prevent an inherited developer-directory override from shaping fixed Apple
+# shims before the canonical selected directory is discovered under env -i.
+unset DEVELOPER_DIR
+
 IFS= read -r m3_shasum_shebang <"$m3_shasum" || m3_shasum_shebang=
 if [[ "$m3_shasum_shebang" != '#!/usr/bin/perl' ]]; then
     printf '%s\n' \
@@ -117,6 +121,7 @@ m3_build_exit_status=null
 m3_direct_test_exit_status=null
 m3_test_binary_sha256=
 m3_test_binary_receipt_path=
+m3_xcode_postflight_verified=false
 m3_build_root=
 m3_build_root_parent=
 m3_build_root_dev=
@@ -173,6 +178,7 @@ print(path)
 m3_source_git() {
     "$m3_env" -i \
         HOME="$m3_login_home" \
+        DEVELOPER_DIR="$m3_xcode_developer_dir" \
         PATH="$m3_source_git_path" \
         TMPDIR="$m3_user_tmp" \
         LANG=C LC_ALL=C \
@@ -211,6 +217,7 @@ m3_source_index_has_no_hiding_flags() {
     m3_source_git ls-files --cached --stage -v -z |
         "$m3_env" -i \
             HOME="$m3_login_home" \
+            DEVELOPER_DIR="$m3_xcode_developer_dir" \
             PATH="$m3_source_git_path" \
             TMPDIR="$m3_user_tmp" \
             LANG=C LC_ALL=C \
@@ -254,65 +261,155 @@ if prohibited:
 '
 }
 
-m3_xcode_developer_dir=$("$m3_env" -i \
-    HOME="$m3_login_home" \
-    PATH=/usr/bin:/bin:/usr/sbin:/sbin \
-    TMPDIR="$m3_user_tmp" \
-    LANG=C LC_ALL=C \
-    "$m3_xcode_select" --print-path)
-m3_metal_driver=$("$m3_env" -i \
-    HOME="$m3_login_home" \
-    PATH=/usr/bin:/bin:/usr/sbin:/sbin \
-    TMPDIR="$m3_user_tmp" \
-    LANG=C LC_ALL=C \
-    "$m3_xcrun" --find metal)
-m3_metal=$("$m3_env" -i \
-    HOME="$m3_login_home" \
-    PATH=/usr/bin:/bin:/usr/sbin:/sbin \
-    TMPDIR="$m3_user_tmp" \
-    LANG=C LC_ALL=C \
-    "$m3_xcrun" -sdk macosx metal -print-prog-name=metal)
+m3_validate_xcode_binding() {
+    local m3_binding_developer_dir=${m3_xcode_developer_dir-}
+    local -a m3_binding_python=("$m3_python")
+    if [[ -n "$m3_binding_developer_dir" ]]; then
+        m3_binding_python=(
+            "$m3_env" "DEVELOPER_DIR=$m3_binding_developer_dir" "$m3_python"
+        )
+    fi
+    "${m3_binding_python[@]}" -I -S - "$@" <<'PY'
+# M3_XCODE_BINDING_PYTHON_BEGIN
+import json
+import os
+import stat
+import sys
 
-m3_tool_identities_json=$("$m3_python" -I -S - \
-    bash /bin/bash \
-    dirname "$m3_dirname" \
-    date "$m3_date" \
-    mkdir "$m3_mkdir" \
-    mv "$m3_mv" \
-    tee "$m3_tee" \
-    shasum "$m3_shasum" \
-    perl "$m3_perl" \
-    awk "$m3_awk" \
-    jq "$m3_jq" \
-    python3 "$m3_python" \
-    git "$m3_git" \
-    sort "$m3_sort" \
-    head "$m3_head" \
-    tail "$m3_tail" \
-    uname "$m3_uname" \
-    sysctl "$m3_sysctl" \
-    sw_vers "$m3_sw_vers" \
-    env "$m3_env" \
-    mktemp "$m3_mktemp" \
-    getconf "$m3_getconf" \
-    cargo "$m3_cargo" \
-    rustc "$m3_rustc" \
-    rustup "$m3_rustup" \
-    cmake "$m3_cmake" \
-    clang "$m3_clang" \
-    clangxx "$m3_clangxx" \
-    ar "$m3_ar" \
-    ranlib "$m3_ranlib" \
-    xcrun "$m3_xcrun" \
-    xcode_select "$m3_xcode_select" \
-    make "$m3_make" \
-    sh "$m3_sh" \
-    cc "$m3_cc" \
-    ld "$m3_ld" \
-    libtool "$m3_libtool" \
-    install_name_tool "$m3_install_name_tool" \
-    metal_driver "$m3_metal_driver" \
-    metal "$m3_metal" <<'PY'
+
+def fail(message):
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def canonical_path(path, description):
+    if not os.path.isabs(path) or os.path.normpath(path) != path:
+        fail(f"{description} is not normalized and absolute")
+    return os.path.realpath(path)
+
+
+arguments = sys.argv[1:]
+if not arguments:
+    fail("selected-Xcode binding mode is required")
+mode = arguments[0]
+if mode == "selection" and len(arguments) == 2:
+    selected_invocation = arguments[1]
+    pinned_canonical = None
+    metal_driver_invocation = None
+elif mode == "binding" and len(arguments) == 4:
+    selected_invocation, pinned_canonical, metal_driver_invocation = arguments[1:]
+else:
+    fail("invalid selected-Xcode binding arguments")
+
+selected_canonical = canonical_path(
+    selected_invocation, "selected Xcode developer directory"
+)
+try:
+    selected_metadata = os.stat(selected_canonical, follow_symlinks=False)
+except OSError as error:
+    fail(f"selected Xcode developer directory is unavailable: {error}")
+if not stat.S_ISDIR(selected_metadata.st_mode):
+    fail("selected Xcode developer directory is not a real directory")
+
+toolchains_root = os.path.join(selected_canonical, "Toolchains")
+try:
+    toolchains_metadata = os.stat(toolchains_root, follow_symlinks=False)
+except OSError as error:
+    fail(f"selected Xcode Toolchains directory is unavailable: {error}")
+if not stat.S_ISDIR(toolchains_metadata.st_mode):
+    fail("selected Xcode Toolchains path is not a real directory")
+
+result = {
+    "developer_dir": {
+        "invocation_path": selected_invocation,
+        "canonical_path": selected_canonical,
+    }
+}
+if mode == "binding":
+    if canonical_path(pinned_canonical, "pinned DEVELOPER_DIR") != pinned_canonical:
+        fail("pinned DEVELOPER_DIR is not canonical")
+    if pinned_canonical != selected_canonical:
+        fail("pinned DEVELOPER_DIR does not match the selected Xcode developer directory")
+
+    metal_driver_canonical = canonical_path(
+        metal_driver_invocation, "xcrun metal driver"
+    )
+    try:
+        metal_driver_metadata = os.stat(metal_driver_canonical, follow_symlinks=False)
+    except OSError as error:
+        fail(f"xcrun metal driver is unavailable: {error}")
+    if not stat.S_ISREG(metal_driver_metadata.st_mode):
+        fail("xcrun metal driver is not a real regular file")
+    if metal_driver_metadata.st_mode & 0o111 == 0:
+        fail("xcrun metal driver is not executable")
+    try:
+        if (
+            os.path.commonpath((toolchains_root, metal_driver_canonical))
+            != toolchains_root
+            or metal_driver_canonical == toolchains_root
+        ):
+            fail("xcrun metal driver escapes the selected Xcode toolchain")
+    except ValueError:
+        fail("xcrun metal driver is on a different path root")
+
+    result["environment_pin"] = {"DEVELOPER_DIR": pinned_canonical}
+    result["metal_driver"] = {
+        "invocation_path": metal_driver_invocation,
+        "canonical_path": metal_driver_canonical,
+    }
+
+print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+# M3_XCODE_BINDING_PYTHON_END
+PY
+}
+
+m3_read_active_xcode_developer_dir() {
+    "$m3_env" -i \
+        HOME="$m3_login_home" \
+        PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+        TMPDIR="$m3_user_tmp" \
+        LANG=C LC_ALL=C \
+        "$m3_xcode_select" --print-path
+}
+
+m3_pinned_xcrun() {
+    "$m3_env" -i \
+        HOME="$m3_login_home" \
+        DEVELOPER_DIR="$m3_xcode_developer_dir" \
+        PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+        TMPDIR="$m3_user_tmp" \
+        LANG=C LC_ALL=C \
+        "$m3_xcrun" "$@"
+}
+
+m3_toolchain_query() {
+    "$m3_env" -i \
+        HOME="$m3_login_home" \
+        CARGO_HOME="$m3_cargo_home" \
+        RUSTUP_HOME="$m3_rustup_home" \
+        DEVELOPER_DIR="$m3_xcode_developer_dir" \
+        PATH="$m3_controlled_path" \
+        TMPDIR="$m3_user_tmp" \
+        LANG=C LC_ALL=C \
+        "$@"
+}
+
+m3_xcode_developer_dir_invocation=$(m3_read_active_xcode_developer_dir)
+m3_xcode_selection_json=$(m3_validate_xcode_binding \
+    selection "$m3_xcode_developer_dir_invocation")
+m3_xcode_developer_dir=$("$m3_jq" -er \
+    '.developer_dir.canonical_path | select(type == "string" and startswith("/"))' \
+    <<<"$m3_xcode_selection_json")
+
+m3_pinned_python() {
+    DEVELOPER_DIR="$m3_xcode_developer_dir" "$m3_python" "$@"
+}
+
+m3_metal_driver=$(m3_pinned_xcrun --find metal)
+m3_metal=$(m3_pinned_xcrun -sdk macosx metal -print-prog-name=metal)
+
+m3_identify_tools() {
+    m3_pinned_python -I -S - "$@" <<'PY'
 import hashlib
 import json
 import os
@@ -357,87 +454,91 @@ if not identities["metal"]["canonical_path"].startswith(
     raise SystemExit("metal compiler does not resolve inside the installed MobileAsset toolchain")
 print(json.dumps(identities, sort_keys=True, separators=(",", ":")))
 PY
-)
+}
 
-m3_xcode_binding_json=$("$m3_python" -I -S - \
-    "$m3_xcode_developer_dir" "$m3_metal_driver" <<'PY'
-# M3_XCODE_BINDING_PYTHON_BEGIN
-import json
-import os
-import stat
-import sys
+m3_collect_tool_identities() {
+    local m3_identity_metal_driver=$1
+    local m3_identity_metal=$2
+    m3_identify_tools \
+        bash /bin/bash \
+        dirname "$m3_dirname" \
+        date "$m3_date" \
+        mkdir "$m3_mkdir" \
+        mv "$m3_mv" \
+        tee "$m3_tee" \
+        shasum "$m3_shasum" \
+        perl "$m3_perl" \
+        awk "$m3_awk" \
+        jq "$m3_jq" \
+        python3 "$m3_python" \
+        git "$m3_git" \
+        sort "$m3_sort" \
+        head "$m3_head" \
+        tail "$m3_tail" \
+        uname "$m3_uname" \
+        sysctl "$m3_sysctl" \
+        sw_vers "$m3_sw_vers" \
+        env "$m3_env" \
+        mktemp "$m3_mktemp" \
+        getconf "$m3_getconf" \
+        cargo "$m3_cargo" \
+        rustc "$m3_rustc" \
+        rustup "$m3_rustup" \
+        cmake "$m3_cmake" \
+        clang "$m3_clang" \
+        clangxx "$m3_clangxx" \
+        ar "$m3_ar" \
+        ranlib "$m3_ranlib" \
+        xcrun "$m3_xcrun" \
+        xcode_select "$m3_xcode_select" \
+        make "$m3_make" \
+        sh "$m3_sh" \
+        cc "$m3_cc" \
+        ld "$m3_ld" \
+        libtool "$m3_libtool" \
+        install_name_tool "$m3_install_name_tool" \
+        metal_driver "$m3_identity_metal_driver" \
+        metal "$m3_identity_metal"
+}
 
+m3_tool_identities_json=$(m3_collect_tool_identities \
+    "$m3_metal_driver" "$m3_metal")
+m3_preflight_tool_identities_json=$m3_tool_identities_json
 
-def fail(message):
-    print(message, file=sys.stderr)
-    raise SystemExit(1)
+m3_xcode_binding_json=$(m3_validate_xcode_binding \
+    binding \
+    "$m3_xcode_developer_dir_invocation" \
+    "$m3_xcode_developer_dir" \
+    "$m3_metal_driver")
 
+m3_verify_xcode_postflight() {
+    local m3_post_xcode_developer_dir_invocation
+    local m3_post_metal_driver
+    local m3_post_metal
+    local m3_post_xcode_binding_json
+    local m3_post_tool_identities_json
 
-def canonical_path(path, description):
-    if not os.path.isabs(path) or os.path.normpath(path) != path:
-        fail(f"{description} is not normalized and absolute")
-    return os.path.realpath(path)
-
-
-selected_invocation, metal_driver_invocation = sys.argv[1:]
-selected_canonical = canonical_path(
-    selected_invocation, "selected Xcode developer directory"
-)
-try:
-    selected_metadata = os.stat(selected_canonical, follow_symlinks=False)
-except OSError as error:
-    fail(f"selected Xcode developer directory is unavailable: {error}")
-if not stat.S_ISDIR(selected_metadata.st_mode):
-    fail("selected Xcode developer directory is not a real directory")
-
-toolchains_root = os.path.join(selected_canonical, "Toolchains")
-try:
-    toolchains_metadata = os.stat(toolchains_root, follow_symlinks=False)
-except OSError as error:
-    fail(f"selected Xcode Toolchains directory is unavailable: {error}")
-if not stat.S_ISDIR(toolchains_metadata.st_mode):
-    fail("selected Xcode Toolchains path is not a real directory")
-
-metal_driver_canonical = canonical_path(
-    metal_driver_invocation, "xcrun metal driver"
-)
-try:
-    metal_driver_metadata = os.stat(metal_driver_canonical, follow_symlinks=False)
-except OSError as error:
-    fail(f"xcrun metal driver is unavailable: {error}")
-if not stat.S_ISREG(metal_driver_metadata.st_mode):
-    fail("xcrun metal driver is not a real regular file")
-if metal_driver_metadata.st_mode & 0o111 == 0:
-    fail("xcrun metal driver is not executable")
-try:
-    if (
-        os.path.commonpath((toolchains_root, metal_driver_canonical))
-        != toolchains_root
-        or metal_driver_canonical == toolchains_root
-    ):
-        fail("xcrun metal driver escapes the selected Xcode toolchain")
-except ValueError:
-    fail("xcrun metal driver is on a different path root")
-
-print(
-    json.dumps(
-        {
-            "developer_dir": {
-                "invocation_path": selected_invocation,
-                "canonical_path": selected_canonical,
-            },
-            "metal_driver": {
-                "invocation_path": metal_driver_invocation,
-                "canonical_path": metal_driver_canonical,
-            },
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-)
-# M3_XCODE_BINDING_PYTHON_END
-PY
-)
+    m3_post_xcode_developer_dir_invocation=$(m3_read_active_xcode_developer_dir) || return $?
+    m3_post_metal_driver=$(m3_pinned_xcrun --find metal) || return $?
+    m3_post_metal=$(m3_pinned_xcrun \
+        -sdk macosx metal -print-prog-name=metal) || return $?
+    m3_post_xcode_binding_json=$(m3_validate_xcode_binding \
+        binding \
+        "$m3_post_xcode_developer_dir_invocation" \
+        "$m3_xcode_developer_dir" \
+        "$m3_post_metal_driver") || return $?
+    if [[ "$m3_post_xcode_binding_json" != "$m3_xcode_binding_json" ]]; then
+        echo "selected Xcode binding changed across the real-model test"
+        return 1
+    fi
+    m3_post_tool_identities_json=$(m3_collect_tool_identities \
+        "$m3_post_metal_driver" "$m3_post_metal") || return $?
+    if [[ "$m3_post_tool_identities_json" != "$m3_preflight_tool_identities_json" ]]; then
+        echo "developer-tool identities changed across the real-model test"
+        return 1
+    fi
+    printf '%s\n' 'selected Xcode binding and developer-tool identities unchanged'
+}
 
 m3_note() {
     printf '%s\n' "$*" | "$m3_tee" -a "$m3_preflight_log"
@@ -498,8 +599,10 @@ m3_write_manifest() {
         --arg source_git_path "$m3_source_git_path" \
         --arg hash_path "$m3_hash_path" \
         --arg user_tmp "$m3_user_tmp" \
+        --arg xcode_developer_dir "$m3_xcode_developer_dir" \
         --argjson tools "$m3_tool_identities_json" \
         --argjson xcode_binding "$m3_xcode_binding_json" \
+        --argjson xcode_postflight_verified "$m3_xcode_postflight_verified" \
         --arg preflight_sha "$m3_preflight_sha" \
         --arg identity_sha "$m3_identity_sha" \
         --arg build_sha "$m3_build_sha" \
@@ -562,6 +665,37 @@ m3_write_manifest() {
               privileged_mode_required: true,
               inherited_startup_state: "BASH_ENV, ENV, imported functions, SHELLOPTS, CDPATH, and GLOBIGNORE ignored by privileged mode before script code"
             },
+            developer_tools: {
+              selection: {
+                environment_launcher: "/usr/bin/env -i",
+                executable: "/usr/bin/xcode-select",
+                argv: ["/usr/bin/xcode-select", "--print-path"],
+                inherited_environment: "cleared",
+                DEVELOPER_DIR: null
+              },
+              pin: {
+                variable: "DEVELOPER_DIR",
+                canonical_value: $xcode_developer_dir,
+                scopes: [
+                  "xcrun_tool_discovery",
+                  "source_git",
+                  "runner_python_helpers",
+                  "toolchain_queries",
+                  "cargo_build",
+                  "direct_test"
+                ]
+              },
+              xcrun: {
+                environment_launcher: "/usr/bin/env -i",
+                executable: "/usr/bin/xcrun",
+                inherited_environment: "cleared",
+                DEVELOPER_DIR: $xcode_developer_dir
+              },
+              python_helpers: {
+                executable: "/usr/bin/python3",
+                DEVELOPER_DIR: $xcode_developer_dir
+              }
+            },
             hashing: {
               environment_launcher: "/usr/bin/env -i",
               executable: "/usr/bin/shasum",
@@ -582,6 +716,7 @@ m3_write_manifest() {
               inherited_environment: "cleared",
               environment: {
                 HOME: "<canonical-login-home>",
+                DEVELOPER_DIR: $xcode_developer_dir,
                 PATH: $source_git_path,
                 TMPDIR: $user_tmp,
                 LANG: "C",
@@ -618,11 +753,22 @@ m3_write_manifest() {
               ],
               local_repository_config: "loaded with the listed command-line safety overrides"
             },
+            toolchain_query_environment: {
+              HOME: "<canonical-login-home>",
+              CARGO_HOME: "<canonical-login-home>/.cargo",
+              RUSTUP_HOME: "<canonical-login-home>/.rustup",
+              DEVELOPER_DIR: $xcode_developer_dir,
+              PATH: $controlled_path,
+              TMPDIR: $user_tmp,
+              LANG: "C",
+              LC_ALL: "C"
+            },
             build_environment: {
               CARGO_TARGET_DIR: "<fresh-runner-target-root>",
               HOME: "<fresh-runner-target-root>/build-home",
               CARGO_HOME: "<canonical-login-home>/.cargo",
               RUSTUP_HOME: "<canonical-login-home>/.rustup",
+              DEVELOPER_DIR: $xcode_developer_dir,
               PATH: $controlled_path,
               TMPDIR: $user_tmp,
               LANG: "C",
@@ -635,6 +781,7 @@ m3_write_manifest() {
             },
             direct_test_environment: {
               HOME: "<fresh-runner-target-root>/test-home",
+              DEVELOPER_DIR: $xcode_developer_dir,
               PATH: $controlled_path,
               TMPDIR: $user_tmp,
               LANG: "C",
@@ -643,7 +790,9 @@ m3_write_manifest() {
           },
           execution_identity: {
             controlled_path: $controlled_path,
-            xcode_binding: $xcode_binding,
+            xcode_binding: ($xcode_binding + {
+              postflight_verified: $xcode_postflight_verified
+            }),
             tools: $tools
           },
           trust_boundary: {
@@ -698,7 +847,7 @@ m3_cleanup_build_root() {
         echo "refusing unsafe M3 build-target cleanup path" >&2
         return 1
     fi
-    "$m3_python" -I -S - "$m3_build_root_parent" "$m3_cleanup_leaf" \
+    m3_pinned_python -I -S - "$m3_build_root_parent" "$m3_cleanup_leaf" \
         "$m3_build_root_dev" "$m3_build_root_ino" <<'PY' || return $?
 # M3_BUILD_ROOT_CLEANUP_PYTHON_BEGIN
 import os
@@ -876,7 +1025,7 @@ fi
 m3_write_manifest running -1
 
 m3_failure_stage=ambient_execution_overrides
-m3_ambient_override=$("$m3_python" -I -S -c '
+m3_ambient_override=$(m3_pinned_python -I -S -c '
 import os
 
 exact = {
@@ -942,7 +1091,7 @@ if [[ -z "${HYPERION_12B_ARTIFACT:-}" ]]; then
 fi
 m3_artifact_root=$HYPERION_12B_ARTIFACT
 m3_sanitize() {
-    "$m3_python" -I -S -c '
+    m3_pinned_python -I -S -c '
 import sys
 text = sys.stdin.read()
 for raw, replacement in (
@@ -1040,7 +1189,7 @@ m3_verify_selected_artifact() {
     done
 
     if [[ "$m3_artifact_identity_kind" == historical_sha256sums ]]; then
-        "$m3_python" -I -S oracle/model_identity.py \
+        m3_pinned_python -I -S oracle/model_identity.py \
             --model "$m3_artifact_root" \
             --manifest-sha256 "$m3_expected_historical_manifest_sha256"
         return
@@ -1189,23 +1338,11 @@ if [[ "$m3_machine_architecture" != arm64 ]]; then
     m3_note "M3 stream parity requires Apple arm64; found $m3_machine_architecture"
     exit 1
 fi
-m3_rustc_version=$("$m3_env" -i \
-    HOME="$m3_login_home" \
-    CARGO_HOME="$m3_cargo_home" \
-    RUSTUP_HOME="$m3_rustup_home" \
-    PATH="$m3_controlled_path" \
-    LANG=C LC_ALL=C \
-    "$m3_rustc" --version --verbose)
-m3_cargo_version=$("$m3_env" -i \
-    HOME="$m3_login_home" \
-    CARGO_HOME="$m3_cargo_home" \
-    RUSTUP_HOME="$m3_rustup_home" \
-    PATH="$m3_controlled_path" \
-    LANG=C LC_ALL=C \
-    "$m3_cargo" --version)
-m3_cmake_version=$("$m3_cmake" --version | "$m3_head" -n 1)
-m3_clang_version=$("$m3_clang" --version | "$m3_head" -n 1)
-m3_python_version=$("$m3_python" --version 2>&1)
+m3_rustc_version=$(m3_toolchain_query "$m3_rustc" --version --verbose)
+m3_cargo_version=$(m3_toolchain_query "$m3_cargo" --version)
+m3_cmake_version=$(m3_toolchain_query "$m3_cmake" --version | "$m3_head" -n 1)
+m3_clang_version=$(m3_toolchain_query "$m3_clang" --version | "$m3_head" -n 1)
+m3_python_version=$(m3_toolchain_query "$m3_python" --version 2>&1)
 m3_note "source_sha=$m3_source_sha"
 m3_note "source_tree_sha=$m3_source_tree_sha"
 m3_note "fixture_sha256=$m3_fixture_actual_sha256"
@@ -1217,7 +1354,7 @@ m3_note "macos_build=$m3_macos_build"
 m3_write_manifest running -1
 
 m3_resolve_contract_executable() {
-    "$m3_python" -I -S - "$@" <<'PY'
+    m3_pinned_python -I -S - "$@" <<'PY'
 # M3_CONTRACT_RESOLVER_PYTHON_BEGIN
 import json
 import os
@@ -1352,7 +1489,7 @@ case "$m3_build_root" in
         exit 1
         ;;
 esac
-m3_build_root_identity=$("$m3_python" -I -S -c '
+m3_build_root_identity=$(m3_pinned_python -I -S -c '
 import os
 import stat
 import sys
@@ -1391,6 +1528,7 @@ set +e
     RUSTUP_HOME="$m3_rustup_home" \
     CARGO_TARGET_DIR="$m3_build_root" \
     HYPERION_12B_ARTIFACT="$m3_artifact_root" \
+    DEVELOPER_DIR="$m3_xcode_developer_dir" \
     PATH="$m3_controlled_path" \
     TMPDIR="$m3_user_tmp" \
     LANG=C LC_ALL=C \
@@ -1490,6 +1628,7 @@ set +e
 "$m3_env" -i \
     HOME="$m3_test_home" \
     HYPERION_12B_ARTIFACT="$m3_artifact_root" \
+    DEVELOPER_DIR="$m3_xcode_developer_dir" \
     PATH="$m3_controlled_path" \
     TMPDIR="$m3_user_tmp" \
     LANG=C LC_ALL=C \
@@ -1535,6 +1674,17 @@ if [[ "$m3_posttest_binary_sha256" != "$m3_test_binary_sha256" ]]; then
 fi
 
 m3_failure_stage=postflight_identity
+set +e
+m3_post_xcode_output=$(m3_verify_xcode_postflight 2>&1)
+m3_post_xcode_status=$?
+set -e
+m3_post_xcode_output=$(printf '%s\n' "$m3_post_xcode_output" | m3_sanitize)
+printf '%s\n' "$m3_post_xcode_output" | "$m3_tee" -a "$m3_identity_log"
+if (( m3_post_xcode_status != 0 )); then
+    exit "$m3_post_xcode_status"
+fi
+m3_xcode_postflight_verified=true
+
 set +e
 m3_post_identity_output=$(m3_verify_selected_artifact 2>&1)
 m3_post_identity_status=$?
