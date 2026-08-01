@@ -105,9 +105,8 @@ const TOOL_TOKENIZER_JSON: &str = r#"{
   }
 }"#;
 
-/// A model-free BPE/ByteFallback tokenizer whose generated `<0xE5>` token is
-/// unresolved by incremental `push` and becomes one replacement scalar only
-/// when the response decoder is finished at EOF.
+/// A model-free BPE/ByteFallback tokenizer whose incomplete `<0xE5>` would
+/// make the dependency synthesize a replacement at EOF, which Hyperion rejects.
 const EOF_FALLBACK_TOKENIZER_JSON: &str = r#"{
   "version": "1.0",
   "truncation": null,
@@ -129,7 +128,7 @@ const EOF_FALLBACK_TOKENIZER_JSON: &str = r#"{
     "fuse_unk": false,
     "byte_fallback": true,
     "ignore_merges": false,
-    "vocab": {"<eos>": 0, "<bos>": 1, "<0xE5>": 2},
+    "vocab": {"<eos>": 0, "<bos>": 1, "<0xE5>": 2, "hello": 3},
     "merges": []
   }
 }"#;
@@ -404,6 +403,14 @@ fn streamed_text(body: &str, dialect: &str) -> String {
                 .map(str::to_owned),
             _ => None,
         })
+        .collect()
+}
+
+fn sse_json_frames(body: &str) -> Vec<serde_json::Value> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).expect("SSE data frame contains valid JSON"))
         .collect()
 }
 
@@ -1732,10 +1739,7 @@ async fn streaming_and_non_streaming_share_incremental_decode_semantics() {
 async fn mixed_256_token_stream_matches_one_shot_for_both_sse_dialects() {
     let ids = mixed_256_ids();
     assert_eq!(ids.len(), 256, "fixture must exercise exactly 256 IDs");
-    assert!(
-        !ids[..ids.len() - 1].contains(&0),
-        "fixture must not terminate on EOS"
-    );
+    assert!(!ids.contains(&0), "fixture must not terminate on EOS");
     let tokenizer = TokenizerHandle::from_bytes(GEMMA_LIKE_TOKENIZER_JSON.as_bytes())
         .expect("Gemma-like tokenizer loads");
     let expected = tokenizer.decode(&ids);
@@ -1768,7 +1772,27 @@ async fn mixed_256_token_stream_matches_one_shot_for_both_sse_dialects() {
     let anthropic_text = streamed_text(&anthropic, "anthropic");
     assert_eq!(anthropic_text, expected);
     assert!(!anthropic_text.contains('\u{FFFD}'));
-    assert!(anthropic.contains("event: message_stop\n"));
+    let anthropic_frames = sse_json_frames(&anthropic);
+    assert!(
+        anthropic_frames
+            .iter()
+            .all(|frame| frame["type"] != "error"),
+        "successful stream has no error frame: {anthropic}"
+    );
+    assert_eq!(
+        anthropic_frames
+            .iter()
+            .filter(|frame| frame["type"] == "message_delta")
+            .count(),
+        1
+    );
+    assert_eq!(
+        anthropic_frames
+            .iter()
+            .filter(|frame| frame["type"] == "message_stop")
+            .count(),
+        1
+    );
 
     let (status, openai) = send(
         srv.router(),
@@ -1782,7 +1806,25 @@ async fn mixed_256_token_stream_matches_one_shot_for_both_sse_dialects() {
     let openai_text = streamed_text(&openai, "openai");
     assert_eq!(openai_text, expected);
     assert!(!openai_text.contains('\u{FFFD}'));
-    assert!(openai.contains("data: [DONE]\n\n"));
+    let openai_frames = sse_json_frames(&openai);
+    assert!(
+        openai_frames
+            .iter()
+            .all(|frame| frame.get("error").is_none()),
+        "successful stream has no error frame: {openai}"
+    );
+    assert_eq!(
+        openai_frames
+            .iter()
+            .filter(|frame| {
+                frame["choices"][0]
+                    .get("finish_reason")
+                    .is_some_and(|reason| !reason.is_null())
+            })
+            .count(),
+        1
+    );
+    assert_eq!(openai.matches("data: [DONE]\n\n").count(), 1);
 }
 
 #[tokio::test]
@@ -1809,7 +1851,16 @@ async fn malformed_eof_fallback_fails_closed_for_both_dialects() {
     .await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     let response: serde_json::Value = serde_json::from_str(&anthropic_json).unwrap();
-    assert_eq!(response["error"]["message"], "internal server error");
+    assert_eq!(
+        response,
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "internal_server_error",
+                "message": "internal server error"
+            }
+        })
+    );
     assert!(!anthropic_json.contains('\u{FFFD}'));
     assert!(!anthropic_json.contains("replacement character"));
 
@@ -1822,9 +1873,30 @@ async fn malformed_eof_fallback_fails_closed_for_both_dialects() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    let expected_error = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "internal_server_error",
+            "message": "internal server error"
+        }
+    });
+    let frames = sse_json_frames(&anthropic_sse);
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["type"] == "error")
+            .count(),
+        1
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| **frame == expected_error)
+            .count(),
+        1
+    );
+    assert_eq!(frames.last(), Some(&expected_error));
     assert_eq!(anthropic_sse.matches("event: error\n").count(), 1);
-    assert_eq!(anthropic_sse.matches("internal server error").count(), 1);
-    assert!(anthropic_sse.contains("\"type\":\"internal_server_error\""));
     assert!(!anthropic_sse.contains('\u{FFFD}'));
     assert!(!anthropic_sse.contains("replacement character"));
     assert!(!anthropic_sse.contains("message_delta"));
@@ -1840,7 +1912,16 @@ async fn malformed_eof_fallback_fails_closed_for_both_dialects() {
     .await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     let response: serde_json::Value = serde_json::from_str(&openai_json).unwrap();
-    assert_eq!(response["error"]["message"], "internal server error");
+    assert_eq!(
+        response,
+        serde_json::json!({
+            "error": {
+                "message": "internal server error",
+                "type": "internal_server_error",
+                "code": null
+            }
+        })
+    );
     assert!(!openai_json.contains('\u{FFFD}'));
     assert!(!openai_json.contains("replacement character"));
 
@@ -1853,18 +1934,123 @@ async fn malformed_eof_fallback_fails_closed_for_both_dialects() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(openai_sse.matches("internal server error").count(), 1);
-    assert_eq!(openai_sse.matches("\"code\":500").count(), 1);
-    assert_eq!(
-        openai_sse
-            .matches("\"type\":\"internal_server_error\"")
-            .count(),
-        1
-    );
+    let expected_error = serde_json::json!({
+        "error": {
+            "message": "internal server error",
+            "type": "internal_server_error",
+            "code": 500
+        }
+    });
+    assert_eq!(sse_json_frames(&openai_sse), vec![expected_error]);
     assert!(!openai_sse.contains('\u{FFFD}'));
     assert!(!openai_sse.contains("replacement character"));
     assert!(!openai_sse.contains("finish_reason"));
     assert!(!openai_sse.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+async fn malformed_eof_after_valid_prefix_emits_prefix_then_one_opaque_error() {
+    let control = fresh_control();
+    let srv = test_server_with_tokenizer(
+        StubEngine {
+            tokens: vec![3, 2],
+            block_after: None,
+        },
+        None,
+        4096,
+        &control,
+        EOF_FALLBACK_TOKENIZER_JSON,
+    );
+
+    let (status, anthropic) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(streamed_text(&anthropic, "anthropic"), "hello");
+    let anthropic_error = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "internal_server_error",
+            "message": "internal server error"
+        }
+    });
+    let anthropic_frames = sse_json_frames(&anthropic);
+    let anthropic_error_indices = anthropic_frames
+        .iter()
+        .enumerate()
+        .filter_map(|(index, frame)| (frame == &anthropic_error).then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(anthropic_error_indices.len(), 1);
+    assert_eq!(
+        anthropic_frames
+            .iter()
+            .filter(|frame| frame["type"] == "error")
+            .count(),
+        1
+    );
+    assert_eq!(anthropic_error_indices[0], anthropic_frames.len() - 1);
+    let text_index = anthropic_frames
+        .iter()
+        .position(|frame| frame["delta"]["text"] == "hello")
+        .expect("valid prefix has a text-delta frame");
+    assert!(text_index < anthropic_error_indices[0]);
+    assert_eq!(anthropic.matches("event: error\n").count(), 1);
+    assert!(!anthropic.contains('\u{FFFD}'));
+    assert!(!anthropic.contains("replacement character"));
+    assert!(!anthropic.contains("message_delta"));
+    assert!(!anthropic.contains("message_stop"));
+
+    let (status, openai) = send(
+        srv.router(),
+        Method::POST,
+        "/v1/chat/completions",
+        &[("content-type", "application/json")],
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(streamed_text(&openai, "openai"), "hello");
+    let openai_error = serde_json::json!({
+        "error": {
+            "message": "internal server error",
+            "type": "internal_server_error",
+            "code": 500
+        }
+    });
+    let openai_frames = sse_json_frames(&openai);
+    let openai_error_indices = openai_frames
+        .iter()
+        .enumerate()
+        .filter_map(|(index, frame)| (frame == &openai_error).then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(openai_error_indices.len(), 1);
+    assert_eq!(
+        openai_frames
+            .iter()
+            .filter(|frame| frame.get("error").is_some())
+            .count(),
+        1
+    );
+    assert_eq!(openai_error_indices[0], openai_frames.len() - 1);
+    let text_index = openai_frames
+        .iter()
+        .position(|frame| frame["choices"][0]["delta"]["content"] == "hello")
+        .expect("valid prefix has a content chunk");
+    assert!(text_index < openai_error_indices[0]);
+    assert_eq!(openai.matches("internal server error").count(), 1);
+    assert!(openai_frames.iter().all(|frame| {
+        frame["choices"][0]
+            .get("finish_reason")
+            .is_none_or(serde_json::Value::is_null)
+    }));
+    assert!(!openai.contains('\u{FFFD}'));
+    assert!(!openai.contains("replacement character"));
+    assert!(!openai.contains("data: [DONE]"));
 }
 
 #[tokio::test]
