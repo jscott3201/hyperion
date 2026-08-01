@@ -21,21 +21,28 @@ m3_evidence_root=$(cd "$m3_evidence_root" && pwd -P)
 m3_manifest="$m3_evidence_root/manifest.json"
 m3_preflight_log="$m3_evidence_root/preflight.log"
 m3_identity_log="$m3_evidence_root/identity.log"
+m3_build_log="$m3_evidence_root/build.log"
 m3_test_log="$m3_evidence_root/test.log"
 : >"$m3_preflight_log"
 : >"$m3_identity_log"
+: >"$m3_build_log"
 : >"$m3_test_log"
 
 m3_expected_fixture_sha256=086ca72232de415973564b2c6028c98a7063f7d024b85411512071650c86cf3d
 m3_expected_historical_manifest_sha256=9fa3c7f6c49305f621ed1f96edbb34c6402b6229701041db4e607df70e9b4144
 m3_expected_owner_payload_manifest_sha256=3cee7e9c21051eb6e6857ef485b355b4a2e847901930d64620348cbc7f56c806
 m3_fixture_path=native/hyperion_mlx/tests/fixtures/12b_greedy_golden.safetensors
-m3_test_argv=(
+m3_build_argv=(
     cargo test --locked --offline
     -p hyperion-server
     --test contract
+    --no-run
+    --message-format=json-render-diagnostics
+)
+m3_direct_test_manifest_argv=(
+    '<contract-test-executable>'
     real_http_sse_matches_m2_golden
-    -- --ignored --exact --nocapture
+    --ignored --exact --nocapture
 )
 
 m3_final_status=running
@@ -58,6 +65,11 @@ m3_cmake_version=
 m3_clang_version=
 m3_python_version=
 m3_finished_at=
+m3_build_exit_status=null
+m3_direct_test_exit_status=null
+m3_test_binary_sha256=
+m3_build_root=
+m3_build_root_parent=
 
 m3_note() {
     printf '%s\n' "$*" | tee -a "$m3_preflight_log"
@@ -72,10 +84,12 @@ m3_write_manifest() {
     local m3_manifest_exit=$2
     local m3_preflight_sha
     local m3_identity_sha
+    local m3_build_sha
     local m3_test_sha
     local m3_manifest_tmp
     m3_preflight_sha=$(m3_log_sha256 "$m3_preflight_log") || return $?
     m3_identity_sha=$(m3_log_sha256 "$m3_identity_log") || return $?
+    m3_build_sha=$(m3_log_sha256 "$m3_build_log") || return $?
     m3_test_sha=$(m3_log_sha256 "$m3_test_log") || return $?
     m3_manifest_tmp="$m3_manifest.tmp"
     jq -n \
@@ -105,8 +119,12 @@ m3_write_manifest() {
         --arg python3 "$m3_python_version" \
         --arg preflight_sha "$m3_preflight_sha" \
         --arg identity_sha "$m3_identity_sha" \
+        --arg build_sha "$m3_build_sha" \
         --arg test_sha "$m3_test_sha" \
+        --arg test_binary_sha "$m3_test_binary_sha256" \
         --arg failure_stage "$m3_failure_stage" \
+        --argjson build_exit_status "$m3_build_exit_status" \
+        --argjson direct_test_exit_status "$m3_direct_test_exit_status" \
         --argjson exit_status "$m3_manifest_exit" \
         '
         {
@@ -132,13 +150,27 @@ m3_write_manifest() {
           started_at_utc: $started,
           finished_at_utc: (if $finished == "" then null else $finished end),
           command: {
-            argv: [
+            build_argv: [
               "cargo", "test", "--locked", "--offline",
               "-p", "hyperion-server", "--test", "contract",
-              "real_http_sse_matches_m2_golden",
-              "--", "--ignored", "--exact", "--nocapture"
+              "--no-run", "--message-format=json-render-diagnostics"
             ],
-            environment: {HYPERION_12B_ARTIFACT: "<explicit-artifact-root>"}
+            direct_test_argv: [
+              "<contract-test-executable>",
+              "real_http_sse_matches_m2_golden",
+              "--ignored", "--exact", "--nocapture"
+            ],
+            environment: {
+              HYPERION_12B_ARTIFACT: "<explicit-artifact-root>"
+            },
+            build_environment: {
+              CARGO_TARGET_DIR: "<fresh-runner-target-root>"
+            }
+          },
+          execution: {
+            build_exit_status: $build_exit_status,
+            direct_test_exit_status: $direct_test_exit_status,
+            test_binary_sha256: (if $test_binary_sha == "" then null else $test_binary_sha end)
           },
           machine: {
             architecture: (if $architecture == "" then null else $architecture end),
@@ -157,6 +189,7 @@ m3_write_manifest() {
           logs: {
             preflight: {path: "preflight.log", sha256: $preflight_sha},
             identity: {path: "identity.log", sha256: $identity_sha},
+            build: {path: "build.log", sha256: $build_sha},
             test: {path: "test.log", sha256: $test_sha}
           },
           failure_stage: (if $failure_stage == "" then null else $failure_stage end),
@@ -166,13 +199,49 @@ m3_write_manifest() {
     mv "$m3_manifest_tmp" "$m3_manifest" || return $?
 }
 
+m3_cleanup_build_root() {
+    local m3_cleanup_leaf
+    if [[ -z "$m3_build_root" ]]; then
+        return 0
+    fi
+    m3_cleanup_leaf=${m3_build_root##*/}
+    if [[ -z "$m3_build_root" || -z "$m3_build_root_parent" || \
+          "$m3_build_root_parent" != /private/tmp || \
+          "$m3_build_root" == "$m3_build_root_parent" || \
+          "${m3_build_root%/*}" != "$m3_build_root_parent" || \
+          "$m3_cleanup_leaf" != hyperion-m3-contract.* ]]; then
+        echo "refusing unsafe M3 build-target cleanup path" >&2
+        return 1
+    fi
+    if [[ -e "$m3_build_root" || -L "$m3_build_root" ]]; then
+        /bin/rm -rf -- "$m3_build_root" || return $?
+    fi
+    if [[ -e "$m3_build_root" || -L "$m3_build_root" ]]; then
+        echo "M3 build-target cleanup did not remove the validated target root" >&2
+        return 1
+    fi
+    m3_build_root=
+    return 0
+}
+
 m3_finalize() {
     local m3_original_status=$?
     local m3_manifest_status=failed
     local m3_manifest_exit=$m3_original_status
-    trap - EXIT HUP INT TERM
+    local m3_cleanup_status=0
+    trap '' HUP INT TERM
+    trap - EXIT
     set +e
-    if [[ "$m3_final_status" == passed && $m3_original_status -eq 0 ]]; then
+    m3_cleanup_build_root
+    m3_cleanup_status=$?
+    if (( m3_cleanup_status != 0 )); then
+        m3_failure_stage=build_target_cleanup
+        if (( m3_manifest_exit == 0 )); then
+            m3_manifest_exit=$m3_cleanup_status
+        fi
+    fi
+    if [[ "$m3_final_status" == passed && $m3_original_status -eq 0 && \
+          $m3_cleanup_status -eq 0 ]]; then
         m3_manifest_status=passed
         m3_failure_stage=
     elif (( m3_manifest_exit == 0 )); then
@@ -186,6 +255,9 @@ m3_finalize() {
         if (( m3_manifest_exit == 0 )); then
             m3_manifest_exit=$m3_manifest_status_code
         fi
+    elif [[ "$m3_manifest_status" == passed && $m3_manifest_exit -eq 0 ]]; then
+        printf 'm3-stream-parity-pass: source=%s fixture=%s evidence=%s\n' \
+            "$m3_source_sha" "$m3_fixture_actual_sha256" "$m3_evidence_root"
     fi
     exit "$m3_manifest_exit"
 }
@@ -210,13 +282,23 @@ m3_sanitize() {
     python3 -I -S -c '
 import sys
 text = sys.stdin.read()
-sys.stdout.write(text.replace(sys.argv[1], "<REPO>").replace(sys.argv[2], "<ARTIFACT>"))
-' "$m3_repo_root" "$m3_artifact_root"
+for raw, replacement in (
+    (sys.argv[1], "<REPO>"),
+    (sys.argv[2], "<ARTIFACT>"),
+    (sys.argv[3], "<BUILD_TARGET>"),
+):
+    if raw:
+        text = text.replace(raw, replacement)
+sys.stdout.write(text)
+' "$m3_repo_root" "$m3_artifact_root" "$m3_build_root"
 }
 if [[ ! -d "$m3_artifact_root" || -L "$m3_artifact_root" ]]; then
     m3_note "HYPERION_12B_ARTIFACT must be a real directory, not a symlink"
     exit 64
 fi
+m3_artifact_root=$(cd "$m3_artifact_root" && pwd -P)
+HYPERION_12B_ARTIFACT=$m3_artifact_root
+export HYPERION_12B_ARTIFACT
 m3_has_historical_manifest=false
 m3_has_owner_payload_manifest=false
 if [[ -e "$m3_artifact_root/SHA256SUMS" || -L "$m3_artifact_root/SHA256SUMS" ]]; then
@@ -273,6 +355,10 @@ for m3_required_command in git python3 cargo rustc cmake clang uname sysctl sw_v
         exit 127
     fi
 done
+if [[ ! -x /usr/bin/mktemp || ! -x /bin/rm ]]; then
+    m3_note "required fixed-path mktemp or rm command is unavailable"
+    exit 127
+fi
 
 m3_verify_selected_artifact() {
     local m3_verify_manifest_path="$m3_artifact_root/$m3_artifact_manifest_name"
@@ -382,17 +468,70 @@ m3_source_sha=$(git rev-parse HEAD)
 m3_source_tree_sha=$(git rev-parse 'HEAD^{tree}')
 m3_source_clean=true
 
-for m3_override in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS; do
-    if [[ -n "${!m3_override:-}" ]]; then
-        m3_note "M3 stream parity rejects ambient $m3_override"
-        exit 1
-    fi
-done
-if env | awk -F= '$1 ~ /^MLX_/ || $1 ~ /^CARGO_PROFILE_/ { found=1 } END { exit !found }'; then
-    m3_note "M3 stream parity rejects ambient MLX_* and CARGO_PROFILE_* overrides"
+m3_failure_stage=ambient_execution_overrides
+m3_ambient_override=$(python3 -I -S -c '
+import os
+
+exact = {
+    "CARGO_HOME",
+    "CARGO_TARGET_DIR",
+    "CARGO_BUILD_TARGET",
+    "CARGO_BUILD_TARGET_DIR",
+    "CARGO_RUNNER",
+    "CARGO_TARGET_RUNNER",
+    "CARGO_BUILD_RUNNER",
+    "CARGO_BUILD_RUSTFLAGS",
+    "CARGO_BUILD_RUSTC",
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    "RUSTFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "RUSTC",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+}
+prefixes = ("MLX_", "CARGO_PROFILE_", "CARGO_TARGET_")
+matches = sorted(
+    name for name in os.environ if name in exact or name.startswith(prefixes)
+)
+if matches:
+    print(matches[0])
+')
+if [[ -n "$m3_ambient_override" ]]; then
+    m3_note "M3 stream parity rejects ambient $m3_ambient_override"
     exit 1
 fi
 
+m3_failure_stage=cargo_configuration_preflight
+if [[ -z "${HOME:-}" ]]; then
+    m3_note "M3 stream parity requires HOME to resolve default Cargo configuration"
+    exit 1
+fi
+for m3_cargo_config_name in config config.toml; do
+    m3_default_cargo_config="$HOME/.cargo/$m3_cargo_config_name"
+    if [[ -e "$m3_default_cargo_config" || -L "$m3_default_cargo_config" ]]; then
+        m3_note "M3 stream parity rejects default user Cargo $m3_cargo_config_name"
+        exit 1
+    fi
+done
+m3_cargo_config_parent=${m3_repo_root%/*}
+[[ -n "$m3_cargo_config_parent" ]] || m3_cargo_config_parent=/
+while :; do
+    for m3_cargo_config_name in config config.toml; do
+        m3_ancestor_cargo_config="$m3_cargo_config_parent/.cargo/$m3_cargo_config_name"
+        if [[ -e "$m3_ancestor_cargo_config" || -L "$m3_ancestor_cargo_config" ]]; then
+            m3_note "M3 stream parity rejects Cargo $m3_cargo_config_name outside the verified source worktree"
+            exit 1
+        fi
+    done
+    if [[ "$m3_cargo_config_parent" == / ]]; then
+        break
+    fi
+    m3_cargo_config_parent=${m3_cargo_config_parent%/*}
+    [[ -n "$m3_cargo_config_parent" ]] || m3_cargo_config_parent=/
+done
+
+m3_failure_stage=fixture_preflight
 if [[ ! -f "$m3_fixture_path" || -L "$m3_fixture_path" ]]; then
     m3_note "committed M2 golden fixture is missing or a symlink"
     exit 1
@@ -460,19 +599,256 @@ then
 fi
 m3_write_manifest running -1
 
+m3_resolve_contract_executable() {
+    python3 -I -S - "$@" <<'PY'
+# M3_CONTRACT_RESOLVER_PYTHON_BEGIN
+import json
+import os
+import stat
+import sys
+
+
+def fail(message):
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+mode, root, source = sys.argv[1:]
+if not os.path.isabs(root) or os.path.realpath(root) != root:
+    fail("fresh Cargo target root is not canonical and absolute")
+if os.path.islink(root) or not os.path.isdir(root):
+    fail("fresh Cargo target root is missing or symlinked")
+
+if mode == "discover":
+    candidates = []
+    try:
+        with open(source, "r", encoding="utf-8", errors="strict") as stream:
+            for line in stream:
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                target = message.get("target")
+                if (
+                    message.get("reason") == "compiler-artifact"
+                    and isinstance(target, dict)
+                    and target.get("name") == "contract"
+                    and target.get("kind") == ["test"]
+                    and isinstance(message.get("executable"), str)
+                    and message["executable"]
+                ):
+                    candidates.append(message["executable"])
+    except (OSError, UnicodeError) as error:
+        fail(f"could not read Cargo machine output: {error}")
+    if len(candidates) != 1:
+        fail(
+            "Cargo machine output must identify exactly one contract test executable; "
+            f"found {len(candidates)}"
+        )
+    candidate = candidates[0]
+elif mode == "validate":
+    candidate = source
+else:
+    fail("unknown contract executable validation mode")
+
+if not os.path.isabs(candidate) or os.path.normpath(candidate) != candidate:
+    fail("Cargo-emitted contract test executable path is not normalized and absolute")
+try:
+    if os.path.commonpath((root, candidate)) != root or candidate == root:
+        fail("Cargo-emitted contract test executable escapes the fresh target root")
+except ValueError:
+    fail("Cargo-emitted contract test executable is on a different path root")
+
+relative = os.path.relpath(candidate, root)
+cursor = root
+try:
+    for component in relative.split(os.sep):
+        cursor = os.path.join(cursor, component)
+        metadata = os.lstat(cursor)
+        if stat.S_ISLNK(metadata.st_mode):
+            fail("Cargo-emitted contract test executable path contains a symlink")
+except OSError as error:
+    fail(f"Cargo-emitted contract test executable is unavailable: {error}")
+if not stat.S_ISREG(metadata.st_mode):
+    fail("Cargo-emitted contract test executable is not a regular file")
+if metadata.st_mode & 0o111 == 0:
+    fail("Cargo-emitted contract test executable is not executable")
+if os.path.realpath(candidate) != candidate:
+    fail("Cargo-emitted contract test executable does not resolve canonically")
+
+open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+try:
+    descriptor = os.open(candidate, open_flags)
+    opened_metadata = os.fstat(descriptor)
+finally:
+    if "descriptor" in locals():
+        os.close(descriptor)
+if not stat.S_ISREG(opened_metadata.st_mode):
+    fail("opened contract test executable is not a regular file")
+if (metadata.st_dev, metadata.st_ino) != (opened_metadata.st_dev, opened_metadata.st_ino):
+    fail("contract test executable changed during validation")
+print(candidate)
+# M3_CONTRACT_RESOLVER_PYTHON_END
+PY
+}
+
+m3_append_build_diagnostic() {
+    local m3_diagnostic_path=$1
+    local m3_diagnostic_pipeline_status
+    if [[ ! -s "$m3_diagnostic_path" ]]; then
+        return 0
+    fi
+    set +e
+    m3_sanitize <"$m3_diagnostic_path" | tee -a "$m3_build_log"
+    m3_diagnostic_pipeline_status=("${PIPESTATUS[@]}")
+    set -e
+    if (( m3_diagnostic_pipeline_status[0] != 0 )); then
+        return "${m3_diagnostic_pipeline_status[0]}"
+    fi
+    if (( m3_diagnostic_pipeline_status[1] != 0 )); then
+        return "${m3_diagnostic_pipeline_status[1]}"
+    fi
+}
+
+m3_failure_stage=build_target_setup
+if [[ ! -d /private/tmp || -L /private/tmp ]] || \
+   [[ "$(cd /private/tmp 2>/dev/null && pwd -P)" != /private/tmp ]]; then
+    m3_note "canonical system build-target parent /private/tmp is unavailable"
+    exit 1
+fi
+m3_build_root_parent=/private/tmp
+m3_build_root=$(/usr/bin/mktemp -d "$m3_build_root_parent/hyperion-m3-contract.XXXXXXXX")
+if [[ ! -d "$m3_build_root" || -L "$m3_build_root" || ! -O "$m3_build_root" || \
+      "${m3_build_root%/*}" != "$m3_build_root_parent" || \
+      "${m3_build_root##*/}" != hyperion-m3-contract.* ]]; then
+    m3_note "mktemp did not create a safe runner-owned Cargo target root"
+    exit 1
+fi
+m3_build_root_canonical=$(cd "$m3_build_root" && pwd -P)
+if [[ "$m3_build_root_canonical" != "$m3_build_root" ]]; then
+    m3_note "fresh Cargo target root did not remain canonical"
+    exit 1
+fi
+case "$m3_build_root" in
+    "$m3_repo_root"|"$m3_repo_root"/*|"$m3_artifact_root"|"$m3_artifact_root"/*)
+        m3_note "fresh Cargo target root overlaps verified source or artifact input"
+        exit 1
+        ;;
+esac
+
+m3_failure_stage=cargo_build
+m3_cargo_machine_output="$m3_build_root/cargo-machine-output.jsonl"
+set +e
+CARGO_TARGET_DIR="$m3_build_root" "${m3_build_argv[@]}" 2>&1 \
+    | tee "$m3_cargo_machine_output" \
+    | m3_sanitize \
+    | tee "$m3_build_log"
+m3_build_pipeline_status=("${PIPESTATUS[@]}")
+set -e
+m3_build_exit_status=${m3_build_pipeline_status[0]}
+if (( m3_build_pipeline_status[0] != 0 )); then
+    exit "${m3_build_pipeline_status[0]}"
+fi
+if (( m3_build_pipeline_status[1] != 0 )); then
+    m3_failure_stage=build_machine_output_capture
+    exit "${m3_build_pipeline_status[1]}"
+fi
+if (( m3_build_pipeline_status[2] != 0 )); then
+    m3_failure_stage=build_log_sanitization
+    exit "${m3_build_pipeline_status[2]}"
+fi
+if (( m3_build_pipeline_status[3] != 0 )); then
+    m3_failure_stage=build_log_write
+    exit "${m3_build_pipeline_status[3]}"
+fi
+
+m3_failure_stage=contract_executable_discovery
+m3_discovery_error="$m3_build_root/contract-executable-discovery.log"
+set +e
+m3_contract_binary=$(m3_resolve_contract_executable \
+    discover "$m3_build_root" "$m3_cargo_machine_output" 2>"$m3_discovery_error")
+m3_discovery_status=$?
+set -e
+m3_append_build_diagnostic "$m3_discovery_error"
+if (( m3_discovery_status != 0 )); then
+    exit "$m3_discovery_status"
+fi
+
+m3_failure_stage=contract_executable_hash
+set +e
+m3_test_binary_sha256=$(m3_log_sha256 "$m3_contract_binary")
+m3_binary_hash_status=$?
+set -e
+if (( m3_binary_hash_status != 0 )); then
+    exit "$m3_binary_hash_status"
+fi
+
+m3_failure_stage=contract_executable_pretest_validation
+m3_validation_error="$m3_build_root/contract-executable-pretest.log"
+set +e
+m3_pretest_contract_binary=$(m3_resolve_contract_executable \
+    validate "$m3_build_root" "$m3_contract_binary" 2>"$m3_validation_error")
+m3_pretest_validation_status=$?
+set -e
+m3_append_build_diagnostic "$m3_validation_error"
+if (( m3_pretest_validation_status != 0 )); then
+    exit "$m3_pretest_validation_status"
+fi
+if [[ "$m3_pretest_contract_binary" != "$m3_contract_binary" ]]; then
+    echo "contract test executable identity changed before direct execution" \
+        | tee -a "$m3_build_log"
+    exit 1
+fi
+m3_pretest_binary_sha256=$(m3_log_sha256 "$m3_contract_binary")
+if [[ "$m3_pretest_binary_sha256" != "$m3_test_binary_sha256" ]]; then
+    echo "contract test executable digest changed before direct execution" \
+        | tee -a "$m3_build_log"
+    exit 1
+fi
+
+m3_direct_test_argv=(
+    "$m3_contract_binary"
+    "${m3_direct_test_manifest_argv[@]:1}"
+)
 m3_failure_stage=real_model_test
 set +e
-"${m3_test_argv[@]}" 2>&1 | m3_sanitize | tee "$m3_test_log"
-m3_pipeline_status=("${PIPESTATUS[@]}")
+"${m3_direct_test_argv[@]}" 2>&1 | m3_sanitize | tee "$m3_test_log"
+m3_test_pipeline_status=("${PIPESTATUS[@]}")
 set -e
-if (( m3_pipeline_status[0] != 0 )); then
-    exit "${m3_pipeline_status[0]}"
+m3_direct_test_exit_status=${m3_test_pipeline_status[0]}
+if (( m3_test_pipeline_status[0] != 0 )); then
+    exit "${m3_test_pipeline_status[0]}"
 fi
-if (( m3_pipeline_status[1] != 0 )); then
-    exit "${m3_pipeline_status[1]}"
+if (( m3_test_pipeline_status[1] != 0 )); then
+    m3_failure_stage=test_log_sanitization
+    exit "${m3_test_pipeline_status[1]}"
 fi
-if (( m3_pipeline_status[2] != 0 )); then
-    exit "${m3_pipeline_status[2]}"
+if (( m3_test_pipeline_status[2] != 0 )); then
+    m3_failure_stage=test_log_write
+    exit "${m3_test_pipeline_status[2]}"
+fi
+
+m3_failure_stage=contract_executable_posttest_validation
+m3_posttest_validation_error="$m3_build_root/contract-executable-posttest.log"
+set +e
+m3_posttest_contract_binary=$(m3_resolve_contract_executable \
+    validate "$m3_build_root" "$m3_contract_binary" 2>"$m3_posttest_validation_error")
+m3_posttest_validation_status=$?
+set -e
+m3_append_build_diagnostic "$m3_posttest_validation_error"
+if (( m3_posttest_validation_status != 0 )); then
+    exit "$m3_posttest_validation_status"
+fi
+if [[ "$m3_posttest_contract_binary" != "$m3_contract_binary" ]]; then
+    echo "contract test executable identity changed after direct execution" \
+        | tee -a "$m3_build_log"
+    exit 1
+fi
+m3_posttest_binary_sha256=$(m3_log_sha256 "$m3_contract_binary")
+if [[ "$m3_posttest_binary_sha256" != "$m3_test_binary_sha256" ]]; then
+    echo "contract test executable digest changed after direct execution" \
+        | tee -a "$m3_build_log"
+    exit 1
 fi
 
 m3_failure_stage=postflight_identity
@@ -514,5 +890,3 @@ fi
 
 m3_final_status=passed
 m3_failure_stage=
-printf 'm3-stream-parity-pass: source=%s fixture=%s evidence=%s\n' \
-    "$m3_source_sha" "$m3_fixture_actual_sha256" "$m3_evidence_root"
