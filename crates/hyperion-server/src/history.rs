@@ -544,6 +544,8 @@ impl<'a> Normalizer<'a> {
         if blocks.is_empty() {
             return Err(self.error(path, "must be a nonempty assistant content array"));
         }
+        // This independently caps text and tool counts before either filtered
+        // reference vector can grow.
         self.precheck_anthropic_content_array(blocks, path)?;
 
         let mut text_blocks = Vec::new();
@@ -729,6 +731,9 @@ impl<'a> Normalizer<'a> {
                 Ok(text.clone())
             }
             Value::Array(blocks) => {
+                // Reject attacker-sized direct arrays before allocating the
+                // proportional reference vector used by the shared validator.
+                self.checked_text_blocks(blocks.len(), path)?;
                 let blocks = blocks.iter().collect::<Vec<_>>();
                 self.text_block_content(&blocks, path, require_nonempty_blocks)
             }
@@ -2051,6 +2056,46 @@ mod tests {
         let history = json!([{"role": "user", "content": many_empty_blocks}]);
         let error = normalize_anthropic(&registry, None, &history).unwrap_err();
         assert!(error.to_string().contains("scan budget"));
+    }
+
+    #[test]
+    fn direct_text_arrays_reject_block_overflow_before_reference_collection() {
+        let registry = permissive_registry(&[]);
+        let blocks = json!([
+            {"type": "text", "text": "a"},
+            {"type": "text", "text": "b"},
+            {"type": "text", "text": "c"},
+        ]);
+        let limits = HistoryLimits {
+            aggregate_text_blocks: 2,
+            ..PRODUCTION_LIMITS
+        };
+
+        let openai = json!([{"role": "user", "content": blocks.clone()}]);
+        let openai_error = registry
+            .normalize_openai_history_with_limits(OpenAiHistoryInput { messages: &openai }, limits)
+            .unwrap_err();
+        assert!(
+            openai_error
+                .to_string()
+                .contains("maximum of 2 text blocks")
+        );
+
+        let anthropic_messages = json!([]);
+        let anthropic_error = registry
+            .normalize_anthropic_history_with_limits(
+                AnthropicHistoryInput {
+                    system: Some(&blocks),
+                    messages: &anthropic_messages,
+                },
+                limits,
+            )
+            .unwrap_err();
+        assert!(
+            anthropic_error
+                .to_string()
+                .contains("maximum of 2 text blocks")
+        );
     }
 
     #[test]

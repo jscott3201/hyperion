@@ -3,8 +3,12 @@
 //! [`ToolCallParser`]; this module adds registry validation and server-minted
 //! provider call IDs without knowing about HTTP framing.
 
-use std::sync::Arc;
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
+use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
@@ -16,6 +20,7 @@ use crate::tool_schema::{ToolMode, ToolRegistry};
 /// IDs remain valid when clients feed multiple assistant turns back as
 /// history. Exhaustion requires 2^64 prepared responses in one process.
 static NEXT_RESPONSE_NONCE: AtomicU64 = AtomicU64::new(1);
+static PROCESS_NAMESPACE: OnceLock<ProcessNamespace> = OnceLock::new();
 
 fn next_response_nonce() -> u64 {
     NEXT_RESPONSE_NONCE
@@ -23,6 +28,62 @@ fn next_response_nonce() -> u64 {
             current.checked_add(1)
         })
         .expect("process-wide tool-call response nonce exhausted")
+}
+
+/// A randomized process namespace mixed with non-secret lifecycle material.
+/// Two words retain collision resistance when independent processes start
+/// their response counters from the same value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcessNamespace([u64; 2]);
+
+impl ProcessNamespace {
+    fn initialize() -> Self {
+        let state = RandomState::new();
+        let process_id = process::id();
+        let started_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let word = |domain: u8| {
+            let mut hasher = state.build_hasher();
+            hasher.write_u8(domain);
+            hasher.write_u32(process_id);
+            hasher.write_u128(started_at);
+            hasher.finish()
+        };
+        Self([word(0), word(1)])
+    }
+}
+
+fn process_namespace() -> ProcessNamespace {
+    *PROCESS_NAMESPACE.get_or_init(ProcessNamespace::initialize)
+}
+
+/// Pure response-local call-ID generator with an injectable process namespace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CallIdGenerator {
+    namespace: ProcessNamespace,
+    response_nonce: u64,
+}
+
+impl CallIdGenerator {
+    fn new() -> Self {
+        Self {
+            namespace: process_namespace(),
+            response_nonce: next_response_nonce(),
+        }
+    }
+
+    fn mint(self, dialect: Dialect, call_index: usize) -> String {
+        let prefix = match dialect {
+            Dialect::OpenAi => "call",
+            Dialect::Anthropic => "toolu",
+        };
+        format!(
+            "{prefix}_{:016x}{:016x}_{}_{}",
+            self.namespace.0[0], self.namespace.0[1], self.response_nonce, call_index
+        )
+    }
 }
 
 /// One validated, provider-independent call ready for response framing.
@@ -50,7 +111,7 @@ pub(crate) struct ToolResponseAdapter {
     registry: Arc<ToolRegistry>,
     parser: Option<ToolCallParser>,
     dialect: Dialect,
-    response_nonce: u64,
+    id_generator: CallIdGenerator,
     next_call_index: usize,
     accepted_calls: usize,
     finished: bool,
@@ -66,7 +127,7 @@ impl ToolResponseAdapter {
             registry,
             parser,
             dialect,
-            response_nonce: next_response_nonce(),
+            id_generator: CallIdGenerator::new(),
             next_call_index: 0,
             accepted_calls: 0,
             finished: false,
@@ -88,7 +149,7 @@ impl ToolResponseAdapter {
         let events = parser.push_with_admission(fragment, &mut admission);
         adapt_events(
             self.dialect,
-            self.response_nonce,
+            self.id_generator,
             &mut self.next_call_index,
             &mut self.accepted_calls,
             events,
@@ -108,7 +169,7 @@ impl ToolResponseAdapter {
         let events = parser.finish_with_admission(&mut admission);
         adapt_events(
             self.dialect,
-            self.response_nonce,
+            self.id_generator,
             &mut self.next_call_index,
             &mut self.accepted_calls,
             events,
@@ -142,7 +203,29 @@ impl ToolResponseAdapter {
             registry,
             parser,
             dialect,
-            response_nonce: next_response_nonce(),
+            id_generator: CallIdGenerator::new(),
+            next_call_index: 0,
+            accepted_calls: 0,
+            finished: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_identity(
+        registry: Arc<ToolRegistry>,
+        dialect: Dialect,
+        namespace: ProcessNamespace,
+        response_nonce: u64,
+    ) -> Self {
+        let parser = (registry.mode() == ToolMode::Auto).then(ToolCallParser::new);
+        Self {
+            registry,
+            parser,
+            dialect,
+            id_generator: CallIdGenerator {
+                namespace,
+                response_nonce,
+            },
             next_call_index: 0,
             accepted_calls: 0,
             finished: false,
@@ -152,7 +235,7 @@ impl ToolResponseAdapter {
 
 fn adapt_events(
     dialect: Dialect,
-    response_nonce: u64,
+    id_generator: CallIdGenerator,
     next_call_index: &mut usize,
     accepted_calls: &mut usize,
     events: Vec<ToolCallEvent>,
@@ -162,14 +245,7 @@ fn adapt_events(
         .map(|event| match event {
             ToolCallEvent::Text(text) => ResponseEvent::Text(text),
             ToolCallEvent::Call(call) => {
-                let id = match dialect {
-                    Dialect::OpenAi => {
-                        format!("call_{response_nonce}_{}", *next_call_index + 1)
-                    }
-                    Dialect::Anthropic => {
-                        format!("toolu_{response_nonce}_{}", *next_call_index + 1)
-                    }
-                };
+                let id = id_generator.mint(dialect, *next_call_index + 1);
                 *next_call_index = next_call_index.saturating_add(1);
                 *accepted_calls = accepted_calls.saturating_add(1);
                 ResponseEvent::Call(AcceptedToolCall {
@@ -185,6 +261,7 @@ fn adapt_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::{AnthropicHistoryInput, OpenAiHistoryInput};
     use crate::tool_call::{TOOL_CALL_CLOSER, TOOL_CALL_OPENER};
     use crate::tool_schema::{OpenAiToolsInput, ToolRegistry};
     use serde_json::json;
@@ -246,6 +323,19 @@ mod tests {
                 ResponseEvent::Text(_) => None,
             })
             .collect()
+    }
+
+    fn minted_id(
+        dialect: Dialect,
+        namespace: ProcessNamespace,
+        response_nonce: u64,
+        query: &str,
+    ) -> String {
+        let source = format!("{TOOL_CALL_OPENER}lookup{{\"query\":\"{query}\"}}{TOOL_CALL_CLOSER}");
+        let mut adapter =
+            ToolResponseAdapter::with_identity(registry(), dialect, namespace, response_nonce);
+        let events = collect(&mut adapter, &[&source]);
+        call_ids(&events)[0].to_owned()
     }
 
     #[test]
@@ -375,6 +465,110 @@ mod tests {
         assert_eq!(second_ids.len(), 1);
         assert!(second_ids[0].ends_with("_1"));
         assert_ne!(first_ids[0], second_ids[0]);
+    }
+
+    #[test]
+    fn independent_namespaces_do_not_collide_and_both_replay_in_history() {
+        let namespace_a = ProcessNamespace([0x1111, 0xaaaa]);
+        let namespace_b = ProcessNamespace([0x2222, 0xbbbb]);
+        let first_call = format!("{TOOL_CALL_OPENER}lookup{{\"query\":\"a\"}}{TOOL_CALL_CLOSER}");
+        let second_call = format!("{TOOL_CALL_OPENER}lookup{{\"query\":\"b\"}}{TOOL_CALL_CLOSER}");
+
+        for (dialect, prefix) in [(Dialect::OpenAi, "call_"), (Dialect::Anthropic, "toolu_")] {
+            let mut first = ToolResponseAdapter::with_identity(registry(), dialect, namespace_a, 1);
+            let first_events = collect(&mut first, &[&first_call, &second_call]);
+            let first_ids = call_ids(&first_events);
+            assert_eq!(first_ids.len(), 2);
+            assert!(first_ids[0].starts_with(prefix));
+            assert!(first_ids[0].len() < 256);
+            let response_prefix = first_ids[0].strip_suffix("_1").unwrap();
+            assert_eq!(first_ids[1], format!("{response_prefix}_2"));
+
+            let mut restarted =
+                ToolResponseAdapter::with_identity(registry(), dialect, namespace_b, 1);
+            let restarted_events = collect(&mut restarted, &[&first_call]);
+            let restarted_ids = call_ids(&restarted_events);
+            assert_eq!(restarted_ids.len(), 1);
+            assert!(restarted_ids[0].starts_with(prefix));
+            assert!(restarted_ids[0].ends_with("_1"));
+            assert_ne!(first_ids[0], restarted_ids[0]);
+        }
+
+        let openai_a = minted_id(Dialect::OpenAi, namespace_a, 1, "first");
+        let openai_b = minted_id(Dialect::OpenAi, namespace_b, 1, "second");
+        let openai_history = json!([
+            {"role": "user", "content": "first"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": openai_a,
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"query\":\"first\"}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": openai_a, "content": "ok"},
+            {"role": "user", "content": "second"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": openai_b,
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"query\":\"second\"}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": openai_b, "content": "ok"},
+        ]);
+        let registry = registry();
+        assert!(
+            registry
+                .normalize_openai_history(OpenAiHistoryInput {
+                    messages: &openai_history,
+                })
+                .is_ok()
+        );
+
+        let anthropic_a = minted_id(Dialect::Anthropic, namespace_a, 1, "first");
+        let anthropic_b = minted_id(Dialect::Anthropic, namespace_b, 1, "second");
+        let anthropic_history = json!([
+            {"role": "user", "content": "first"},
+            {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": anthropic_a,
+                    "name": "lookup",
+                    "input": {"query": "first"},
+                }],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": anthropic_a, "content": "ok"}],
+            },
+            {"role": "user", "content": "second"},
+            {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": anthropic_b,
+                    "name": "lookup",
+                    "input": {"query": "second"},
+                }],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": anthropic_b, "content": "ok"}],
+            },
+        ]);
+        assert!(
+            registry
+                .normalize_anthropic_history(AnthropicHistoryInput {
+                    system: None,
+                    messages: &anthropic_history,
+                })
+                .is_ok()
+        );
     }
 
     #[test]
