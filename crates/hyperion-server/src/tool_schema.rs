@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
+use std::io::{self, Write};
 
 use serde_json::{Map, Value};
 
@@ -266,9 +267,19 @@ fn compile_tools(
             &format!("tools[{index}]"),
             &mut declaration_bytes,
             MAX_DECLARATION_BYTES,
-            false,
             0,
         )?;
+    }
+
+    let mut schema_value_nodes = 0;
+    for (index, tool) in tools.iter().enumerate() {
+        let path = format!("tools[{index}]");
+        let (_, _, schema_value) = parse_declaration(tool, &path, provider)?;
+        let schema_path = match provider {
+            Provider::OpenAi => format!("{path}.function.parameters"),
+            Provider::Anthropic => format!("{path}.input_schema"),
+        };
+        inspect_schema_tree(schema_value, &schema_path, 0, &mut schema_value_nodes)?;
     }
 
     let mut schema_nodes = 0;
@@ -752,7 +763,50 @@ fn validate_argument_budget(value: &Value) -> Result<(), ToolValidationError> {
     }
     let mut nodes = 0;
     let mut bytes = 0;
-    inspect_arguments(value, "$.arguments", 0, &mut nodes, &mut bytes)
+    inspect_arguments(value, "$.arguments", 0, &mut nodes, &mut bytes)?;
+    validate_compact_argument_bytes(value)
+}
+
+struct BoundedJsonCounter {
+    bytes: usize,
+    exceeded: bool,
+}
+
+impl Write for BoundedJsonCounter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let Some(total) = self.bytes.checked_add(buffer.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::other("compact JSON size overflow"));
+        };
+        if total > MAX_ARGUMENT_BYTES {
+            self.exceeded = true;
+            return Err(io::Error::other("compact JSON exceeds byte budget"));
+        }
+        self.bytes = total;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn validate_compact_argument_bytes(value: &Value) -> Result<(), ToolValidationError> {
+    let mut counter = BoundedJsonCounter {
+        bytes: 0,
+        exceeded: false,
+    };
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => Ok(()),
+        Err(_) if counter.exceeded => Err(validation_error(
+            "$.arguments",
+            format_args!("compact JSON encoding exceeds maximum of {MAX_ARGUMENT_BYTES} bytes"),
+        )),
+        Err(error) => Err(validation_error(
+            "$.arguments",
+            format_args!("compact JSON size accounting failed: {error}"),
+        )),
+    }
 }
 
 fn inspect_arguments(
@@ -819,7 +873,6 @@ fn inspect_strings_and_keys(
     path: &str,
     bytes: &mut usize,
     maximum: usize,
-    property_key: bool,
     depth: usize,
 ) -> Result<(), ToolSchemaError> {
     const MAX_INSPECTION_DEPTH: usize = MAX_DEPTH * 2 + 8;
@@ -833,9 +886,6 @@ fn inspect_strings_and_keys(
         Value::Object(object) => {
             for (key, value) in object {
                 reject_reserved(key, &format!("{path}.{key}"))?;
-                if property_key {
-                    validate_raw_key(key, &format!("{path}.{key}"))?;
-                }
                 *bytes = bytes.saturating_add(key.len());
                 if *bytes > maximum {
                     return Err(error(
@@ -843,13 +893,11 @@ fn inspect_strings_and_keys(
                         format_args!("exceeds maximum of {maximum} key/string bytes"),
                     ));
                 }
-                let is_property_key = key == "properties";
                 inspect_strings_and_keys(
                     value,
                     &format!("{path}.{key}"),
                     bytes,
                     maximum,
-                    is_property_key,
                     depth + 1,
                 )?;
             }
@@ -861,7 +909,6 @@ fn inspect_strings_and_keys(
                     &format!("{path}[{index}]"),
                     bytes,
                     maximum,
-                    false,
                     depth + 1,
                 )?;
             }
@@ -874,6 +921,43 @@ fn inspect_strings_and_keys(
                     path,
                     format_args!("exceeds maximum of {maximum} key/string bytes"),
                 ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn inspect_schema_tree(
+    value: &Value,
+    path: &str,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<(), ToolSchemaError> {
+    if depth > MAX_DEPTH {
+        return Err(error(
+            path,
+            format_args!("exceeds maximum depth {MAX_DEPTH}"),
+        ));
+    }
+    *nodes = nodes
+        .checked_add(1)
+        .ok_or_else(|| error(path, "schema JSON node count overflow"))?;
+    if *nodes > MAX_SCHEMA_NODES {
+        return Err(error(
+            path,
+            format_args!("exceeds maximum of {MAX_SCHEMA_NODES} schema JSON nodes"),
+        ));
+    }
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                inspect_schema_tree(child, &format!("{path}.{key}"), depth + 1, nodes)?;
+            }
+        }
+        Value::Array(values) => {
+            for (index, child) in values.iter().enumerate() {
+                inspect_schema_tree(child, &format!("{path}[{index}]"), depth + 1, nodes)?;
             }
         }
         _ => {}
@@ -1321,6 +1405,33 @@ mod tests {
     }
 
     #[test]
+    fn opaque_annotation_keys_are_scanned_but_not_treated_as_renderer_keys() {
+        let tools = json!([openai_tool(
+            "annotations",
+            json!({
+                "type":"object",
+                "default":{"properties":{"display name":true}}
+            })
+        )]);
+        let registry = openai(&tools).unwrap();
+        let parameters = &registry.render_tools()[0]["function"]["parameters"];
+        assert_eq!(
+            parameters,
+            &json!({"type":"object","properties":{},"required":[]})
+        );
+        assert!(parameters.get("default").is_none());
+
+        let actual_property = json!([openai_tool(
+            "bad",
+            json!({
+                "type":"object",
+                "properties":{"display name":{"type":"boolean"}}
+            })
+        )]);
+        assert!(openai(&actual_property).is_err());
+    }
+
+    #[test]
     fn declaration_schema_and_argument_budgets_fail_closed() {
         let too_many = Value::Array(
             (0..=MAX_DECLARATIONS)
@@ -1344,6 +1455,23 @@ mod tests {
             json!({"type":"object","properties":properties})
         )]);
         assert!(openai(&too_many_nodes).is_err());
+
+        let enum_values = vec![Value::String(String::new()); MAX_SCHEMA_NODES + 1];
+        let oversized_enum = json!([openai_tool(
+            "enum_nodes",
+            json!({
+                "type":"object",
+                "properties":{"choice":{"type":"string","enum":enum_values}}
+            })
+        )]);
+        assert!(openai(&oversized_enum).is_err());
+
+        let example_values = vec![Value::Bool(true); MAX_SCHEMA_NODES + 1];
+        let oversized_examples = json!([openai_tool(
+            "example_nodes",
+            json!({"type":"object","examples":example_values})
+        )]);
+        assert!(openai(&oversized_examples).is_err());
 
         let mut nested = json!({"type":"string"});
         for _ in 0..MAX_DEPTH {
@@ -1382,6 +1510,23 @@ mod tests {
                 .validate_generated(&call("args", json!({"value":deep_arguments})))
                 .is_err()
         );
+
+        let numeric_values = vec![Value::from(u64::MAX); MAX_ARGUMENT_NODES - 2];
+        let numeric_arguments = json!({"n":numeric_values});
+        assert_eq!(
+            serde_json::to_vec(&numeric_arguments).unwrap().len(),
+            85_981
+        );
+        assert_eq!(
+            registry
+                .validate_generated(&call("args", numeric_arguments))
+                .unwrap_err()
+                .to_string(),
+            "tool call $.arguments: compact JSON encoding exceeds maximum of 65536 bytes"
+        );
+        registry
+            .validate_generated(&call("args", json!({"n":[1,2,3],"ok":true})))
+            .unwrap();
     }
 
     #[test]
