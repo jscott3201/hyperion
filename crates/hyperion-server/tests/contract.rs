@@ -778,7 +778,8 @@ async fn non_streaming_native_tool_shapes_are_provider_compatible() {
     assert_eq!(choice["finish_reason"], "tool_calls");
     assert!(choice["message"]["content"].is_null());
     let call = &choice["message"]["tool_calls"][0];
-    assert_eq!(call["id"], "call_1");
+    let id = call["id"].as_str().unwrap();
+    assert!(id.starts_with("call_") && id.ends_with("_1"));
     assert_eq!(call["type"], "function");
     assert_eq!(call["function"]["name"], "lookup");
     let arguments: serde_json::Value =
@@ -819,7 +820,8 @@ async fn non_streaming_native_tool_shapes_are_provider_compatible() {
     assert_eq!(response["content"][0]["text"], "hello");
     let call = &response["content"][1];
     assert_eq!(call["type"], "tool_use");
-    assert_eq!(call["id"], "toolu_1");
+    let id = call["id"].as_str().unwrap();
+    assert!(id.starts_with("toolu_") && id.ends_with("_1"));
     assert_eq!(call["name"], "lookup");
     assert_eq!(call["input"], serde_json::json!({"query": "hi"}));
     assert_eq!(response["content"][2]["text"], "world");
@@ -864,10 +866,16 @@ async fn streaming_native_tool_shapes_preserve_mixed_order_and_indices() {
         .filter(|chunk| chunk["choices"][0]["delta"]["tool_calls"].is_array())
         .collect();
     assert_eq!(tool_deltas.len(), 2);
+    let response_prefix = tool_deltas[0]["choices"][0]["delta"]["tool_calls"][0]["id"]
+        .as_str()
+        .unwrap()
+        .strip_suffix("_1")
+        .unwrap()
+        .to_owned();
     for (index, chunk) in tool_deltas.iter().enumerate() {
         let call = &chunk["choices"][0]["delta"]["tool_calls"][0];
         assert_eq!(call["index"].as_u64(), Some(index as u64));
-        assert_eq!(call["id"], format!("call_{}", index + 1));
+        assert_eq!(call["id"], format!("{response_prefix}_{}", index + 1));
         assert_eq!(call["function"]["name"], "lookup");
         serde_json::from_str::<serde_json::Value>(call["function"]["arguments"].as_str().unwrap())
             .unwrap();
@@ -919,8 +927,16 @@ async fn streaming_native_tool_shapes_preserve_mixed_order_and_indices() {
     for (index, event) in starts.iter().enumerate() {
         assert_eq!(event["index"].as_u64(), Some(index as u64));
     }
-    assert_eq!(starts[1]["content_block"]["id"], "toolu_1");
-    assert_eq!(starts[3]["content_block"]["id"], "toolu_2");
+    let response_prefix = starts[1]["content_block"]["id"]
+        .as_str()
+        .unwrap()
+        .strip_suffix("_1")
+        .unwrap();
+    assert!(response_prefix.starts_with("toolu_"));
+    assert_eq!(
+        starts[3]["content_block"]["id"],
+        format!("{response_prefix}_2")
+    );
     assert_eq!(
         events
             .iter()

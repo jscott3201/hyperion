@@ -4,12 +4,26 @@
 //! provider call IDs without knowing about HTTP framing.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 
 use crate::dialect::Dialect;
 use crate::tool_call::{ToolCallEvent, ToolCallParser, ToolCallStats};
 use crate::tool_schema::{ToolMode, ToolRegistry};
+
+/// Process-wide response nonce. Combined with the per-response call index so
+/// IDs remain valid when clients feed multiple assistant turns back as
+/// history. Exhaustion requires 2^64 prepared responses in one process.
+static NEXT_RESPONSE_NONCE: AtomicU64 = AtomicU64::new(1);
+
+fn next_response_nonce() -> u64 {
+    NEXT_RESPONSE_NONCE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("process-wide tool-call response nonce exhausted")
+}
 
 /// One validated, provider-independent call ready for response framing.
 #[derive(Clone, Debug, PartialEq)]
@@ -36,6 +50,7 @@ pub(crate) struct ToolResponseAdapter {
     registry: Arc<ToolRegistry>,
     parser: Option<ToolCallParser>,
     dialect: Dialect,
+    response_nonce: u64,
     next_call_index: usize,
     accepted_calls: usize,
     finished: bool,
@@ -51,6 +66,7 @@ impl ToolResponseAdapter {
             registry,
             parser,
             dialect,
+            response_nonce: next_response_nonce(),
             next_call_index: 0,
             accepted_calls: 0,
             finished: false,
@@ -70,6 +86,7 @@ impl ToolResponseAdapter {
         adapt_events(
             &self.registry,
             self.dialect,
+            self.response_nonce,
             &mut self.next_call_index,
             &mut self.accepted_calls,
             parser.push(fragment),
@@ -87,6 +104,7 @@ impl ToolResponseAdapter {
         adapt_events(
             &self.registry,
             self.dialect,
+            self.response_nonce,
             &mut self.next_call_index,
             &mut self.accepted_calls,
             parser.finish(),
@@ -120,6 +138,7 @@ impl ToolResponseAdapter {
             registry,
             parser,
             dialect,
+            response_nonce: next_response_nonce(),
             next_call_index: 0,
             accepted_calls: 0,
             finished: false,
@@ -130,6 +149,7 @@ impl ToolResponseAdapter {
 fn adapt_events(
     registry: &ToolRegistry,
     dialect: Dialect,
+    response_nonce: u64,
     next_call_index: &mut usize,
     accepted_calls: &mut usize,
     events: Vec<ToolCallEvent>,
@@ -143,8 +163,12 @@ fn adapt_events(
                     return ResponseEvent::Text(call.raw);
                 }
                 let id = match dialect {
-                    Dialect::OpenAi => format!("call_{}", *next_call_index + 1),
-                    Dialect::Anthropic => format!("toolu_{}", *next_call_index + 1),
+                    Dialect::OpenAi => {
+                        format!("call_{response_nonce}_{}", *next_call_index + 1)
+                    }
+                    Dialect::Anthropic => {
+                        format!("toolu_{response_nonce}_{}", *next_call_index + 1)
+                    }
                 };
                 *next_call_index = next_call_index.saturating_add(1);
                 *accepted_calls = accepted_calls.saturating_add(1);
@@ -214,6 +238,16 @@ mod tests {
         output
     }
 
+    fn call_ids(events: &[ResponseEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ResponseEvent::Call(call) => Some(call.id.as_str()),
+                ResponseEvent::Text(_) => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn arbitrary_fragmentation_preserves_order_and_mints_stable_ids() {
         let source =
@@ -225,12 +259,15 @@ mod tests {
             let mut adapter = ToolResponseAdapter::new(registry(), Dialect::OpenAi);
             let events =
                 coalesce_text(collect(&mut adapter, &[&source[..split], &source[split..]]));
+            let id = call_ids(&events)[0].to_owned();
+            assert!(id.starts_with("call_"), "split {split}: {id}");
+            assert!(id.ends_with("_1"), "split {split}: {id}");
             assert_eq!(
                 events,
                 vec![
                     ResponseEvent::Text("before ".into()),
                     ResponseEvent::Call(AcceptedToolCall {
-                        id: "call_1".into(),
+                        id,
                         name: "lookup".into(),
                         arguments: json!({"query": "hi"}),
                     }),
@@ -260,7 +297,9 @@ mod tests {
         let mut adapter =
             ToolResponseAdapter::with_limits(registry(), Dialect::Anthropic, 1, 64 * 1024);
         let events = collect(&mut adapter, &[&a, &a, &b]);
-        assert!(matches!(&events[0], ResponseEvent::Call(call) if call.id == "toolu_1"));
+        assert!(
+            matches!(&events[0], ResponseEvent::Call(call) if call.id.starts_with("toolu_") && call.id.ends_with("_1"))
+        );
         assert_eq!(events[1], ResponseEvent::Text(b));
         assert_eq!(adapter.stats().parsed, 3);
         assert_eq!(adapter.stats().deduped, 1);
@@ -276,6 +315,25 @@ mod tests {
         assert_eq!(adapter.stats().parsed, 1);
         assert_eq!(adapter.stats().wellformed, 0);
         assert_eq!(adapter.stats().repaired, 1);
+    }
+
+    #[test]
+    fn separate_responses_never_reuse_ids_and_indices_stay_contiguous() {
+        let first_call = format!("{TOOL_CALL_OPENER}lookup{{\"query\":\"a\"}}{TOOL_CALL_CLOSER}");
+        let second_call = format!("{TOOL_CALL_OPENER}lookup{{\"query\":\"b\"}}{TOOL_CALL_CLOSER}");
+        let mut first = ToolResponseAdapter::new(registry(), Dialect::OpenAi);
+        let first_events = collect(&mut first, &[&first_call, &second_call]);
+        let first_ids = call_ids(&first_events);
+        assert_eq!(first_ids.len(), 2);
+        let response_prefix = first_ids[0].strip_suffix("_1").unwrap();
+        assert_eq!(first_ids[1], format!("{response_prefix}_2"));
+
+        let mut second = ToolResponseAdapter::new(registry(), Dialect::OpenAi);
+        let second_events = collect(&mut second, &[&first_call]);
+        let second_ids = call_ids(&second_events);
+        assert_eq!(second_ids.len(), 1);
+        assert!(second_ids[0].ends_with("_1"));
+        assert_ne!(first_ids[0], second_ids[0]);
     }
 
     #[test]
