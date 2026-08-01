@@ -297,14 +297,15 @@ int main() {
         static_cast<double>(budget.effective_bytes) * 0.30 / kGlobalKvBytesPerToken);
     require(opt == expected_opt, "throughput optimum must match the 30% formula");
 
-    // ── G4 gate ───────────────────────────────────────────────────────────────
+    // ── Geometry-only G4 scaffold ─────────────────────────────────────────────
 
-    // At 8K context, the predicted peak must be within budget (the G4 gate passes).
+    // This dense-BF16 geometry estimator is intentionally unwired from real quantized
+    // admission. These assertions cover its arithmetic only; they do not claim that
+    // the production 12B 8K/32K G4 evidence gate is closed.
     require(peak_within_budget(8192, geometry, budget.effective_bytes),
-        "8K context must pass the G4 peak-≤-budget gate");
-    // At 32K context, the predicted peak must also be within budget (the G4 gate passes).
+        "8K context must pass the geometry-only budget scaffold");
     require(peak_within_budget(32768, geometry, budget.effective_bytes),
-        "32K context must pass the G4 peak-≤-budget gate");
+        "32K context must pass the geometry-only budget scaffold");
 
     // ── Governor admission ────────────────────────────────────────────────────
 
