@@ -993,7 +993,7 @@ impl<'a> Normalizer<'a> {
             .map_err(|_| {
                 self.error(
                     path,
-                    "must satisfy the schema of a declared tool without unsafe content",
+                    "must satisfy the schema of a declared tool without disallowed content",
                 )
             })?;
         self.argument_bytes = aggregate;
