@@ -1,8 +1,15 @@
 {
-  "schema": "hyperion.m3-governor-calibration.v1",
-  "generated": "2026-07-23",
-  "model": "gemma4-12b-qat-mlx-g64-b4",
+  "schema": "hyperion.m3-governor-calibration.v2",
+  "classification": "MEASURED",
+  "recorded": "2026-08-01",
+  "source_commit": "b659c268c394254fb047c8c7ce1f167c3a6b56ae",
+  "source_file_sha256": "4936af2fabd0997bdb3d9d1ec051c8fdecc893fa5869a87fef7470ca2343ebca",
+  "executable_sha256": "090300599685cf5e6e89ee4d9da36010801ddb20cd028ac6dc9c4775df65921e",
+  "machine_state": "m5-16g-local-2026-07-21",
   "mlx_version": "0.32.0",
+  "model": "gemma4-12b-qat-mlx-g64-b4",
+  "model_sha256sums_file_sha256": "06fa68b13cbb6ca0e9f68573851e56aef1419be832e1efba168a11ef747879b4",
+  "golden_fixture_sha256": "086ca72232de415973564b2c6028c98a7063f7d024b85411512071650c86cf3d",
   "quant": "group-quantized g64/b4 (bf16 compute)",
   "prefill_chunk_size": 2048,
   "geometry": {
@@ -18,40 +25,57 @@
   },
   "governor": {
     "workspace_reserve_bytes": 536870912,
-    "transient_safety_factor": 1.25,
-    "global_kv_bytes_per_token": 16384,
-    "transient_model": "fused-SDPA OUTPUT [q, head_dim] per layer (POST-FIX; the [q, ctx] scores term was dropped — see the fix history below)",
-    "predict_path": "hyperion::governor::predict_peak (the live quantized-weights path; NOT peak_within_budget, which estimates dense bf16 and would false-negative on the g64/b4 12B)"
+    "transient_safety": 1.25,
+    "budget_ceiling_bytes": 12064746749,
+    "soft_watermark_bytes": 10858272074
   },
-  "method": "Per sentinel: a chunked (2048-token) prefill of synthetic zero ids at offset 0 — the production prefill path. max_predicted = the MAX predict_peak(chunk, offset) across chunks (the governor's effective admission ceiling). measured = mx::get_peak_memory() across the full chunked prefill (reset_peak_memory before). Peak memory for dense matmuls is shape-driven, so synthetic ids are valid. The gate verb is 'recorded' (10:45-46); the 20% guard is a non-gating warning that surfaces gross miscalibration.",
+  "method": "One diagnostic trial per sentinel through the internal production-equivalent prefill mechanics: a fresh whole-request KvGrowthPlan and KvGrowthTransaction, repeated hard/soft admission halving, rooted forward outputs, intermediate evaluation, final lm-head/softcap/greedy epilogue, then materialize/publish only on completion. Synthetic zero ids are shape-valid for peak allocation. This is not the public-C-ABI serving-suite evidence required to close G4.",
+  "command": "HYPERION_12B_ARTIFACT=$REPO/artifacts/models/gemma4-12b-qat-mlx-g64-b4 HYPERION_REPO_ROOT=$WORKTREE $WORKTREE/build/native/native_decode_bench --calibrate-sentinels",
+  "trial_count": 1,
   "sentinels": [
     {
       "context_len": 8192,
-      "max_predicted_bytes": 11276221142,
-      "measured_bytes": 8210965454,
-      "error_band_bytes": 3065255688,
-      "relative_error": 0.373312,
-      "within_20pct_guard": false
+      "outcome": "completed",
+      "completed_tokens": 8192,
+      "max_predicted_bytes": 12048957940,
+      "max_attempted_predicted_bytes": 12523004116,
+      "measured_bytes": 8617813862,
+      "error_band_bytes": 3431144078,
+      "relative_error": 0.398146,
+      "admission_attempts": 9233,
+      "executed_chunks": 1028,
+      "smallest_executed_chunk": 1,
+      "within_20pct_guard": false,
+      "uncontrolled_oom": false
     },
     {
       "context_len": 32768,
-      "max_predicted_bytes": 13755243222,
-      "measured_bytes": 10242253780,
-      "error_band_bytes": 3512989442,
-      "relative_error": 0.34299,
-      "within_20pct_guard": false
+      "outcome": "controlled_hard_reject",
+      "reason_code": "governor_hard_reject_at_one_token",
+      "completed_tokens": 0,
+      "max_predicted_bytes": 0,
+      "max_attempted_predicted_bytes": 12829447412,
+      "measured_bytes": 0,
+      "admission_attempts": 12,
+      "executed_chunks": 0,
+      "smallest_executed_chunk": null,
+      "uncontrolled_oom": false
     }
   ],
-  "fix_history": {
-    "before_fix_transient_model": "M2-2.6b modeled the SDPA ATTENTION SCORES tensor at full size [B, n_heads, q, ctx] per layer (the max(scores, output) formula).",
-    "before_fix_sentinels": [
-      {"context_len": 8192, "max_predicted_bytes": 18825968342, "measured_bytes": 8210965454, "relative_error": 1.29278},
-      {"context_len": 32768, "max_predicted_bytes": 36740028886, "measured_bytes": 10242253780, "relative_error": 2.5871}
-    ],
-    "root_cause": "MLX's mx::fast::scaled_dot_product_attention is a FUSED kernel that does NOT materialize the [q, ctx] scores matrix; it streams the computation. The M2-2.6b governor predicted a buffer that does not exist (~98-100% of the over-prediction was the transient scores term). The fused-SDPA footprint that IS materialized is the OUTPUT [q, head_dim] per layer.",
-    "fix": "attention_transient now models the OUTPUT [q, head_dim] per layer (governor.cc + predict_peak + peak_within_budget), dropping the scores term from the max(). The 1.25 kTransientSafety factor covers the fused-kernel tile working set.",
-    "after_fix_effect": "The over-prediction dropped from 2.3x (8K) / 3.6x (32K) to 1.37x (8K) / 1.34x (32K) — a ~3x improvement. The bias is now roughly CONSTANT across context (37% → 34%, vs 129% → 259% before), confirming the ctx-scaled scores term was the culprit. The governor now admits the 8K prefill comfortably (10.8 GiB predicted, under the 12 GiB budget); 32K predicts 13.1 GiB (just over the 12 GiB ceiling) vs 9.8 GiB measured — the remaining ~34% is the kWorkspaceReserve (512 MiB) + kTransientSafety (1.25x) + the live settled_working_set, a reasonable conservative admission margin."
+  "supersedes": {
+    "path": "benchmarks/m3/governor-calibration-v1-superseded.json",
+    "status": "historical_observations_retained_not_current_gate_evidence",
+    "reason": "The v1 probe executed fixed chunks directly and omitted production request-wide KV transaction and repeated shrink admission. Its measured values remain historical observations of that older shape, but they cannot establish current production-path 8K/32K outcomes."
   },
-  "remaining_margin": "The ~34% conservative over-prediction is intentional admission headroom (the governor's purpose is to predict a bit high; it never under-admits → no OOM risk). It is NOT a further bug — the ctx-worsening trend that signaled a real bug is gone (flat across context). A future tightening (lower kTransientSafety toward 1.0 now that the output term is exact, not a worst-case scores bound) is possible if admitting 32K under the 12 GiB budget becomes a product requirement; today the 8K sentinel — the M2 G4 headline context — admits cleanly.",
-  "gate_clause": "M3 'governor calibration report (predicted vs measured peaks across sentinels, error band recorded)' — 10-milestones-and-gates.md:45-46. This artifact RECORDS the report (the gate verb) AND documents the fix the calibration motivated. The 'zero uncontrolled OOM across suite' clause (10:46) is NOT closed by this report — it requires the serving suite; the conservative bias means OOM risk is low."
+  "gate_status": {
+    "calibration_report_recorded": true,
+    "prediction_within_20pct_guard": false,
+    "sentinel_8k_completed": true,
+    "sentinel_32k_completed": false,
+    "zero_uncontrolled_oom_in_probe": true,
+    "full_serving_suite_run": false,
+    "g4_closed": false,
+    "next_evidence_work_item": "019fbd9f-cdb4-7ef1-b2b9-c33de302c97e"
+  },
+  "verdict": "MEASURED diagnostic; FAIL for G4 acceptance because the 32K required-success sentinel was predictively rejected and the 8K prediction error is outside the recorded 20% guard."
 }

@@ -233,3 +233,49 @@ HYPERION_M0_OK
 - Consequence: M2 implementation may proceed, but M1 remains unaccepted; no throughput-optimal
   cap or relative M2 decode-performance gate may be claimed until a fresh compliant M1 run
 - Verdict: `DEFERRED (NO PERFORMANCE CLAIM)`
+
+## M3 rows
+
+### `HYP-M3-GOVERNOR-CALIBRATION-002` — production-lifetime diagnostic calibration
+
+- Classification: `MEASURED`
+- Source commit: `b659c268c394254fb047c8c7ce1f167c3a6b56ae`
+- Worktree: clean for tracked files; model and build artifacts ignored by policy
+- Machine state: `m5-16g-local-2026-07-21`
+- MLX: 0.32.0; device-derived effective budget `12,064,746,749` bytes; soft watermark
+  `10,858,272,074` bytes
+- Path-normalized exact command (`$REPO` is the root checkout and `$WORKTREE` the clean
+  governor worktree):
+
+```text
+HYPERION_12B_ARTIFACT=$REPO/artifacts/models/gemma4-12b-qat-mlx-g64-b4 HYPERION_REPO_ROOT=$WORKTREE $WORKTREE/build/native/native_decode_bench --calibrate-sentinels
+```
+
+- Native benchmark source SHA-256:
+  `4936af2fabd0997bdb3d9d1ec051c8fdecc893fa5869a87fef7470ca2343ebca`
+- Native benchmark executable SHA-256:
+  `090300599685cf5e6e89ee4d9da36010801ddb20cd028ac6dc9c4775df65921e`
+- Model `SHA256SUMS` file SHA-256:
+  `06fa68b13cbb6ca0e9f68573851e56aef1419be832e1efba168a11ef747879b4`
+- Golden fixture SHA-256:
+  `086ca72232de415973564b2c6028c98a7063f7d024b85411512071650c86cf3d`
+- Method: one diagnostic trial per sentinel through the internal production-equivalent
+  whole-request KV plan/transaction, repeated hard/soft shrink admission, rooted forward
+  outputs, final epilogue, and materialize/publish only after completion. This is not the
+  public-C-ABI serving-suite evidence required to close G4.
+- 8K: `completed`; max executed prediction `12,048,957,940` bytes; max attempted
+  prediction `12,523,004,116` bytes; measured peak `8,617,813,862` bytes; relative error
+  `+39.8146%`; 9,233 admission attempts; 1,028 executed chunks; smallest chunk one token;
+  no uncontrolled OOM.
+- 32K: `controlled_hard_reject` before execution; max attempted prediction
+  `12,829,447,412` bytes; 12 admission attempts down to the one-token terminal shape;
+  no graph for the rejected chunk, no partial KV publication, and no uncontrolled OOM.
+- Canonical artifact: `benchmarks/m3/governor-calibration.json`
+- Superseded artifact: the byte-preserved
+  `benchmarks/m3/governor-calibration-v1-superseded.json` remains a historical observation
+  of its older fixed-chunk probe, which omitted the production request-wide transaction and
+  repeated shrink admission; it is not current gate evidence.
+- Gate disposition: calibration is recorded and fail-closed behavior is observed, but the
+  8K prediction is outside the 20% guard, 32K did not complete, and the full serving suite
+  was not run. Work item `019fbd9f-cdb4-7ef1-b2b9-c33de302c97e` remains open.
+- Verdict: `FAIL FOR G4 ACCEPTANCE` — do not cite this row as 32K success or M3/G4 closure.

@@ -34,11 +34,19 @@ class StepTelemetryAccumulator {
     [[nodiscard]] hyperion::governor::GovernorDecision observe(
         hyperion::governor::GovernorDecision decision) noexcept {
         peak_mlx_bytes_ = std::max(peak_mlx_bytes_, decision.predicted_peak_bytes);
+        pressure_observed_ = pressure_observed_ ||
+            decision.admission != hyperion::governor::Admission::Accepted;
         return decision;
     }
 
     [[nodiscard]] std::uint64_t peak_mlx_bytes() const noexcept {
         return peak_mlx_bytes_;
+    }
+
+    /// Successful execution after any hard/soft shrink attempt is surfaced as
+    /// SOFT_PAUSED. HARD_REJECT remains a terminal state written by the caller.
+    [[nodiscard]] HypGovernorState successful_governor_state() const noexcept {
+        return pressure_observed_ ? HYP_GOVERNOR_SOFT_PAUSED : HYP_GOVERNOR_READY;
     }
 
     [[nodiscard]] StepTelemetrySnapshot snapshot(const KvState& kvstate) const noexcept {
@@ -83,6 +91,7 @@ class StepTelemetryAccumulator {
     }
 
     std::uint64_t peak_mlx_bytes_ = 0;
+    bool pressure_observed_ = false;
 };
 
 /// Write the sampled token + terminal governor/KV telemetry to a validated result.

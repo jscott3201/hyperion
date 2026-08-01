@@ -40,6 +40,36 @@ Budget derive_budget(std::uint64_t recommended_working_set_bytes) {
     };
 }
 
+Decision derive_device_budget(const DeviceInfo& device_info) {
+    constexpr const char* kInvalidRecommendation =
+        "device did not report a valid max recommended working set size";
+    const auto found =
+        device_info.find("max_recommended_working_set_size");
+    if (found == device_info.end()) {
+        return Decision{false, {}, kInvalidRecommendation};
+    }
+    const auto* recommended = std::get_if<std::size_t>(&found->second);
+    if (recommended == nullptr || *recommended == 0) {
+        return Decision{false, {}, kInvalidRecommendation};
+    }
+    const Budget budget = derive_budget(*recommended);
+    if (budget.effective_bytes == 0 || budget.soft_watermark_bytes == 0) {
+        return Decision{false, {}, kInvalidRecommendation};
+    }
+    return Decision{true, budget, {}};
+}
+
+RuntimeEnvironmentDecision evaluate_runtime_environment(
+    bool has_mlx_sdpa_blocks_override) {
+    if (has_mlx_sdpa_blocks_override) {
+        return RuntimeEnvironmentDecision{
+            false,
+            "MLX_SDPA_BLOCKS is unsupported because it invalidates governor workspace accounting",
+        };
+    }
+    return RuntimeEnvironmentDecision{true, ""};
+}
+
 Decision evaluate(
     bool has_gpu,
     std::uint32_t apple_gpu_family,

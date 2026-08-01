@@ -1,6 +1,7 @@
 #include "governor.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <mlx/mlx.h>
 
@@ -14,12 +15,18 @@ namespace {
 
 /// BF16 element size (bytes). The KV cache dtype is always bfloat16 in production.
 constexpr std::size_t kBf16Bytes = 2;
+constexpr std::size_t kBoolBytes = 1;
 
 /// Safety factor for fused-SDPA tiles and graph buffering (1.25 exactly).
 constexpr std::uint64_t kTransientSafetyNumerator = 5;
 constexpr std::uint64_t kTransientSafetyDenominator = 4;
 
 constexpr std::uint64_t kMaxBytes = std::numeric_limits<std::uint64_t>::max();
+
+/// The pinned vector two-pass kernel selects at most 1024 blocks. Model-load
+/// policy rejects MLX_SDPA_BLOCKS because that debug override is otherwise
+/// unbounded and would invalidate this workspace ceiling.
+constexpr std::uint64_t kMaxFusedVectorBlocks = 1024;
 
 std::uint64_t saturating_add(std::uint64_t lhs, std::uint64_t rhs) {
     return rhs > kMaxBytes - lhs ? kMaxBytes : lhs + rhs;
@@ -37,6 +44,153 @@ std::uint64_t scale_attention_transient(std::uint64_t bytes) {
         return kMaxBytes;
     }
     return bytes * kTransientSafetyNumerator / kTransientSafetyDenominator;
+}
+
+bool has_layer_kind(const Geometry& geometry, LayerType kind) {
+    return std::find(geometry.layer_types.begin(), geometry.layer_types.end(), kind) !=
+        geometry.layer_types.end();
+}
+
+struct AttentionExecutionShape {
+    std::uint64_t q;
+    std::uint64_t local_k;
+    std::uint64_t global_k;
+};
+
+AttentionExecutionShape attention_execution_shape(
+    const Geometry& geometry,
+    const AdmissionInput& input) {
+    if (input.n_tokens == 0) {
+        return {0, 0, 0};
+    }
+
+    if (input.step_kind == StepKind::Decode) {
+        // Decode executes q=1 forwards sequentially. The last step has the largest
+        // committed K axis and is therefore the admitted block's attention peak.
+        const std::uint64_t committed = saturating_add(input.offset, input.n_tokens);
+        return {
+            1,
+            std::min<std::uint64_t>(geometry.sliding_window, committed),
+            committed,
+        };
+    }
+
+    const std::uint64_t q = input.n_tokens;
+    const std::uint64_t committed = saturating_add(input.offset, q);
+    if (input.offset == 0) {
+        // Fresh prefill attends to this chunk's own K/V for both layer kinds.
+        return {q, q, q};
+    }
+    if (input.n_tokens == 1) {
+        // The production single-query continuation reads the final ring window.
+        return {
+            q,
+            std::min<std::uint64_t>(geometry.sliding_window, committed),
+            committed,
+        };
+    }
+    // Multi-query sliding continuation assembles retained-prefix + current chunk.
+    return {
+        q,
+        saturating_add(
+            std::min<std::uint64_t>(geometry.sliding_window, input.offset), q),
+        committed,
+    };
+}
+
+AttentionPath attention_path(
+    std::uint64_t q,
+    std::uint64_t k,
+    std::uint64_t query_head_dim,
+    std::uint64_t value_head_dim,
+    std::uint64_t num_query_heads,
+    std::uint64_t num_kv_heads) {
+    if (q == 0) {
+        return AttentionPath::None;
+    }
+    if (num_kv_heads == 0 || num_query_heads % num_kv_heads != 0 || q > k) {
+        return AttentionPath::Fallback;
+    }
+
+    const std::uint64_t gqa = num_query_heads / num_kv_heads;
+    if (q <= 8) {
+        const bool equal_supported = query_head_dim == value_head_dim &&
+            (query_head_dim == 64 || query_head_dim == 96 ||
+                query_head_dim == 128 || query_head_dim == 256);
+        const bool asymmetric_supported =
+            query_head_dim == 192 && value_head_dim == 128;
+        if ((equal_supported || asymmetric_supported) &&
+            saturating_multiply(q, gqa) <= 32) {
+            return AttentionPath::FusedVector;
+        }
+        return AttentionPath::Fallback;
+    }
+
+    const bool full_supported = query_head_dim == value_head_dim &&
+        (query_head_dim == 64 || query_head_dim == 80 || query_head_dim == 128);
+    return full_supported ? AttentionPath::FusedFull : AttentionPath::Fallback;
+}
+
+std::uint64_t tensor_bytes(
+    std::uint64_t first,
+    std::uint64_t second,
+    std::uint64_t third,
+    std::uint64_t element_bytes) {
+    std::uint64_t bytes = saturating_multiply(first, second);
+    bytes = saturating_multiply(bytes, third);
+    return saturating_multiply(bytes, element_bytes);
+}
+
+std::uint64_t fused_vector_workspace_bytes(
+    std::uint64_t q,
+    std::uint64_t k,
+    std::uint64_t num_query_heads,
+    std::uint64_t value_head_dim) {
+    if (k < 1024) {
+        return 0;
+    }
+
+    // MLX 0.32.0's long-context vector path allocates:
+    //   intermediate [B,Hq,q,blocks,Dv] in the query dtype, and
+    //   sums/maxs    [B,Hq,q,blocks]    in float32.
+    // Use the largest source-selected block count so the prediction is independent
+    // of which pinned Metal architecture branch is active.
+    std::uint64_t rows = saturating_multiply(num_query_heads, q);
+    rows = saturating_multiply(rows, kMaxFusedVectorBlocks);
+    const std::uint64_t intermediate =
+        saturating_multiply(rows, saturating_multiply(value_head_dim, kBf16Bytes));
+    const std::uint64_t reductions =
+        saturating_multiply(rows, 2ULL * sizeof(float));
+    return saturating_add(intermediate, reductions);
+}
+
+std::uint64_t attention_layer_phase_bytes(
+    std::uint64_t q,
+    std::uint64_t k,
+    std::uint64_t num_query_heads,
+    std::uint64_t value_head_dim,
+    AttentionPath path) {
+    if (path == AttentionPath::None) {
+        return 0;
+    }
+
+    const std::uint64_t output = tensor_bytes(
+        num_query_heads, q, value_head_dim, kBf16Bytes);
+    const std::uint64_t mask = tensor_bytes(q, k, 1, kBoolBytes);
+    std::uint64_t phase = saturating_add(output, mask);
+    if (path == AttentionPath::Fallback) {
+        const std::uint64_t scores = tensor_bytes(
+            num_query_heads, q, k, kBf16Bytes);
+        phase = saturating_add(phase, scores);
+    } else if (path == AttentionPath::FusedVector) {
+        phase = saturating_add(
+            phase,
+            fused_vector_workspace_bytes(q, k, num_query_heads, value_head_dim));
+    }
+    // Full fused attention has no allocator-backed intermediate in the pinned
+    // source. The retained 1.25 factor is its conservative tile/graph allowance
+    // and is also applied to fallback/vector phases.
+    return scale_attention_transient(phase);
 }
 
 struct GlobalKvProjection {
@@ -228,35 +382,55 @@ std::uint64_t continuation_local_kv_scratch(
     return saturating_multiply(bytes, kBf16Bytes); // K + V
 }
 
-std::uint64_t attention_transient_bytes(
+TransientPrediction predict_transient_impl(
     const Geometry& geometry,
-    std::uint32_t n_tokens,
-    std::uint32_t offset,
-    StepKind step_kind) {
-    // Prefill is one q=n forward. Decode executes the admitted block as sequential
-    // q=1 forwards, so its peak SDPA output is one token regardless of block length.
-    const std::uint64_t q = step_kind == StepKind::Prefill
-        ? n_tokens
-        : (n_tokens == 0 ? 0ULL : 1ULL);
+    const AdmissionInput& input) {
+    const AttentionExecutionShape shape = attention_execution_shape(geometry, input);
     const std::uint64_t n_heads = geometry.num_attention_heads;
-    const std::uint64_t local_elements = saturating_multiply(
-        saturating_multiply(q, geometry.head_dim_local), n_heads);
-    const std::uint64_t global_elements = saturating_multiply(
-        saturating_multiply(q, geometry.head_dim_global), n_heads);
-    const std::uint64_t local_transient =
-        saturating_multiply(local_elements, kBf16Bytes);
-    const std::uint64_t global_transient =
-        saturating_multiply(global_elements, kBf16Bytes);
+    const bool has_local = has_layer_kind(geometry, LayerType::Sliding);
+    const bool has_global = has_layer_kind(geometry, LayerType::Full);
 
-    std::uint64_t total = 0;
-    for (const auto& kind : geometry.layer_types) {
-        total = saturating_add(
-            total, kind == LayerType::Sliding ? local_transient : global_transient);
-    }
-    const std::uint64_t scaled_sdpa = scale_attention_transient(total);
-    return saturating_add(
-        scaled_sdpa,
-        continuation_local_kv_scratch(geometry, n_tokens, offset, step_kind));
+    const AttentionPath local_path = has_local
+        ? attention_path(
+              shape.q, shape.local_k,
+              geometry.head_dim_local, geometry.head_dim_local,
+              n_heads, geometry.num_kv_heads_local)
+        : AttentionPath::None;
+    const AttentionPath global_path = has_global
+        ? attention_path(
+              shape.q, shape.global_k,
+              geometry.head_dim_global, geometry.head_dim_global,
+              n_heads, geometry.num_kv_heads_global)
+        : AttentionPath::None;
+
+    std::uint64_t local_phase = attention_layer_phase_bytes(
+        shape.q, shape.local_k, n_heads, geometry.head_dim_local, local_path);
+    local_phase = saturating_add(
+        local_phase,
+        continuation_local_kv_scratch(
+            geometry, input.n_tokens, input.offset, input.step_kind));
+    const std::uint64_t global_phase = attention_layer_phase_bytes(
+        shape.q, shape.global_k, n_heads, geometry.head_dim_global, global_path);
+    const std::uint64_t attention_peak = std::max(local_phase, global_phase);
+
+    const std::uint64_t epilogue_q = input.step_kind == StepKind::Prefill
+        ? input.n_tokens
+        : (input.n_tokens == 0 ? 0ULL : 1ULL);
+    const std::uint64_t epilogue = input.include_epilogue
+        ? scale_attention_transient(tensor_bytes(
+              epilogue_q, geometry.vocab_size, 1, kBf16Bytes))
+        : 0;
+    return {
+        local_phase,
+        global_phase,
+        attention_peak,
+        epilogue,
+        std::max(attention_peak, epilogue),
+        shape.local_k,
+        shape.global_k,
+        local_path,
+        global_path,
+    };
 }
 
 struct MemoryPrediction {
@@ -265,25 +439,23 @@ struct MemoryPrediction {
 };
 
 MemoryPrediction predict_memory(
-    std::uint32_t n_tokens,
-    std::uint32_t offset,
+    const AdmissionInput& input,
     const KvState& kvstate,
     const Geometry& geometry,
-    StepKind step_kind,
     const hyperion::model::KvGrowthPlan* operation_plan) {
-    const auto derived_plan = hyperion::model::plan_kv_growth(kvstate, n_tokens);
+    const auto derived_plan =
+        hyperion::model::plan_kv_growth(kvstate, input.n_tokens);
     const auto& plan = operation_plan == nullptr ? derived_plan : *operation_plan;
     const std::uint64_t settled = saturating_add(
         mx::get_active_memory(), mx::get_cache_memory());
     const GlobalKvProjection global =
-        project_global_kv(kvstate, step_kind, derived_plan);
+        project_global_kv(kvstate, input.step_kind, derived_plan);
 
     std::uint64_t predicted = saturating_add(settled, global.reallocation_bytes);
     predicted = saturating_add(
-        predicted, staging_cow_bytes(kvstate, plan, step_kind));
+        predicted, staging_cow_bytes(kvstate, plan, input.step_kind));
     predicted = saturating_add(
-        predicted,
-        attention_transient_bytes(geometry, n_tokens, offset, step_kind));
+        predicted, predict_transient_impl(geometry, input).operation_peak_bytes);
     return {
         saturating_add(predicted, kWorkspaceReserveBytes),
         global.persistent_bytes,
@@ -314,32 +486,40 @@ std::uint64_t Governor::local_kv_bytes(const KvState& kvstate) const {
 }
 
 GovernorDecision Governor::evaluate(
-    std::uint32_t n_tokens,
-    std::uint32_t offset,
+    const AdmissionInput& input,
     const KvState& kvstate,
-    StepKind step_kind,
     const hyperion::model::KvGrowthPlan* operation_plan) const {
     const MemoryPrediction prediction = predict_memory(
-        n_tokens, offset, kvstate, geometry_, step_kind, operation_plan);
+        input, kvstate, geometry_, operation_plan);
+    // MLX reads this debug override at kernel evaluation time, not only at model
+    // construction. Recheck every admission so a post-load environment mutation
+    // cannot silently exceed the pinned 1024-block workspace model.
+    const bool unsupported_sdpa_override =
+        std::getenv("MLX_SDPA_BLOCKS") != nullptr;
 
     // Local allocation is fixed; global telemetry is projected post-step allocation.
     const std::uint64_t local_kv = local_kv_bytes(kvstate);
     const std::uint64_t global_kv = prediction.projected_global_bytes;
 
     GovernorDecision decision;
-    decision.predicted_peak_bytes = prediction.peak_bytes;
+    decision.predicted_peak_bytes = unsupported_sdpa_override
+        ? kMaxBytes
+        : prediction.peak_bytes;
     decision.budget_ceiling_bytes = budget_ceiling_bytes_;
     decision.soft_watermark_bytes = soft_watermark_bytes_;
     decision.local_kv_bytes = local_kv;
     decision.global_kv_bytes = global_kv;
 
-    if (prediction.peak_bytes == kMaxBytes ||
+    if (unsupported_sdpa_override || prediction.peak_bytes == kMaxBytes ||
         prediction.peak_bytes > budget_ceiling_bytes_) {
-        // Hard reject: even at the ceiling, this step won't fit.
+        // The proposed shape breaches the hard ceiling. Prefill callers halve this
+        // signal repeatedly; it becomes a terminal typed OOM only at one token.
         decision.admission = Admission::HardRejected;
-        decision.reason = prediction.peak_bytes == kMaxBytes
-            ? "memory projection exceeds the representable allocation range"
-            : "predicted peak exceeds the 12.06 GiB budget ceiling";
+        decision.reason = unsupported_sdpa_override
+            ? "MLX_SDPA_BLOCKS appeared after model load; governor admission fails closed"
+            : (prediction.peak_bytes == kMaxBytes
+                  ? "memory projection exceeds the representable allocation range"
+                  : "predicted peak exceeds the device-derived budget ceiling");
         return decision;
     }
 
@@ -355,15 +535,56 @@ GovernorDecision Governor::evaluate(
     return decision;
 }
 
-std::uint64_t predict_peak(
-    std::uint32_t n_tokens,
+PrefillAdmissionResult Governor::admit_prefill_to_fit(
+    std::uint32_t proposed_n_tokens,
     std::uint32_t offset,
+    std::uint32_t total_tokens,
+    const KvState& kvstate,
+    const hyperion::model::KvGrowthPlan* operation_plan) const {
+    PrefillAdmissionResult result;
+    if (proposed_n_tokens == 0) {
+        result.decision = evaluate(
+            AdmissionInput{0, offset, StepKind::Prefill, false},
+            kvstate,
+            operation_plan);
+        result.attempts[0] = result.decision;
+        result.attempt_count = 1;
+        return result;
+    }
+
+    std::uint32_t take = proposed_n_tokens;
+    while (true) {
+        const bool final_chunk =
+            offset <= total_tokens && take == total_tokens - offset;
+        const GovernorDecision decision = evaluate(
+            AdmissionInput{take, offset, StepKind::Prefill, final_chunk},
+            kvstate,
+            operation_plan);
+        result.attempts[result.attempt_count++] = decision;
+        result.n_tokens = take;
+        result.decision = decision;
+
+        if (decision.admission == Admission::Accepted || take == 1) {
+            // At one token soft pressure is advisory and executable; hard pressure
+            // is the sole terminal prefill rejection.
+            return result;
+        }
+        take = std::max(std::uint32_t{1}, take / 2);
+    }
+}
+
+std::uint64_t predict_peak(
+    const AdmissionInput& input,
     const KvState& kvstate,
     const Geometry& geometry,
-    StepKind step_kind,
     const hyperion::model::KvGrowthPlan* operation_plan) {
-    return predict_memory(
-        n_tokens, offset, kvstate, geometry, step_kind, operation_plan).peak_bytes;
+    return predict_memory(input, kvstate, geometry, operation_plan).peak_bytes;
+}
+
+TransientPrediction predict_transient(
+    const Geometry& geometry,
+    const AdmissionInput& input) {
+    return predict_transient_impl(geometry, input);
 }
 
 std::uint32_t throughput_optimum_context(std::uint64_t budget_ceiling_bytes) {
@@ -381,9 +602,9 @@ bool peak_within_budget(
     std::uint32_t context_len,
     const Geometry& geometry,
     std::uint64_t budget_ceiling_bytes) {
-    // G4 gate: predict the peak at ``context_len`` tokens (a full prefill of that
-    // length) and check it stays ≤ budget. Uses the same formula but with the
-    // full context as the prefill chunk (worst-case transient).
+    // G4 scaffold: predict a production-shaped chunked prefill rather than one
+    // impossible context-wide forward. It remains intentionally unwired until the
+    // weight estimator becomes quantization-aware.
     // settled_working_set at context_len = model weights + full KV at context_len.
     // The model weights are estimated from the geometry (bf16 = 2 bytes/element):
     //   embedding: vocab_size * hidden_size (shared if tie_word_embeddings)
@@ -396,38 +617,69 @@ bool peak_within_budget(
     // load path (it is scaffold for a future quantization-aware G4 check). The
     // moe/use_double_wide_mlp/ple_* fields are also ignored; harmless for the 12B
     // (dense MLP, no MoE/PLE) but would need accounting for a MoE target.
-    const std::uint64_t emb =
-        static_cast<std::uint64_t>(geometry.vocab_size) * geometry.hidden_size;
+    const std::uint64_t emb = saturating_multiply(
+        geometry.vocab_size, geometry.hidden_size);
+    const std::uint64_t attention_weights = saturating_multiply(
+        saturating_multiply(geometry.hidden_size, geometry.hidden_size), 4);
+    const std::uint64_t mlp_weights = saturating_multiply(
+        saturating_multiply(geometry.hidden_size, geometry.intermediate_size), 3);
     const std::uint64_t per_layer =
-        static_cast<std::uint64_t>(geometry.hidden_size) * geometry.hidden_size * 4 +
-        static_cast<std::uint64_t>(geometry.hidden_size) * geometry.intermediate_size * 3;
+        saturating_add(attention_weights, mlp_weights);
     const std::uint64_t lm_head = geometry.tie_word_embeddings ? 0 : emb;
+    std::uint64_t model_elements = saturating_add(
+        emb,
+        saturating_multiply(geometry.num_hidden_layers, per_layer));
+    model_elements = saturating_add(model_elements, lm_head);
     const std::uint64_t model_bytes =
-        (emb + static_cast<std::uint64_t>(geometry.num_hidden_layers) * per_layer + lm_head) * 2;
-    const std::uint64_t kv_bytes =
-        static_cast<std::uint64_t>(context_len) * kGlobalKvBytesPerToken;
+        saturating_multiply(model_elements, kBf16Bytes);
 
-    // The transient for a full prefill of ``context_len`` tokens at offset 0:
-    // q = context_len. The fused-SDPA OUTPUT [q, head_dim] per layer (the [q, ctx]
-    // scores are NOT materialized — see Governor::attention_transient + the M3
-    // calibration report).
-    const std::uint64_t q = static_cast<std::uint64_t>(context_len);
-    const std::uint64_t n_heads = static_cast<std::uint64_t>(geometry.num_attention_heads);
-    const std::uint64_t head_dim_local = static_cast<std::uint64_t>(geometry.head_dim_local);
-    const std::uint64_t head_dim_global = static_cast<std::uint64_t>(geometry.head_dim_global);
+    const std::uint64_t local_layers = static_cast<std::uint64_t>(std::count(
+        geometry.layer_types.begin(), geometry.layer_types.end(), LayerType::Sliding));
+    const std::uint64_t global_layers = static_cast<std::uint64_t>(std::count(
+        geometry.layer_types.begin(), geometry.layer_types.end(), LayerType::Full));
+    std::uint64_t local_kv = saturating_add(
+        geometry.sliding_window, hyperion::model::kDefaultGammaMax);
+    local_kv = saturating_multiply(local_kv, geometry.num_kv_heads_local);
+    local_kv = saturating_multiply(local_kv, geometry.head_dim_local);
+    local_kv = saturating_multiply(local_kv, 2ULL * kBf16Bytes);
+    local_kv = saturating_multiply(local_kv, local_layers);
 
-    std::uint64_t total_transient = 0;
-    for (const auto& kind : geometry.layer_types) {
-        if (kind == LayerType::Sliding) {
-            total_transient += q * head_dim_local * n_heads * kBf16Bytes;
-        } else {
-            total_transient += q * head_dim_global * n_heads * kBf16Bytes;
-        }
+    constexpr std::uint64_t kGlobalCapacityStep = 256;
+    const std::uint64_t global_capacity = context_len == 0
+        ? 0
+        : saturating_multiply(
+              (static_cast<std::uint64_t>(context_len) + kGlobalCapacityStep - 1) /
+                  kGlobalCapacityStep,
+              kGlobalCapacityStep);
+    std::uint64_t global_kv = saturating_multiply(
+        global_capacity, geometry.num_kv_heads_global);
+    global_kv = saturating_multiply(global_kv, geometry.head_dim_global);
+    global_kv = saturating_multiply(global_kv, 2ULL * kBf16Bytes);
+    global_kv = saturating_multiply(global_kv, global_layers);
+    const std::uint64_t kv_bytes = saturating_add(local_kv, global_kv);
+
+    constexpr std::uint32_t kPrefillChunkSize = 2048;
+    std::uint64_t operation_transient = 0;
+    std::uint32_t offset = 0;
+    while (offset < context_len) {
+        const std::uint32_t take =
+            std::min(kPrefillChunkSize, context_len - offset);
+        const auto transient = predict_transient_impl(
+            geometry,
+            AdmissionInput{
+                take,
+                offset,
+                StepKind::Prefill,
+                take == context_len - offset,
+            });
+        operation_transient =
+            std::max(operation_transient, transient.operation_peak_bytes);
+        offset += take;
     }
-    total_transient = scale_attention_transient(total_transient);
 
-    const std::uint64_t predicted =
-        model_bytes + kv_bytes + total_transient + kWorkspaceReserveBytes;
+    std::uint64_t predicted = saturating_add(model_bytes, kv_bytes);
+    predicted = saturating_add(predicted, operation_transient);
+    predicted = saturating_add(predicted, kWorkspaceReserveBytes);
 
     return predicted <= budget_ceiling_bytes;
 }

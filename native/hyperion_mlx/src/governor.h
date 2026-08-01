@@ -5,6 +5,8 @@
 #include "hyperion_mlx.h"
 #include "kv_cache.h"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 
 namespace mx = mlx::core;
@@ -14,7 +16,7 @@ namespace hyperion::governor {
 using hyperion::model::Geometry;
 using hyperion::model::KvState;
 
-/// Fixed overheads (bytes) subtracted from the 12.06 GiB ceiling before admission.
+/// Fixed overhead added to each predicted peak before device-budget admission.
 /// The 512 MiB reserve is the governor's safety margin for workspace + graph buffers
 /// that MLX does not attribute to get_active_memory / get_cache_memory.
 inline constexpr std::uint64_t kWorkspaceReserveBytes = 512ULL * 1024ULL * 1024ULL;
@@ -33,7 +35,8 @@ enum class Admission {
     Accepted,
     /// The step would breach the soft watermark; halve the chunk and retry.
     SoftPaused,
-    /// The step would breach the hard ceiling even at 1 token; reject.
+    /// The proposed shape breaches the hard ceiling. Prefill halves this signal;
+    /// only a one-token hard result is terminal.
     HardRejected,
 };
 
@@ -45,21 +48,66 @@ enum class StepKind {
     Decode,
 };
 
+/// Exact execution shape proposed to admission. Prefill is one q=n forward;
+/// decode is ``n_tokens`` sequential q=1 forwards. ``include_epilogue`` is true
+/// only when this execution shape also evaluates lm_head + softcap: every non-empty
+/// decode block and only the currently proposed final prefill chunk.
+struct AdmissionInput {
+    std::uint32_t n_tokens;
+    std::uint32_t offset;
+    StepKind step_kind;
+    bool include_epilogue;
+};
+
+/// Pinned MLX 0.32.0 attention dispatch selected for one layer kind.
+enum class AttentionPath {
+    None,
+    FusedVector,
+    FusedFull,
+    Fallback,
+};
+
+/// Per-phase transient prediction. Layer evaluation is sequential, so attention
+/// is the maximum of the one-local-layer and one-global-layer phases. The logits
+/// epilogue is sequential after the decoder stack, so the operation peak is the
+/// maximum of attention and epilogue rather than their sum.
+struct TransientPrediction {
+    std::uint64_t local_phase_bytes;
+    std::uint64_t global_phase_bytes;
+    std::uint64_t attention_peak_bytes;
+    std::uint64_t epilogue_phase_bytes;
+    std::uint64_t operation_peak_bytes;
+    std::uint64_t local_kv_length;
+    std::uint64_t global_kv_length;
+    AttentionPath local_path;
+    AttentionPath global_path;
+};
+
 /// Governor state reported back to the caller + telemetry.
 struct GovernorDecision {
-    Admission admission;
+    Admission admission = Admission::HardRejected;
     /// Predicted peak MLX bytes if the step proceeds (bytes).
-    std::uint64_t predicted_peak_bytes;
+    std::uint64_t predicted_peak_bytes = 0;
     /// The effective budget ceiling this decision was checked against (bytes).
-    std::uint64_t budget_ceiling_bytes;
+    std::uint64_t budget_ceiling_bytes = 0;
     /// The soft watermark (bytes); breaching it triggers SoftPaused.
-    std::uint64_t soft_watermark_bytes;
+    std::uint64_t soft_watermark_bytes = 0;
     /// Predicted local KV bytes after the step (bytes).
-    std::uint64_t local_kv_bytes;
+    std::uint64_t local_kv_bytes = 0;
     /// Predicted global KV bytes after the step (bytes).
-    std::uint64_t global_kv_bytes;
+    std::uint64_t global_kv_bytes = 0;
     /// Human-readable reason for a rejection/pause (empty on Accepted).
-    const char* reason;
+    const char* reason = "";
+};
+
+/// Repeated halve-and-re-evaluate result for one prefill chunk. A uint32 proposal
+/// reaches one in at most 32 attempts. Every decision is retained so step telemetry
+/// can observe every attempted prediction without allocating on the request path.
+struct PrefillAdmissionResult {
+    std::uint32_t n_tokens = 0;
+    GovernorDecision decision{};
+    std::array<GovernorDecision, 32> attempts{};
+    std::size_t attempt_count = 0;
 };
 
 /// Predictive admission governor for the M2 native forward pass.
@@ -72,7 +120,7 @@ struct GovernorDecision {
 /// predicted_peak = settled_working_set
 ///                + kv_reallocation_peak    [full replacement buffers on growth]
 ///                + staging_cow             [growth-transaction cache candidates]
-///                + attention_transient     [SDPA outputs + continuation scratch]
+///                + operation_transient     [max attention/epilogue phase]
 ///                + workspace + 512 MiB reserve
 /// ```
 ///
@@ -84,23 +132,16 @@ struct GovernorDecision {
 ///       any global cache grows; sequential decode also charges a growing cache's
 ///       current candidate when no-growth appends precede its first crossing; each
 ///       unavailable retained K/V input is charged until settled memory contains it
-///   attention_transient = (sum over layers of
-///       q * head_dim_local  * n_heads * dtype  [sliding]
-///       q * head_dim_global * n_heads * dtype  [global]) * safety
-///       + one assembled local K/V buffer for continuation prefill
-///   q = n_tokens for the one-shot prefill forward, or min(n_tokens, 1) for the
-///       peak of sequential q=1 decode forwards
-///   (the transient is the fused-SDPA OUTPUT [B, n_heads, q, head_dim] per layer —
-///    MLX's mx::fast::scaled_dot_product_attention is a FUSED kernel that does NOT
-///    materialize the [q, ctx] scores matrix (it streams it), so the transient is the
-///    output buffer, scaled by num_attention_heads — the QUERY head count. The
-///    continuation-prefill path additionally assembles the retained local prefix and
-///    current chunk into bounded K and V buffers before SDPA; the governor charges one
-///    exact per-layer peak for those buffers on ``StepKind::Prefill`` when
-///    ``offset > 0 && n_tokens > 1``. The
-///    kTransientSafety factor (1.25) covers the fused-kernel tile working set. The
-///    M2-2.6b governor modeled the full [q, ctx] scores and over-predicted by 2.3-3.6x
-///    (M3 calibration, benchmarks/m3/governor-calibration.json); this is the fix.)
+///   operation_transient = max(attention_peak, final_logits_epilogue)
+///   attention_peak = max(one local-layer phase, one global-layer phase)
+///   fallback layer phase = score[B,Hq,q,k] + output[B,Hq,q,Dv] + bool mask[q,k]
+///   fused layer phase = output + bool mask + pinned-kernel workspace allowance
+///   local continuation prefill additionally keeps one assembled K/V scratch pair
+///   alive with the local attention phase. All phase math is saturating and retains
+///   the 1.25 transient safety factor. q is the chunk width for prefill and one for
+///   sequential decode; decode K uses the last step in the admitted block.
+///   final_logits_epilogue charges the full BF16 [1,q,vocab] tensor only for a final
+///   prefill chunk (or q=1 decode), before the last-row slice.
 ///
 /// The governor is stateless across steps (it reads live MLX memory counters each
 /// call) but holds a reference to the geometry + budget for the per-layer math.
@@ -113,15 +154,21 @@ class Governor {
         std::uint64_t budget_ceiling_bytes,
         std::uint64_t soft_watermark_bytes);
 
-    /// Predict admission for a prefill/decode step of ``n_tokens`` at the given
-    /// committed ``offset`` (the current prefix length; 0 for a fresh prefill).
-    /// ``kvstate`` is read to compute the current local/global KV byte counts;
-    /// ``step_kind`` distinguishes a multi-token query from sequential q=1 decode.
+    /// Predict admission for ``input`` at its committed offset. ``kvstate`` is read
+    /// to compute current local/global KV bytes and replacement/staging lifetimes.
     [[nodiscard]] GovernorDecision evaluate(
-        std::uint32_t n_tokens,
-        std::uint32_t offset,
+        const AdmissionInput& input,
         const KvState& kvstate,
-        StepKind step_kind,
+        const hyperion::model::KvGrowthPlan* operation_plan = nullptr) const;
+
+    /// Repeatedly halve a prefill proposal after either hard or soft pressure.
+    /// Recomputes K lengths and final-chunk epilogue inclusion at every shape. A
+    /// hard decision is terminal only at one token; soft-at-one is executable.
+    [[nodiscard]] PrefillAdmissionResult admit_prefill_to_fit(
+        std::uint32_t proposed_n_tokens,
+        std::uint32_t offset,
+        std::uint32_t total_tokens,
+        const KvState& kvstate,
         const hyperion::model::KvGrowthPlan* operation_plan = nullptr) const;
 
     /// The hard ceiling this governor checks against (bytes).
@@ -141,12 +188,16 @@ class Governor {
 /// Compute the predicted peak for a step WITHOUT admission (for telemetry fill
 /// in the step result). Reads live MLX memory counters.
 [[nodiscard]] std::uint64_t predict_peak(
-    std::uint32_t n_tokens,
-    std::uint32_t offset,
+    const AdmissionInput& input,
     const KvState& kvstate,
     const Geometry& geometry,
-    StepKind step_kind,
     const hyperion::model::KvGrowthPlan* operation_plan = nullptr);
+
+/// Geometry/dispatch-aware transient phase prediction used by admission and the
+/// load-time G4 scaffold. It is independent of live MLX memory and KV allocation.
+[[nodiscard]] TransientPrediction predict_transient(
+    const Geometry& geometry,
+    const AdmissionInput& input);
 
 /// The throughput-optimum context length (A4) — the context at which throughput
 /// peaks before memory pressure dominates. NOT the ceiling; the governor targets
@@ -155,8 +206,8 @@ class Governor {
 [[nodiscard]] std::uint32_t throughput_optimum_context(
     std::uint64_t budget_ceiling_bytes);
 
-/// G4 gate: does the predicted peak at ``context_len`` tokens stay ≤ budget?
-/// Checked at the 8K/32K sentinels during model load.
+/// G4 scaffold: does a production-shaped chunked prefill at ``context_len`` stay
+/// within budget? This remains unwired pending quantization-aware weight accounting.
 [[nodiscard]] bool peak_within_budget(
     std::uint32_t context_len,
     const Geometry& geometry,
