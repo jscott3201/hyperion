@@ -16,6 +16,8 @@
 //!   shutdown) (B6).
 //! - [`tool_call`] — transport-neutral incremental Gemma 4 tool-call parsing,
 //!   bounded dedupe, finite repair, and raw-fidelity telemetry.
+//! - [`tool_schema`] — bounded provider tool normalization and generated-call
+//!   schema validation, kept independent of the HTTP adapters.
 //! - [`server`] — the axum router, the single-flight `Semaphore(1)` → 429, the
 //!   streaming handler, cancel-on-client-drop, 503 not-ready (B5).
 
@@ -27,6 +29,7 @@ pub mod prepare;
 pub mod server;
 pub mod sse;
 pub mod tool_call;
+pub mod tool_schema;
 
 use hyperion_core::EngineIdentity;
 
