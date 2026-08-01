@@ -953,7 +953,8 @@ HypStatus hyp_decode_block_sampled(HypModel model,
         }
         // Successful decode telemetry reports the exact pre-step admission decision.
         hyperion::model::write_step_result_sampled(
-            out_result, sample, HYP_GOVERNOR_READY, telemetry.snapshot(*kvstate->kv));
+            out_result, sample, telemetry.successful_governor_state(),
+            telemetry.snapshot(*kvstate->kv));
         execution_guard.disarm();
         return hyperion::model::ok();
     } catch (const std::bad_alloc&) {

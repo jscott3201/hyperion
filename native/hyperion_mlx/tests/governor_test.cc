@@ -400,6 +400,11 @@ int main() {
         local_originals.push_back(cache.values());
     }
     mx::eval(local_originals);
+    // The exact predictor-parity checks below read MLX's live allocator counters.
+    // Wait for this materialization and its allocator bookkeeping to settle first;
+    // otherwise a cold Metal process can observe different baselines in two
+    // back-to-back predictions even though their shape accounting is identical.
+    mx::synchronize(s);
     for (const auto& cache : materialized_originals_state.local) {
         require(cache.keys().is_available() && cache.values().is_available(),
             "explicit local-original eval must make every retained input available");
@@ -788,6 +793,22 @@ int main() {
         overflow_rejection.global_kv_bytes ==
             std::numeric_limits<std::uint64_t>::max(),
         "unrepresentable capacity proposal must saturate projected telemetry upward");
+
+    // MLX reads MLX_SDPA_BLOCKS at attention evaluation time. A value that appears
+    // after model construction must therefore reject at each admission, not rely
+    // solely on the model-load environment check.
+    require(std::getenv("MLX_SDPA_BLOCKS") == nullptr,
+        "governor test requires a clean MLX_SDPA_BLOCKS environment");
+    require(::setenv("MLX_SDPA_BLOCKS", "1048576", 1) == 0,
+        "governor test must install the runtime override negative control");
+    const auto runtime_override_rejection = gov.evaluate(
+        AdmissionInput{1, 1023, StepKind::Decode, true}, kvstate);
+    require(runtime_override_rejection.admission == Admission::HardRejected &&
+            runtime_override_rejection.predicted_peak_bytes ==
+                std::numeric_limits<std::uint64_t>::max(),
+        "a post-load MLX_SDPA_BLOCKS override must fail admission closed");
+    require(::unsetenv("MLX_SDPA_BLOCKS") == 0,
+        "governor test must restore the runtime environment");
 
     decision = boundary_crossing;
 

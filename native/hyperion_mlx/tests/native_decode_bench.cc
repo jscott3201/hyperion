@@ -32,6 +32,7 @@
 #include "geometry.h"
 #include "governor.h"
 #include "kv_cache.h"
+#include "platform_policy.h"
 #include "weights_loader.h"
 
 #include <algorithm>
@@ -40,7 +41,10 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <limits>
+#include <memory>
 #include <numeric>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -142,6 +146,12 @@ int main(int argc, char** argv) {
         const auto dispatch = build_dispatch(g);
         const mx::Stream cpu = mx::default_stream(mx::Device::cpu);
         const mx::Stream gpu = mx::new_stream(mx::Device::gpu);
+        const auto runtime_environment =
+            hyperion::platform::evaluate_runtime_environment(
+                std::getenv("MLX_SDPA_BLOCKS") != nullptr);
+        if (!runtime_environment.supported) {
+            throw std::runtime_error(runtime_environment.reason);
+        }
 
         auto golden_map = mx::load_safetensors(golden.string(), cpu).first;
         auto ids_it = golden_map.find("ids");
@@ -172,27 +182,26 @@ int main(int argc, char** argv) {
         };
 
         // ── M3 governor calibration mode (--calibrate-sentinels, 10:45-46). Runs a full ──
-        // prefill at the 8K + 32K sentinels (offset 0), compares the governor's
-        // predict_peak() (the LIVE quantized-weights path — NOT peak_within_budget, which
-        // estimates dense bf16 and would false-negative on the g64/b4 12B) against the
-        // MEASURED mx::get_peak_memory(), and emits a per-sentinel predicted/measured/
-        // error-band JSON record. The gate verb is "recorded" — a loose non-gating guard
-        // (|predicted-measured|/measured < 20%) surfaces gross miscalibration without
-        // blocking. Synthetic ids (zeros) are defensible: peak MLX memory for dense matmuls
-        // is shape-driven, not value-driven.
+        // prefill at the 8K + 32K sentinels (offset 0), using the same request-wide
+        // transaction, repeated shrink admission, rooted forward outputs, final epilogue,
+        // and materialize/publish sequence as hyp_prefill_chunk. The error band compares
+        // the prediction for shapes that actually executed against mx::get_peak_memory();
+        // rejected proposal predictions are reported separately. Synthetic ids (zeros)
+        // are defensible because peak MLX memory for dense matmuls is shape-driven.
         if (calibrate_sentinels) {
-            // The governor admits prefill CHUNK-BY-CHUNK (2048-token chunks, the
-            // production path): each chunk is evaluated via predict_peak(chunk, offset)
-            // before it runs. The calibration compares the MAX predicted peak across all
-            // chunks (the governor's effective admission ceiling for the prefill) against
-            // the MEASURED mx::get_peak_memory() across the full chunked prefill. This is
-            // the apples-to-apples comparison of how the governor is actually used — NOT a
-            // single-chunk prefill of the whole context (which is infeasible at 32K: the
-            // global attention transient for a 32K single chunk is ~32 GiB > the device).
             constexpr std::uint32_t kChunk = 2048;
             const std::array<std::uint32_t, 2> sentinels = {
                 hyperion::governor::kSentinel8K, hyperion::governor::kSentinel32K};
-            std::cout << "{\n  \"schema\": \"hyperion.m3-governor-calibration.v1\",\n";
+            const auto device_budget = hyperion::platform::derive_device_budget(
+                mx::device_info(mx::Device::gpu));
+            if (!device_budget.supported) {
+                throw std::runtime_error(device_budget.reason);
+            }
+            hyperion::governor::Governor governor(
+                g,
+                device_budget.budget.effective_bytes,
+                device_budget.budget.soft_watermark_bytes);
+            std::cout << "{\n  \"schema\": \"hyperion.m3-governor-calibration.v2\",\n";
             std::cout << "  \"model\": \"gemma4-12b-qat-mlx-g64-b4\",\n";
             std::cout << "  \"prefill_chunk_size\": " << kChunk << ",\n";
             std::cout << "  \"geometry\": {\"hidden_size\": " << g.hidden_size
@@ -201,34 +210,79 @@ int main(int argc, char** argv) {
                       << ", \"sliding_window\": " << g.sliding_window << "},\n";
             std::cout << "  \"governor\": {\"workspace_reserve_bytes\": "
                       << hyperion::governor::kWorkspaceReserveBytes
-                      << ", \"transient_safety\": 1.25},\n";
+                      << ", \"transient_safety\": 1.25"
+                      << ", \"budget_ceiling_bytes\": "
+                      << device_budget.budget.effective_bytes
+                      << ", \"soft_watermark_bytes\": "
+                      << device_budget.budget.soft_watermark_bytes << "},\n";
             std::cout << "  \"sentinels\": [\n";
             for (std::size_t s = 0; s < sentinels.size(); ++s) {
                 const std::uint32_t ctx = sentinels[s];
                 std::vector<int32_t> host_ids(ctx, 0);
                 mx::array ids_ctx = mx::array(host_ids.data(), mx::Shape{static_cast<int>(ctx)}, mx::int32);
-                auto kvstate = build_kv_state(dispatch, hyperion::model::kDefaultGammaMax, mx::bfloat16, gpu);
-                // Run the chunked prefill (the production path); track the MAX predicted
-                // peak across chunks + the MEASURED peak across the whole prefill.
+                auto live_kvstate = std::make_unique<hyperion::model::KvState>(
+                    build_kv_state(
+                        dispatch,
+                        hyperion::model::kDefaultGammaMax,
+                        mx::bfloat16,
+                        gpu));
+                const auto operation_plan =
+                    hyperion::model::plan_kv_growth(*live_kvstate, ctx);
+                if (!operation_plan.representable) {
+                    throw std::runtime_error(
+                        "sentinel prefill exceeds representable KV dimensions");
+                }
+                auto settled_staging_plan = operation_plan;
+                settled_staging_plan.requires_transaction = false;
+                hyperion::model::KvGrowthTransaction transaction(
+                    live_kvstate, operation_plan);
+
                 mx::reset_peak_memory();
-                std::uint64_t max_predicted = 0;
+                std::uint64_t max_executed_predicted = 0;
+                std::uint64_t max_attempted_predicted = 0;
+                std::uint32_t admission_attempts = 0;
+                std::uint32_t executed_chunks = 0;
+                std::uint32_t smallest_executed_chunk =
+                    std::numeric_limits<std::uint32_t>::max();
                 std::uint32_t offset = 0;
+                bool controlled_hard_reject = false;
                 while (offset < ctx) {
-                    const std::uint32_t take = std::min(kChunk, ctx - offset);
-                    max_predicted = std::max(max_predicted,
-                        hyperion::governor::predict_peak(
-                            hyperion::governor::AdmissionInput{
-                                take,
-                                offset,
-                                hyperion::governor::StepKind::Prefill,
-                                take == ctx - offset,
-                            },
-                            kvstate,
-                            g));
+                    const std::uint32_t proposed = std::min(kChunk, ctx - offset);
+                    const auto admission = governor.admit_prefill_to_fit(
+                        proposed,
+                        offset,
+                        ctx,
+                        transaction.state(),
+                        offset == 0 ? &operation_plan : &settled_staging_plan);
+                    for (std::size_t i = 0; i < admission.attempt_count; ++i) {
+                        max_attempted_predicted = std::max(
+                            max_attempted_predicted,
+                            admission.attempts[i].predicted_peak_bytes);
+                        ++admission_attempts;
+                    }
+                    if (admission.decision.admission ==
+                        hyperion::governor::Admission::HardRejected) {
+                        // The shrink loop returns hard only after the one-token shape
+                        // is rejected. This is a successful calibration outcome: stop
+                        // before constructing that chunk's graph and let transaction
+                        // destruction discard the already-staged partial prefill.
+                        controlled_hard_reject = true;
+                        break;
+                    }
+                    const std::uint32_t take = admission.n_tokens;
+                    max_executed_predicted = std::max(
+                        max_executed_predicted,
+                        admission.decision.predicted_peak_bytes);
+                    smallest_executed_chunk = std::min(
+                        smallest_executed_chunk, take);
+                    ++executed_chunks;
+
                     const int off0 = static_cast<int>(offset);
                     const int off1 = static_cast<int>(offset + take);
                     mx::array chunk_ids = mx::slice(ids_ctx, {off0}, {off1}, {1}, gpu);
-                    mx::array h = fwd.forward(fwd.embed(chunk_ids), kvstate, offset);
+                    mx::array h = fwd.forward(
+                        fwd.embed(chunk_ids), transaction.state(), offset);
+                    h = transaction.root_forward_result(h);
                     if (offset + take == ctx) {
                         (void)epilogue(h, static_cast<int>(take));
                     } else {
@@ -236,24 +290,73 @@ int main(int argc, char** argv) {
                     }
                     offset += take;
                 }
+                if (!controlled_hard_reject) {
+                    transaction.materialize();
+                    transaction.publish();
+                }
                 mx::synchronize(gpu);
                 const std::uint64_t measured = mx::get_peak_memory();
-                const std::int64_t error_band = static_cast<std::int64_t>(max_predicted) -
-                                                static_cast<std::int64_t>(measured);
+                if (controlled_hard_reject) {
+                    std::cout << "    {\"context_len\": " << ctx
+                              << ", \"outcome\": \"controlled_hard_reject\""
+                              << ", \"reason_code\": \"governor_hard_reject_at_one_token\""
+                              << ", \"completed_tokens\": " << offset
+                              << ", \"max_predicted_bytes\": "
+                              << max_executed_predicted
+                              << ", \"max_attempted_predicted_bytes\": "
+                              << max_attempted_predicted
+                              << ", \"measured_bytes\": " << measured
+                              << ", \"admission_attempts\": " << admission_attempts
+                              << ", \"executed_chunks\": " << executed_chunks
+                              << ", \"smallest_executed_chunk\": ";
+                    if (executed_chunks == 0) {
+                        std::cout << "null";
+                    } else {
+                        std::cout << smallest_executed_chunk;
+                    }
+                    std::cout << ", \"uncontrolled_oom\": false}";
+                    if (s + 1 < sentinels.size()) std::cout << ",";
+                    std::cout << "\n";
+                    std::cerr << "  [sentinel " << (ctx / 1024)
+                              << "K] controlled governor rejection after " << offset
+                              << " tokens; max_executed_predicted="
+                              << (max_executed_predicted / (1024 * 1024))
+                              << " MiB  max_attempted_predicted="
+                              << (max_attempted_predicted / (1024 * 1024))
+                              << " MiB  measured_so_far="
+                              << (measured / (1024 * 1024)) << " MiB\n";
+                    continue;
+                }
+                const std::int64_t error_band =
+                    static_cast<std::int64_t>(max_executed_predicted) -
+                    static_cast<std::int64_t>(measured);
                 const double rel_error = measured > 0
                     ? static_cast<double>(error_band) / static_cast<double>(measured) : 0.0;
                 const bool within_guard = measured > 0 && std::fabs(rel_error) < 0.20;
                 std::cout << "    {\"context_len\": " << ctx
-                          << ", \"max_predicted_bytes\": " << max_predicted
+                          << ", \"outcome\": \"completed\""
+                          << ", \"completed_tokens\": " << offset
+                          << ", \"max_predicted_bytes\": " << max_executed_predicted
+                          << ", \"max_attempted_predicted_bytes\": "
+                          << max_attempted_predicted
                           << ", \"measured_bytes\": " << measured
                           << ", \"error_band_bytes\": " << error_band
                           << ", \"relative_error\": " << rel_error
+                          << ", \"admission_attempts\": " << admission_attempts
+                          << ", \"executed_chunks\": " << executed_chunks
+                          << ", \"smallest_executed_chunk\": "
+                          << smallest_executed_chunk
                           << ", \"within_20pct_guard\": " << (within_guard ? "true" : "false")
+                          << ", \"uncontrolled_oom\": false"
                           << "}";
                 if (s + 1 < sentinels.size()) std::cout << ",";
                 std::cout << "\n";
-                std::cerr << "  [sentinel " << (ctx / 1024) << "K] max_predicted="
-                          << (max_predicted / (1024 * 1024)) << " MiB  measured="
+                std::cerr << "  [sentinel " << (ctx / 1024)
+                          << "K] max_executed_predicted="
+                          << (max_executed_predicted / (1024 * 1024))
+                          << " MiB  max_attempted_predicted="
+                          << (max_attempted_predicted / (1024 * 1024))
+                          << " MiB  measured="
                           << (measured / (1024 * 1024)) << " MiB  error_band="
                           << (error_band / (1024 * 1024)) << " MiB  rel="
                           << (rel_error * 100.0) << "%"

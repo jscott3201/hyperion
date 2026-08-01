@@ -1,6 +1,7 @@
 #include "governor.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <mlx/mlx.h>
 
@@ -490,26 +491,35 @@ GovernorDecision Governor::evaluate(
     const hyperion::model::KvGrowthPlan* operation_plan) const {
     const MemoryPrediction prediction = predict_memory(
         input, kvstate, geometry_, operation_plan);
+    // MLX reads this debug override at kernel evaluation time, not only at model
+    // construction. Recheck every admission so a post-load environment mutation
+    // cannot silently exceed the pinned 1024-block workspace model.
+    const bool unsupported_sdpa_override =
+        std::getenv("MLX_SDPA_BLOCKS") != nullptr;
 
     // Local allocation is fixed; global telemetry is projected post-step allocation.
     const std::uint64_t local_kv = local_kv_bytes(kvstate);
     const std::uint64_t global_kv = prediction.projected_global_bytes;
 
     GovernorDecision decision;
-    decision.predicted_peak_bytes = prediction.peak_bytes;
+    decision.predicted_peak_bytes = unsupported_sdpa_override
+        ? kMaxBytes
+        : prediction.peak_bytes;
     decision.budget_ceiling_bytes = budget_ceiling_bytes_;
     decision.soft_watermark_bytes = soft_watermark_bytes_;
     decision.local_kv_bytes = local_kv;
     decision.global_kv_bytes = global_kv;
 
-    if (prediction.peak_bytes == kMaxBytes ||
+    if (unsupported_sdpa_override || prediction.peak_bytes == kMaxBytes ||
         prediction.peak_bytes > budget_ceiling_bytes_) {
         // The proposed shape breaches the hard ceiling. Prefill callers halve this
         // signal repeatedly; it becomes a terminal typed OOM only at one token.
         decision.admission = Admission::HardRejected;
-        decision.reason = prediction.peak_bytes == kMaxBytes
-            ? "memory projection exceeds the representable allocation range"
-            : "predicted peak exceeds the device-derived budget ceiling";
+        decision.reason = unsupported_sdpa_override
+            ? "MLX_SDPA_BLOCKS appeared after model load; governor admission fails closed"
+            : (prediction.peak_bytes == kMaxBytes
+                  ? "memory projection exceeds the representable allocation range"
+                  : "predicted peak exceeds the device-derived budget ceiling");
         return decision;
     }
 
