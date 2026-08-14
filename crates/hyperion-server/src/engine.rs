@@ -28,6 +28,7 @@ use hyperion_ffi::{
     Status, StepResult,
 };
 use hyperion_model::geometry::Geometry;
+use hyperion_model::load::{ExecutableModelRef, ModelLoadPlan};
 
 /// The native prefill chunk size (05 §Prefill chunking). `hyp_prefill_chunk`
 /// chunks internally at this boundary and expects the whole prompt in one
@@ -323,12 +324,11 @@ impl EngineDriver for MailboxEngine {
 /// failure (the thread stays alive to drain the mailbox even if load failed —
 /// it exits immediately since `engine` is `Err`).
 pub fn engine_thread_loop(
-    geometry: Geometry,
-    weights_path: String,
+    plan: ModelLoadPlan,
     rx: std::sync::mpsc::Receiver<MailboxJob>,
     loaded: std::sync::mpsc::Sender<Result<(), EngineError>>,
 ) {
-    let engine = match Engine::load(&geometry, &weights_path) {
+    let engine = match Engine::load(&plan) {
         Ok(e) => {
             let _ = loaded.send(Ok(()));
             e
@@ -374,10 +374,16 @@ struct Generation {
 }
 
 impl Engine {
-    /// Load a model from a validated geometry + weights directory. The
-    /// `Geometry` is bridged to the ABI params via `AbiGeometry` (the buffer
-    /// the `layer_types` pointer borrows is owned for the call's duration).
-    pub fn load(geometry: &Geometry, weights_path: &str) -> Result<Self, EngineError> {
+    /// Load an opaque plan whose validated config is bound to its artifact root.
+    pub fn load(plan: &ModelLoadPlan) -> Result<Self, EngineError> {
+        match plan.executable() {
+            ExecutableModelRef::Gemma4(geometry) => Self::load_gemma4(geometry, plan.root_str()),
+        }
+    }
+
+    /// Current Gemma-native path, kept family-specific so Qwen cannot be
+    /// coerced through the Gemma-shaped C ABI while its graph is unavailable.
+    fn load_gemma4(geometry: &Geometry, weights_path: &str) -> Result<Self, EngineError> {
         let model = Model::create()?;
         let abi = AbiGeometry::from_geometry(geometry);
         model.load(abi.params(), weights_path)?;
@@ -950,57 +956,6 @@ mod tests {
         );
     }
 
-    /// The tiny fixture's geometry, mirroring `make_tiny_geometry()` in the
-    /// native forward test (the committed `gemma4-unified-tiny` config.json is
-    /// intentionally minimal and does not carry the rope/softmax fields
-    /// `Geometry::from_text_config_str` requires, so we build the validated
-    /// struct directly with the same values the native test uses).
-    fn tiny_geometry() -> Geometry {
-        use hyperion_model::geometry::{LayerType, RopeSpec, TextModelType};
-        Geometry {
-            model_type: TextModelType::Gemma4UnifiedText,
-            hidden_size: 128,
-            intermediate_size: 256,
-            num_hidden_layers: 6,
-            layer_types: vec![
-                LayerType::Sliding,
-                LayerType::Sliding,
-                LayerType::Sliding,
-                LayerType::Sliding,
-                LayerType::Sliding,
-                LayerType::Full,
-            ],
-            num_attention_heads: 4,
-            head_dim_local: 64,
-            head_dim_global: 128,
-            num_kv_heads_local: 2,
-            num_kv_heads_global: 1,
-            attention_k_eq_v_global: true,
-            num_kv_shared_layers: 0,
-            sliding_window: 8,
-            rope_local: RopeSpec {
-                theta: 10_000.0,
-                partial_rotary_factor: None,
-                proportional: false,
-            },
-            rope_global: RopeSpec {
-                theta: 1_000_000.0,
-                partial_rotary_factor: Some(0.25),
-                proportional: true,
-            },
-            final_logit_softcapping: 30.0,
-            rms_norm_eps: 1e-6,
-            attention_bias: false,
-            vocab_size: 128,
-            max_position_embeddings: 256,
-            tie_word_embeddings: true,
-            ple_hidden_per_layer_input: 0,
-            ple_vocab_per_layer_input: 0,
-            use_double_wide_mlp: false,
-            moe: None,
-        }
-    }
-
     /// The committed tiny fixture directory (a real 6-layer gemma4_unified
     /// artifact; ~728 KB, so it runs in-repo). The dev/M5 machine has it; CI
     /// does not, so this is `#[ignore]`.
@@ -1093,10 +1048,9 @@ mod tests {
     #[test]
     #[ignore = "requires the committed tiny fixture + a Metal device (self-hosted M5)"]
     fn engine_drives_greedy_on_tiny_fixture() {
-        let geometry = tiny_geometry();
         let dir = tiny_fixture_dir();
-        let engine = Engine::load(&geometry, dir.to_str().expect("utf-8 fixture path"))
-            .expect("load tiny fixture");
+        let plan = ModelLoadPlan::from_directory(&dir).expect("validate tiny fixture load plan");
+        let engine = Engine::load(&plan).expect("load tiny fixture");
 
         // Same prompt the native forward_test uses: {7, 3, 40, 100}.
         let request = EngineRequest {

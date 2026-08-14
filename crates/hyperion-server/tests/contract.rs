@@ -32,6 +32,35 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tower::ServiceExt;
 
+#[test]
+fn startup_rejects_qwen_before_tokenizer_or_native_initialization() {
+    let artifact = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("hyperion-model")
+        .join("fixtures")
+        .join("qwen35-recognized-only");
+    assert!(
+        !artifact.join("tokenizer.json").exists(),
+        "the poison fixture must not let tokenizer loading succeed"
+    );
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_hyperion-server"))
+        .arg("--model")
+        .arg(&artifact)
+        .output()
+        .expect("run hyperion-server startup boundary");
+    assert!(!output.status.success(), "recognized Qwen must fail closed");
+    let stderr = String::from_utf8(output.stderr).expect("startup stderr is UTF-8");
+    assert!(
+        stderr.contains("recognized model family qwen3_5 is not executable in this build"),
+        "typed unsupported error must win before tokenizer/native work: {stderr}"
+    );
+    assert!(
+        !stderr.contains("load tokenizer") && !stderr.contains("native engine error"),
+        "startup crossed the family boundary before rejecting Qwen: {stderr}"
+    );
+}
+
 /// A minimal HuggingFace `tokenizer.json` with a tiny WordLevel vocab that
 /// includes `<eos>` (so `token_to_id("<eos>")` resolves) + a few tokens. This
 /// lets the contract tests run `prepare` (render + tokenize) without a fixture
@@ -2991,10 +3020,8 @@ async fn real_http_sse_matches_m2_golden() {
         "fixture: expected the frozen 24-token completion"
     );
 
-    let config = std::fs::read_to_string(artifact.join("config.json"))
-        .expect("artifact identity: 12B config.json is readable");
-    let geometry = hyperion_model::geometry::Geometry::from_config_str(&config)
-        .expect("artifact identity: 12B geometry parses");
+    let model_plan = hyperion_model::load::ModelLoadPlan::from_directory(&artifact)
+        .expect("artifact identity: 12B model load plan validates");
     let tokenizer = TokenizerHandle::from_file(&artifact.join("tokenizer.json"))
         .expect("artifact identity: tokenizer loads");
     let template = ChatTemplate::from_artifact(&artifact, Some(&tokenizer))
@@ -3004,17 +3031,13 @@ async fn real_http_sse_matches_m2_golden() {
         !expected_text.is_empty(),
         "fixture: golden completion must decode to non-empty text"
     );
-    let artifact_string = artifact
-        .to_str()
-        .expect("artifact identity: artifact path is valid UTF-8")
-        .to_string();
-    let context = geometry.max_position_embeddings;
+    let context = model_plan.max_context();
 
     let (mailbox, mailbox_rx) = MailboxEngine::channel();
     let (loaded_tx, loaded_rx) = std::sync::mpsc::channel();
     let engine_thread = std::thread::Builder::new()
         .name("m3-real-engine".to_string())
-        .spawn(move || engine_thread_loop(geometry, artifact_string, mailbox_rx, loaded_tx))
+        .spawn(move || engine_thread_loop(model_plan, mailbox_rx, loaded_tx))
         .expect("lifecycle: real engine thread spawns");
     match loaded_rx.recv_timeout(std::time::Duration::from_secs(300)) {
         Ok(Ok(())) => {}

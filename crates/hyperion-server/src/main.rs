@@ -39,11 +39,16 @@ fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--build-info") {
         let info = hyperion_server::build_info();
+        let executable_families = info
+            .engine
+            .executable_model_families
+            .iter()
+            .map(|family| family.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
         println!(
-            "hyperion family={} native_backends={} serving_available={}",
-            info.engine.model_family.as_str(),
-            info.engine.native_backend_count,
-            info.serving_available,
+            "hyperion executable_families={} native_backends={} serving_available={}",
+            executable_families, info.engine.native_backend_count, info.serving_available,
         );
         return Ok(());
     }
@@ -65,13 +70,12 @@ fn run() -> Result<(), String> {
     // (BindGate::Loopback ⇒ no auth; Authenticated ⇒ bearer enforced. Both OK
     // to proceed; bind_gate already refused the fail-closed case.)
 
-    // Load the geometry from the artifact's config.json.
-    let config_path = std::path::Path::new(&model_dir).join("config.json");
-    let config_str =
-        std::fs::read_to_string(&config_path).map_err(|e| format!("read {config_path:?}: {e}"))?;
-    let geometry = hyperion_model::geometry::Geometry::from_config_str(&config_str)
-        .map_err(|e| format!("parse geometry: {e}"))?;
-    let context: ContextWindow = geometry.max_position_embeddings;
+    // Classify the architecture before loading any tokenizer/template or
+    // initializing native state. Recognized-but-unimplemented families fail
+    // here instead of leaking through Gemma-specific semantics.
+    let model_plan = hyperion_model::load::ModelLoadPlan::from_directory(&model_dir)
+        .map_err(|e| format!("plan model load: {e}"))?;
+    let context: ContextWindow = model_plan.max_context();
 
     // The model id (echoed in /v1/models + SSE frames) — the artifact dir name.
     let model_id = std::path::Path::new(&model_dir)
@@ -81,22 +85,21 @@ fn run() -> Result<(), String> {
         .to_string();
 
     // Load the tokenizer + chat template from the same artifact dir.
-    let tokenizer_path = std::path::Path::new(&model_dir).join("tokenizer.json");
+    let tokenizer_path = model_plan.root().join("tokenizer.json");
     let tokenizer =
         TokenizerHandle::from_file(&tokenizer_path).map_err(|e| format!("load tokenizer: {e}"))?;
-    let template = ChatTemplate::from_artifact(std::path::Path::new(&model_dir), Some(&tokenizer))
+    let template = ChatTemplate::from_artifact(model_plan.root(), Some(&tokenizer))
         .map_err(|e| format!("load chat template: {e}"))?;
 
     // Spawn the dedicated engine thread. The `!Send` `Engine` is loaded **on**
     // the engine thread (it can't be moved across threads); `engine_thread_loop`
-    // loads it from `geometry` + `model_dir` and reports success via `loaded`.
+    // loads it from the config-bound artifact plan and reports success via
+    // `loaded`.
     let (mailbox, rx) = MailboxEngine::channel();
     let (loaded_tx, loaded_rx) = std::sync::mpsc::channel();
-    let engine_geometry = geometry.clone();
-    let engine_model_dir = model_dir.clone();
     let engine_handle = std::thread::Builder::new()
         .name("hyperion-engine".into())
-        .spawn(move || engine_thread_loop(engine_geometry, engine_model_dir, rx, loaded_tx))
+        .spawn(move || engine_thread_loop(model_plan, rx, loaded_tx))
         .map_err(|e| format!("spawn engine thread: {e}"))?;
     // Wait for the engine thread to finish loading before serving (a 503
     // not-ready gate would be the async alternative; PR B loads-at-startup).
