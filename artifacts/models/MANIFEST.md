@@ -10,7 +10,7 @@ truth for identity, acquisition status, license review, local hashes, and progra
 | Legacy M1 | `google/gemma-4-E4B-it-qat-q4_0-unquantized` | `476025a01dbf99361c062bbeca3d6a76bb4c4566` | verified and converted for the deferred M1 stock baseline |
 | Post-V1 MTP | `google/gemma-4-12B-it-qat-q4_0-unquantized-assistant` | `18934064dd4c5c6cc3621f6381e7d377fc8cb7bd` | recorded, not acquired, and not a P0–P7 dependency |
 | Post-V1 MTP | `google/gemma-4-E4B-it-qat-q4_0-unquantized-assistant` | `27f8d204f09f2be353d6ff0bf0d012792b13c79f` | recorded, not acquired, and not a P0–P7 dependency |
-| P2 | `Qwen/Qwen3.8-27B` | `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` | identity pinned; not downloaded, converted, loadable, or accepted |
+| P2 | `Qwen/Qwen3.8-27B` | `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` | expected source/oracle contract pinned; no local payload, trace, conversion, execution, or acceptance |
 
 ## Accepted legacy M0 primary artifact
 
@@ -94,13 +94,22 @@ declares `apache-2.0`; each local model card is rechecked when acquired.
 
 - Repository/revision: `Qwen/Qwen3.8-27B` at
   `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`.
-- Reviewed remote state: public, ungated, Apache-2.0; 18 BF16 safetensor shards; source payload
-  about 55.56 GB. These are remote inventory facts, not a local verification record.
+- Reviewed remote state: public, ungated, Apache-2.0; 18 BF16 safetensor shards; complete
+  32-file repository payload 55,586,114,863 bytes. These are revision-pinned remote inventory
+  facts, not a local verification record.
+- Expected source inventory: [`oracle/qwen38/source-manifest.json`](../../oracle/qwen38/source-manifest.json),
+  SHA-256 `450ff5ada441702f54e8da2cd3c92a207ab1b3bdbaa6254427556d9afa4ff91a`.
+  It records content hashes for small files and official LFS payload hashes for large files; the
+  future high-memory run must still rehash every downloaded byte.
+- Oracle/case contract: [`oracle/qwen38/contract.json`](../../oracle/qwen38/contract.json) and
+  [`oracle/qwen38/cases.jsonl`](../../oracle/qwen38/cases.jsonl). Both implementation sources are
+  pinned but unexecuted; no numeric trace or agreement result is present.
 - Expected architecture: outer `qwen3_5`, text `qwen3_5_text`, 64-layer hybrid text graph.
 - Initial component selection: text weights only. Vision and bundled MTP are omitted by an
   explicit converter inventory, never by a permissive loader glob.
-- Local status: no source or transformed Qwen payload has been acquired. No hash manifest,
-  conversion identity, quality result, or native support is accepted.
-- P2 must record local file/LFS hashes, exact config/index/tokenizer/template/generation hashes,
-  source license frontmatter, converter identity, consumed/omitted tensor lists, and final root
-  digest before any transformed artifact can enter an evidence run.
+- Local status: no source or transformed Qwen payload has been acquired. No local source-tree
+  identity, conversion identity, real trace, quality result, or native support is accepted.
+- P2 must verify the expected hashes against local bytes, record source license frontmatter,
+  produce independent raw oracle receipts/traces, and later bind converter identity,
+  consumed/omitted tensor lists, and the final transformed root digest before any artifact can
+  enter an evidence run.

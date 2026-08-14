@@ -1,0 +1,190 @@
+{
+  "schema": "hyperion.qwen38-oracle-contract.v1",
+  "status": {
+    "oracle_reference_only": true,
+    "weights_acquired": false,
+    "local_model_tree_verified": false,
+    "oracle_executed": false,
+    "real_weight_traces_produced": false,
+    "tolerances_frozen": false,
+    "reference_agreement_measured": false,
+    "native_executable": false,
+    "artifact_accepted": false,
+    "support_accepted": false
+  },
+  "source": {
+    "repository": "Qwen/Qwen3.8-27B",
+    "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+    "manifest_path": "oracle/qwen38/source-manifest.json",
+    "manifest_sha256": "450ff5ada441702f54e8da2cd3c92a207ab1b3bdbaa6254427556d9afa4ff91a"
+  },
+  "component": {
+    "scope": "text-only",
+    "outer_architecture": "Qwen3_5ForConditionalGeneration",
+    "outer_model_type": "qwen3_5",
+    "text_model_type": "qwen3_5_text",
+    "included_tensor_prefixes": [
+      "model.language_model.",
+      "lm_head."
+    ],
+    "omitted_tensor_prefixes": [
+      "model.visual.",
+      "mtp."
+    ],
+    "text_parameters": 26895998464,
+    "num_hidden_layers": 64,
+    "linear_attention_layers": 48,
+    "full_attention_layers": 16,
+    "hidden_size": 5120,
+    "intermediate_size": 17408,
+    "vocab_size": 248320,
+    "tie_word_embeddings": false,
+    "recurrent_state_dtype": "float32"
+  },
+  "oracles": [
+    {
+      "id": "transformers",
+      "repository": "huggingface/transformers",
+      "revision": "95940bf8775059a42f047256f076e4f607bc43ec",
+      "implementation_path": "src/transformers/models/qwen3_5/modeling_qwen3_5.py",
+      "implementation_sha256": "90d929129ffc835d2652c604925c4f3842bc6e401e174ec6f0db2285dfb8f85a",
+      "state": "source_pinned_unexecuted",
+      "execution_mode_status": "partial_intent_environment_and_producer_unfrozen",
+      "execution_intent": {
+        "model_class": "Qwen3_5ForConditionalGeneration",
+        "component": "text_inputs_only",
+        "weight_dtype": "bfloat16",
+        "attention": "eager",
+        "hub_kernels": false,
+        "trust_remote_code": false,
+        "local_files_only": true,
+        "generation": "fixed_step_greedy_direct_forward",
+        "max_steps": 16
+      }
+    },
+    {
+      "id": "mlx_lm",
+      "repository": "ml-explore/mlx-lm",
+      "revision": "8239c72de5a0e42c539e30489021db73c7fe258c",
+      "implementation_path": "mlx_lm/models/qwen3_5.py",
+      "implementation_sha256": "cdcfbf22681d2005f4bdff53ab9ab06da7aeb71c0e89378f65f893beeaf0b47c",
+      "state": "source_pinned_unexecuted",
+      "execution_mode_status": "partial_intent_environment_and_producer_unfrozen",
+      "execution_intent": {
+        "model_class": "mlx_lm.models.qwen3_5.Model",
+        "component": "text_only_sanitized",
+        "weight_dtype": "bfloat16",
+        "mlx": "0.32.0",
+        "model_training": false,
+        "generation": "fixed_step_greedy_direct_forward",
+        "max_steps": 16
+      }
+    }
+  ],
+  "conversation": {
+    "cases_path": "oracle/qwen38/cases.jsonl",
+    "cases_sha256": "2a1c23a1baa9ea8566fce71d452272202eddf71e83190c930389fce94097fda3",
+    "case_count": 20,
+    "tokenizer_class": "Qwen2Tokenizer",
+    "tokenizer_sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+    "tokenizer_config_sha256": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27",
+    "chat_template_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+    "generation_config_sha256": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e",
+    "special_tokens": {
+      "endoftext": 248044,
+      "im_start": 248045,
+      "im_end": 248046,
+      "tool_call_start": 248058,
+      "tool_call_end": 248059,
+      "tool_response_start": 248066,
+      "tool_response_end": 248067,
+      "think_start": 248068,
+      "think_end": 248069
+    },
+    "stop_token_ids": [
+      248046,
+      248044
+    ],
+    "shared_dependency_disclosure": "Both reference arms use the pinned checkpoint tokenizer and template; their rendering agreement is not an independent model-math vote."
+  },
+  "required_coverage": [
+    "canonical_dual_stop",
+    "consecutive_tool_results",
+    "invalid_reasoning_effort_rejection",
+    "multi_turn",
+    "parallel_tool_calls",
+    "parser_every_byte_split",
+    "parser_malformed_fallback",
+    "parser_parallel_calls",
+    "parser_utf8_split",
+    "parser_valid_call",
+    "preserve_thinking_false",
+    "preserve_thinking_true",
+    "stop_endoftext",
+    "stop_im_end",
+    "system_first_rejection",
+    "system_first_valid",
+    "system_with_tools",
+    "thinking_default",
+    "thinking_disabled",
+    "thinking_low",
+    "thinking_medium",
+    "thinking_xhigh",
+    "tool_declaration"
+  ],
+  "trace": {
+    "state": "channel_requirements_preregistered_no_payload",
+    "required_channels": [
+      "rendered_utf8",
+      "input_ids",
+      "position_ids",
+      "full_vocab_logits_f32",
+      "topk_ids_values_and_margins",
+      "greedy_token_ids",
+      "free_running_utf8",
+      "selected_hidden_states",
+      "selected_gdn_recurrent_state_f32",
+      "selected_gdn_conv_state",
+      "selected_full_attention_kv",
+      "instrumented_uninstrumented_control"
+    ],
+    "required_boundaries": [
+      "initial",
+      "post_prefill",
+      "post_decode",
+      "token_step",
+      "chunk_before_conv_width",
+      "chunk_at_conv_width",
+      "chunk_after_conv_width"
+    ],
+    "bundle_rules": {
+      "raw_oracle_outputs_separate": true,
+      "producer_authored_pass_ignored": true,
+      "third_party_comparison_required": true,
+      "exact_inventory_required": true,
+      "external_inventory_digest_required": true,
+      "atomic_publication_required": true,
+      "source_verified_before_and_after": true
+    },
+    "tolerances": {
+      "status": "unfrozen_requires_clean_and_fault_measurement"
+    }
+  },
+  "required_evidence_identities": [
+    "source_manifest",
+    "source_tree",
+    "oracle_implementation",
+    "oracle_environment",
+    "python_runtime",
+    "device_backend",
+    "execution_mode",
+    "case_corpus",
+    "conversation_profile",
+    "trace_schema",
+    "producer_command",
+    "producer_executable",
+    "machine_profile",
+    "raw_payload_inventory",
+    "comparison_harness"
+  ]
+}
