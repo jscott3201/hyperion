@@ -1,15 +1,18 @@
-# 07 — Speculative decoding (MTP lane) [M7 — sequenced late ON PURPOSE]
+# 07 — Speculative decoding research baseline [post-V1 under ADR 0006]
+
+This chapter preserves the Gemma MTP research and promotion discipline. Neither Gemma MTP nor
+Qwen's bundled MTP is a V1 dependency in the active P0–P7 plan.
 
 ## Why decode needs it (physics)
 
 M5 decode is memory-bandwidth-bound: 153 GB/s ÷ ~7 GB Q4 working set ⇒ ~low-20s tok/s
 dense ceiling regardless of kernel quality (Apple's own M5 data: decode only +19–27% vs M4
-while prefill jumped ~4×). Speculative decoding is the ONLY lever that beats the ceiling —
-it converts k sequential bandwidth-bound steps into one wider, more compute-bound verify
-step that can use idle NAX capacity. Everything else in this package optimizes toward the
-ceiling; this lane goes through it.
+while prefill jumped ~4×). Speculative decoding is the preserved plan for amortizing dense weight
+reads beyond the single-token bandwidth ceiling: it converts k sequential steps into one wider,
+more compute-bound verify step that can use idle NAX capacity. It is a hypothesis for a reopened
+post-V1 lane, not the only possible systems lever or a current performance claim.
 
-## Why it is M7 and not M2 (evidence)
+## Why the legacy plan placed it at M7 rather than M2 (evidence)
 
 Helios ran an ~XR14→XR86 marathon on MTP and never cleared its own +25% protected-aggregate
 default-on gate: final XR86 = **+19.969%**, weighted acceptance **0.706**, verifier forward =
@@ -18,9 +21,9 @@ matured. The lesson is NOT "MTP doesn't work" — acceptance 0.706 with a 400M d
 healthy, and Google reports up to 3× (H100-class) and ~2.2× on Apple silicon (26B, batch
 4–8); llama.cpp measured 1.9–3.1× (DGX Spark, acceptance 0.588). The lesson is that
 **verify-step cost decides everything**, and Helios's verifier ran on the slow re-trace
-execution model with a serial rollback default. hyperion's sequencing: make the dense path
-fast first (M2–M4: compiled step, K1/K2 kernels), then attach MTP where the verify forward
-is cheap. Same gate (+25%), different substrate.
+execution model with a serial rollback default. The retired M2–M4/M7 plan therefore put dense
+execution and kernels first. Under ADR 0006, MTP is post-V1 and can reopen only after the accepted
+resident path supplies a credible verify-cost baseline.
 
 ## Design (official drafter, one-pass verify)
 
@@ -43,19 +46,20 @@ is cheap. Same gate (+25%), different substrate.
   - **Alias the vocab/embedding tensor** between target and drafter — hyperion owns both ends
     (NunSpark loads two 262144 tables redundantly; a real 16 GB cost to avoid).
 - **Draft:** greedy, depth γ ∈ [2, 8] (autotuned per acceptance EWMA; Helios XR14 heritage).
-  Single-position pinned drafting (linear chain). **Tree drafting is OUT of v1** — not because
+  Single-position pinned drafting (linear chain). **Tree drafting is outside the first reopened
+  lane** — not because
   it's impossible on MLX (NunSpark shows it works by flattening the tree into the batch
   dimension: equal-length root-to-leaf paths from one shared prefix, tile the prefix KV across
   B rows, one stock causal mask + scalar offset — no custom tree mask/RoPE), but because its
   compute scales `num_paths × path_len` (redundant ancestor recompute), which is free in a
   disk-bound engine but **not** in hyperion's compute-bound regime, and NunSpark's own tree
   path is an unvalidated POC on hybrid sliding/global attention with an unguarded Rotating-
-  cache gap. Revisit post-v1 only with a compute-bound payoff hypothesis (references/nunspark-
+  cache gap. Revisit only with a compute-bound payoff hypothesis (references/nunspark-
   adoptions.md B5).
 - **Verify:** ONE batched forward over the γ candidate tokens (shape-bucketed like decode;
   qmv_wide is MLX 0.32.0's kernel for exactly this small-batch quantized matvec). Greedy
   acceptance: longest matching prefix + 1 corrected token (target distribution preserved
-  under greedy by construction). Sampled-mode speculative acceptance is post-v1.
+  under greedy by construction). Sampled-mode speculative acceptance is a later sublane.
 - **Rollback: append-only, never trim committed state (A2 — a real bug in NunSpark's own
   Gemma-MTP path).** `RotatingKVCache.is_trimmable()` is False once the sliding-window ring
   has rotated, and a long agentic session (many spec rounds) is exactly what rotates it.
@@ -76,11 +80,12 @@ is cheap. Same gate (+25%), different substrate.
   (1) same-shape+same-state = bit-identical (cheap, real); (2) **cross-shape MTP =
   target-verified lossless** — every emitted token equals some real verify-pass argmax, and
   each divergence from single-token greedy must be an explained sub-0.5 top-2 near-tie via a
-  standing **`near_tie_events` counter** (shipped from M2); (3) any divergence *not* explained
+  standing **`near_tie_events` counter** (implemented during the legacy Gemma work and required
+  before any reopened speculative lane); (3) any divergence *not* explained
   by a near-tie gap = a real bug → auto-disable + record fixture. Parity is a per-session
   runtime check plus the counter, not a byte-identity assertion.
 
-## Second lane — n-gram / prompt-lookup adaptive drafter [M5, complementary to MTP] (B1)
+## Second lane — n-gram / prompt-lookup adaptive drafter [deferred, complementary to MTP] (B1)
 
 A cheap second speculative lane that pairs well with the agentic tool-calling target, adopted
 from NunSpark's best-designed drafter. Model-free: draft the next tokens from the most recent
@@ -103,20 +108,20 @@ numbers. Same three-tier exactness (target-verified + `near_tie_events`) applies
 
 ## MoE targets: speculative decoding is OFF by default (A5)
 
-If the 26B-A4B MoE tier is ever built (M9), **do not** run MTP or n-gram spec against it:
+If a 26B-A4B MoE tier is ever reopened from the legacy M9 proposal, **do not** run MTP or n-gram
+spec against it:
 NunSpark MEASURED spec *slower than greedy* across four MoE scales (30B/120B/235B/480B) because
 each verify-pass position fires its own expert union, so union-I/O grows with γ while acceptance
-doesn't. Spec is the **dense** lever (Gemma-4-12B, this milestone); expert-caching is the sparse
-lever (M9). This note exists so M9 doesn't rediscover it.
+doesn't. Spec is a **dense-target** lever; expert caching is the sparse-target lever. This note is
+preserved so a future MoE lane does not rediscover the same result.
 
-## Gate (unchanged from Helios — the number that was never beaten)
+## Gate if the lane is reopened (inherited from Helios)
 
 Promote to default-on ONLY at **≥ +25% protected aggregate** across the real-workload
 corpus (chat/tool/qa/long-context lanes, first token excluded, A-C-C-A, candidate-min >
 baseline-max), with G1 exactness green and G4 memory within budget (drafter adds ~0.25 GB
-Q4 + activations). Below gate → ships as scoped opt-in (`"speculative": true` per request /
-config allowlist per workload lane, exactly how Helios ended), and that is an ACCEPTABLE
-M7 completion. The ledger records either outcome.
+Q4 + activations). A below-gate experiment may be parked or retained as a separately scoped
+opt-in only with a new decision record; it does not affect P0–P7 acceptance.
 
 ## Expected economics on M5 (to be MEASURED, orientation only)
 
@@ -124,12 +129,12 @@ Acceptance 0.6–0.75 (Helios 0.706 measured; llama.cpp 0.588) × γ=4 ⇒ ~2.3�
 committed per verify forward. If the compiled verify forward costs ≤1.6× a single decode
 step (plausible: same weights-read amortized over γ tokens is precisely the
 bandwidth-sharing win), net ≥ +40–80% is in range — comfortably over the +25% gate. If the
-verify forward stays ≥2.5× a decode step, it will land sub-gate again like Helios. The M7
-kill-switch criterion is explicit up front: two full A/B rounds sub-gate → park, write the
+verify forward stays ≥2.5× a decode step, it will land sub-gate again like Helios. The inherited
+kill-switch criterion remains: two full A/B rounds sub-gate → park, write the
 decision record, move on (R2 discipline — no second marathon).
 
 ## Batch-4-8 note (Google's Apple-silicon claim context)
 
-Google's ~2.2× figure was batch 4–8 on the 26B; hyperion v1 is batch-1 single-flight. Do
-not import their number as an expectation; the M1 baseline + M7 A/B rows are the only
-numbers that count (baseline-then-gate law).
+Google's ~2.2× figure was batch 4–8 on the 26B; Hyperion's accepted local profiles are batch-one
+single-flight. Do not import that number as an expectation; a reopened lane needs its own
+preregistered baseline and A/B rows.

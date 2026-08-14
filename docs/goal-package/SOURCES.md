@@ -1,5 +1,24 @@
 # SOURCES — evidence map (compiled 2026-07-21)
 
+Updated for the dual-family owner ruling on 2026-08-14. Older mutable `main` links remain the
+historical Gemma v0.2 research record; new Qwen inputs below use the frozen source revision.
+
+## Primary — Qwen3.8 source (PINNED, not yet locally verified)
+
+- [Model card](https://huggingface.co/Qwen/Qwen3.8-27B/blob/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/README.md)
+  and immutable source revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`.
+- [config.json](https://huggingface.co/Qwen/Qwen3.8-27B/blob/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/config.json)
+  and [tensor index](https://huggingface.co/Qwen/Qwen3.8-27B/blob/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/model.safetensors.index.json).
+- [tokenizer config](https://huggingface.co/Qwen/Qwen3.8-27B/blob/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/tokenizer_config.json),
+  [chat template](https://huggingface.co/Qwen/Qwen3.8-27B/blob/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/chat_template.jinja),
+  and [generation config](https://huggingface.co/Qwen/Qwen3.8-27B/blob/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/generation_config.json).
+- [Transformers Qwen3.5 implementation](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py)
+  and [mlx-lm Qwen3.5 implementation](https://github.com/ml-explore/mlx-lm/blob/8239c72de5a0e42c539e30489021db73c7fe258c/mlx_lm/models/qwen3_5.py).
+  P2 must freeze an exact Transformers commit and revalidate the existing mlx-lm candidate before
+  either becomes an oracle identity; these links are architecture sources, not accepted parity.
+- [Gated Delta Networks](https://arxiv.org/abs/2412.06464) is the primary mixer-method paper. It
+  explains recurrence mechanics but is not Qwen3.8 training, quality, or runtime evidence.
+
 ## Primary — model (CONFIRMED tier)
 
 - `config.json`, all five sizes (fetched directly): [12B](https://huggingface.co/google/gemma-4-12B-it/resolve/main/config.json) · [E2B](https://huggingface.co/google/gemma-4-E2B-it/resolve/main/config.json) · [E4B](https://huggingface.co/google/gemma-4-E4B/resolve/main/config.json) · [26B-A4B](https://huggingface.co/google/gemma-4-26B-A4B/resolve/main/config.json) · [31B](https://huggingface.co/google/gemma-4-31B-it/resolve/main/config.json)

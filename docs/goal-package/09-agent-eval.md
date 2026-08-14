@@ -1,9 +1,14 @@
 # 09 — Agent eval (re-domained to the actual workload)
 
+The task/grader layer is shared, but each artifact runs through its exact conversation profile
+and receives a separate frozen baseline/floor. Cross-family aggregate scores never substitute
+for tokenizer/template/tool fidelity or family-specific regression rows.
+
 ## What carries from mlx-bonsai (mechanism ≈ verbatim)
 
 - The **turn-loop runner**: streaming chat request → assemble tool calls → execute in
-  sandbox → append `<|tool_response|>` → repeat (≤10 turns) → grade. Zero-dependency Rust.
+  sandbox → append the selected conversation profile's rendered tool result → repeat (≤10 turns)
+  → grade. Zero-dependency Rust; no Gemma marker is embedded in the shared runner.
 - **Sandbox safety**: fixed path, delete+recopy reset, path-escape rejection (abs/`..`/
   backslash/NUL/symlink), protected grader surfaces restored before every grade.
   **Upgrade (closing bonsai's admitted gap):** network isolation enforced, not
@@ -49,20 +54,21 @@ r=multi-step, x=hard/compound):
   "instructions"), oversized args, duplicate-call bait (dedupe telemetry asserted).
 
 Graders are deterministic Rust/JSON-schema checks + golden expected-call sets (no pytest,
-no LLM judge). Rubric stays 0–5 ordinal per task; suite floor carried as G3: **overall ≥
-24/26-equivalent ratio and zero regressions on previously-green tasks** (exact floor set by
-the M5 baseline run — baseline-then-gate, the floor is measured not invented).
+no LLM judge). Rubric stays 0–5 ordinal per task. Each artifact/profile freezes its own G3 floor
+from a preregistered baseline and permits zero regressions on previously green tasks. The former
+24/26 proposal is not a cross-family gate and cannot become a floor without accepted measurement.
 
 ## Quality gates beyond agentic
 
 - **gemma-challenge/eval-prompts** (128 MMLU-Pro/GPQA-Diamond/AIME26 prompts, harness
-  format): wired as the kernel-CI quality canary (the logit-saturation catch). License note:
+  format): retained as the Gemma kernel-CI quality canary (the logit-saturation catch), not as a
+  Qwen acceptance substitute. License note:
   keep the prompt payload out of the public repository until its redistribution terms have
-  been independently verified; O-2 does not relicense external evaluation data.
+  been independently verified; Hyperion's repository license does not relicense external data.
 - **Thinking-mode A/B:** suite runs thinking-on vs thinking-off arms; ledger records
   quality-vs-token-budget curves (feeds deployment profiles' budget defaults).
-- 12B-vs-E4B capability delta on the same suite (M8) — the tier-admission evidence the
-  pointforge/eval programs consume downstream.
+- A 12B-versus-E4B capability delta remains an optional legacy Gemma-family comparison if that
+  tier is reopened; it is not a P0–P7 dependency.
 
 ## Relationship to project-level evals
 

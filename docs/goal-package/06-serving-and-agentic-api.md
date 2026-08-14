@@ -1,5 +1,9 @@
 # 06 — Serving & agentic API
 
+The HTTP/SSE surfaces are shared. Rendering, tokenization, stop rules, generation defaults,
+thinking/tool grammar, and incremental parsing belong to an exact checkpoint conversation
+profile. A Qwen request must never be rendered or parsed by the current Gemma profile.
+
 ## Surfaces (carry mlx-bonsai's dual-dialect core)
 
 Single axum router, localhost-first (`127.0.0.1` bind default; non-loopback REQUIRES a
@@ -11,7 +15,8 @@ bearer token or refuses to start — fail-closed, bonsai rule), 32 MiB body limi
 | `POST /v1/chat/completions`, `GET /v1/models[/{id}]` | OpenAI-native, chunked SSE + `[DONE]` |
 | `GET /control/health`, `/control/stats`, `POST /control/reload`, `/control/shutdown` | Ops |
 
-Internally both dialects normalize to one `PreparedPrompt` (same template render, same
+Internally both dialects normalize to one `PreparedPrompt` through the selected conversation
+profile (same checkpoint template render, same
 `EngineRequest`); dialect only selects SSE framing + error envelope. Session identity for the
 conversation cache: honor an explicit `session_id` metadata field on both dialects, else
 fall back to prefix-chain fingerprint.
@@ -32,13 +37,13 @@ engine thread between steps/chunks. Usage accounting in the terminal frame (both
 
 ## Sampler surface
 
-Greedy (`temperature: 0`) and sampled modes. Defaults per Google model card: t=1.0,
-top_p=0.95, top_k=64 (single-source; recorded as such). min_p, presence/frequency/repetition
+Greedy (`temperature: 0`) and sampled modes. Defaults come from the exact checkpoint generation
+profile. The current Gemma profile uses t=1.0, top_p=0.95, top_k=64. min_p, presence/frequency/repetition
 penalties supported. Per-request `seed` honored and echoed. Deterministic tagging runs use
 greedy intent; interactive assistant workloads use sampled defaults — both are first-class
 (greedy-only was a bonsai limitation, dropped).
 
-## Tool calling (Gemma 4 native wire format)
+## Tool calling (current Gemma 4 conversation profile)
 
 - Declarations rendered into the template's `<|tool|>declaration:` block from OpenAI
   `tools` / Anthropic `tools` schemas.
@@ -57,7 +62,11 @@ greedy intent; interactive assistant workloads use sampled defaults — both are
 - Raw-fidelity telemetry: parsed/wellformed/repaired counters per request → feeds agent-eval
   "server-repaired upper bound" honesty (bonsai discipline).
 
-## Thinking mode (engine-level policy, not an afterthought)
+Qwen's profile uses its own XML-like function/parameter call grammar, tool-response folding,
+stop IDs, and thinking defaults. It requires separate golden and incremental-parser fixtures;
+none of the Gemma markers above are shared protocol.
+
+## Thinking mode (current Gemma profile)
 
 - Enable via template (`<|think|>` in system turn / `enable_thinking`); 12B-it template's
   empty-thinking stabilization token honored (ghost-thought suppression).
@@ -72,16 +81,18 @@ greedy intent; interactive assistant workloads use sampled defaults — both are
   to the answer — policy lives Rust-side, no native knowledge. (Budget policy is our design;
   the mode itself is Google-documented.)
 
-## Constrained JSON (O-4 — the strict-output lane) [M5]
+## Constrained JSON (optional shared agentic lane; legacy M5)
 
 Reality: neither predecessor had it; both post-hoc repaired. For the target tool-driven
 workloads, tool-argument validity is the reliability boundary, and "validator disposes" plus repair
 telemetry already de-risks v0. So:
 
-- **v0 (M3):** post-hoc parser + repair + `validator disposes` downstream — ship first.
-- **v1 (M5):** schema-guided token masking for tool-argument JSON: compile the active tool's
-  JSON-Schema to a token-mask automaton over the 262144 vocab (xgrammar-style; Swift port
-  evidence shows ~3–10% decode overhead is the going rate). Scope v1 masks to: object
+- **Implemented Gemma baseline (legacy M3):** post-hoc parser + repair + `validator disposes`
+  downstream.
+- **candidate:** schema-guided token masking for tool-argument JSON: compile the active tool's
+  JSON-Schema to a token-mask automaton over the selected conversation profile's exact
+  vocabulary (Gemma 262144; Qwen3.8 248320). A Swift port suggests roughly 3–10% decode overhead.
+  Scope the candidate masks to: object
   structure, key names, string/number/bool/null, enums. NOT full JSON-Schema (no regex
   patterns, no oneOf recursion) — bounded, testable, honest.
 - Gate: constrained mode must strictly dominate post-hoc on malformed-rate at ≤10% decode

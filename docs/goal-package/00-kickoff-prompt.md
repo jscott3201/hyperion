@@ -1,57 +1,45 @@
 # Kickoff prompt (Claude Code / Codex goal)
 
-Use after the repository is created and this package is placed at `_goals/hyperion-goal-package/`
-(or repo root `docs/goal-package/`). Run milestones in order; never skip a gate.
+Use after reading [ADR 0006](../decisions/0006-dual-family-v1-scope-and-gates.md),
+`AGENTS.md`, and `01-goal-contract.md`. Follow the dependency DAG in
+`10-milestones-and-gates.md`; implementation is not acceptance.
 
 ```text
-/goal Implement hyperion, a clean-sheet Rust 1.95+ + MLX 0.32.0 inference engine exclusively
-for the Google Gemma 4 model family on Apple M5 Macs (macOS 26.2+, M5 generation is the hard
-compatibility floor — no M1–M4 fallbacks), optimized first for the 16 GB MacBook Pro M5
-profile and for non-coding agentic workloads (tool calling with strict JSON, thinking-mode
-control, long multi-turn conversations). Follow the goal package at docs/goal-package/:
-read 01-goal-contract.md and AGENTS.md first, then execute milestones M0–M8 from
-10-milestones-and-gates.md strictly in order. Hard constraints: single native backend behind
-a narrow C ABI (no Python on the request path, no helper subprocess backend); heterogeneous
-KV from day one (O(1) ring for the 40 local sliding-window layers, capacity-stepped single
-K=V tensor for the 8 global layers); shape-bucketed compiled decode step (no per-step graph
-re-trace, no unbounded concatenate-grow KV, no per-step reset_peak_memory); device-derived
-memory ceiling with a predictive pre-admission governor (fail-closed 529); real SSE streaming
-on both OpenAI and Anthropic surfaces; in-process tokenizer and Gemma 4 chat template with
-native tool-call wire format and thinking-mode policy; correctness before speed everywhere —
-mlx-lm (>=0.31.3, pinned) is the parity oracle and the A/B verification protocol in
-08-correctness-and-verification.md governs every promotion (G1 parity, G2 throughput,
-G3 agent-eval floor, G4 memory/governor; candidate-min must beat baseline-max; append-only
-ledger; never move a floor to pass). Speculative correctness is TARGET-VERIFIED, not
-byte-identical — every emitted token must equal a real verify-pass argmax and each greedy-
-divergence must be an explained sub-0.5 near-tie (ship the near_tie_events counter from M2);
-do NOT gate on "MTP-on == MTP-off byte-identity" (unachievable at fp16/bf16 scale). Speculative
-rollback is append-only (discard by not committing; never trim a rotated sliding-window ring).
-Build attention masks per layer-kind from that kind's own cache. The governor targets the
-MEASURED throughput optimum (below the OOM ceiling — run the M1 budget sweep), never live OS
-availability. MTP speculative decoding is milestone M7 (default-off, promotes only at >= +25%
-protected aggregate); a zero-cost n-gram adaptive prompt-lookup drafter is a second speculative
-lane at M5. Do not build: SSD cache tiers, KV compression for active decode, LoRA application,
-multimodal, TUI, tree speculative decoding, the M9 26B-A4B streaming tier (owner-gated), or any
-M1–M4 support. Record MEASURED evidence rows for every benchmark claim with exact commands and
-machine state. Between iterations, complete the next unaccepted milestone in order and stop if a
-gate cannot be defensibly passed under the constraints.
+/goal Implement Hyperion, a clean-sheet Rust 1.95 + MLX 0.32.0 inference runtime for Gemma 4
+and Qwen's qwen3_5 hybrid architecture on Apple M5/macOS 26.2+, with the 16 GB MacBook Pro M5
+as the binding profile. Preserve the implemented Gemma path through a family-specific adapter;
+add the pinned Qwen/Qwen3.8-27B text path as a separate 48-Gated-DeltaNet/16-full-GQA graph.
+
+Keep one native C++/MLX serving runtime, one MLX-owning engine thread, a narrow C ABI, no Python
+or helper subprocess on the request path, real incremental SSE, bounded single-flight admission,
+and a fail-closed memory governor. Architecture adapters own config/tensors/graph/state;
+checkpoint conversation profiles own tokenizer/template/stops/thinking/tools/defaults;
+deployment profiles own transformed artifacts/cache/limits/residency. Never pass Qwen through
+Gemma geometry or conversation code.
+
+For Qwen V1, target text-only batch-one inference with 16K total cached tokens—including prompt,
+reasoning, answer, tool history, and reserved output—on 16 GB. Keep Gated DeltaNet recurrent
+matrices FP32 and state transactional. Use BF16 KV as the correctness control and resident affine
+Q2/mixed scalar weights as the capacity controls. Custom weight formats and compressed KV are
+conditional on measured quality, memory, and latency. Stream conversion by shard/layer with
+hashes, resumability, and atomic publication; do not stream the full dense model from SSD per
+decode token or rely on macOS swap.
+
+Correctness outranks speed. Pin independent Transformers and mlx-lm Qwen references, compare
+state/layer/logit/free-generation traces, and bind evidence to artifact, conversation,
+deployment, state-layout, runtime/kernel, oracle, harness, machine, and command identities.
+Use real weights where feasible, preserve append-only evidence, and never relabel implementation
+or family recognition as accepted support. Start with the next dependency-ready phase in
+10-milestones-and-gates.md and end accepted phases with a numbered ADR.
 ```
 
-## Session-zero checklist (before M0 coding)
+## Current pickup checklist
 
-1. Confirm hardware: `sysctl hw.model`, macOS ≥ 26.2, M5 (gen-17 GPU family canary — see
-   02-architecture.md §Startup canary). Record `recommendedMaxWorkingSetSize`.
-2. Pin toolchain: Rust 1.95+, MLX 0.32.0 (exact), mlx-lm 0.31.3+ (oracle venv, pinned),
-   CMake + Metal toolchain. Record all versions in the ledger header.
-3. Download weights (Hugging Face, Apache-2.0):
-   - `google/gemma-4-12B-it-qat-q4_0-unquantized` (primary base for quantization)
-   - `google/gemma-4-12B-it` (bf16 — parity/QAT-delta spot-checks ONLY; ≈24 GB, does NOT fit
-     16 GB resident: run off-device or via streaming convert. The on-device oracle and native
-     arm both run the SAME Q4 so parity isolates the engine, not the quant.)
-   - `google/gemma-4-E4B-it-qat-q4_0-unquantized` (M8)
-   - `google/gemma-4-12B-it-qat-q4_0-unquantized-assistant` (MTP drafter, M7 — 4L, hidden 1024,
-     centroid logit head; alias the vocab table with the target, match dtypes at the boundary)
-   - `google/gemma-4-E4B-it-qat-q4_0-unquantized-assistant` (E4B MTP drafter, M8)
-   Store under `artifacts/models/` (gitignored).
-4. Verify the oracle: `mlx_lm.generate` runs gemma-4-12B (community MLX conversion or local
-   `mlx_lm.convert` output) on this machine before any native code exists.
+1. Verify branch/status, read ADRs and the current gate-truth table in `10`.
+2. Confirm M5/macOS/MLX/Rust pins before native or measured work.
+3. Preserve the pinned Gemma 12B regression artifact in `artifacts/models/MANIFEST.md`.
+4. Do not download Qwen3.8's 55.56 GB source without checking storage; use an external volume or
+   remote/high-memory conversion host and a bounded converter.
+5. Keep oracle/conversion environments isolated from serving.
+6. Run the narrowest relevant model-free checks on PRs and the complete real-model/M5 gates only
+   in the protected release/measurement environment.

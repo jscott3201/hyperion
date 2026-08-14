@@ -1,6 +1,11 @@
 # 03 — Native runtime & kernel lanes
 
-## The execution-model decision (made up front — Helios R4)
+> **Scope note (ADR 0006):** K1–K3 and the QAT-Q4 details are the current Gemma adapter's
+> baseline, not universal Qwen requirements. Shared invariants are explicit streams, stable
+> execution shapes, transactional state publication, direct packed-weight consumption, and no
+> unbounded hot-loop growth.
+
+## Gemma execution-model baseline (made up front — Helios R4)
 
 Helios re-traced the define-by-run graph every step, deferred KV evaluation to end-of-step
 (global layers first), grew global KV by full `concatenate` reallocation, and called
@@ -21,7 +26,7 @@ attributed to full-attention deferred eval. hyperion rules the opposite model:
    the hot loop.
 5. **Explicit streams everywhere;** the engine thread owns them (02-architecture).
 
-## The SDPA gap (provable from MLX 0.32.0 dispatch source — this is the moat)
+## Gemma SDPA gap (provable from MLX 0.32.0 dispatch source)
 
 MLX fused attention support at 0.32.0:
 
@@ -34,7 +39,7 @@ Consequences measured in Helios: unfused prefill materializes [T_q, T_kv] score 
 (the 16K memory blowup), and global-layer decode runs unfused. The custom-kernel program
 exists to close exactly this, nothing more speculative than that.
 
-### Kernel lane K1 — global-layer attention kernel (head_dim 512, K=V-aware) [M4]
+### Kernel lane K1 — global-layer attention kernel (head_dim 512, K=V-aware) [legacy Gemma lane]
 
 Fused Metal kernel for the 8 global layers: GQA 16 Q-heads : 1 KV-head, head_dim 512,
 **K=V unified** — the value tensor IS the key tensor. Must cover **q_len 1..γ_max** (decode
@@ -50,21 +55,21 @@ Authoring: `mx::fast::metal_kernel` (C++ API; JIT, template-specialized on head_
 forward-only is fine for inference). Fall back to a C++ `Primitive` only if graph-fusion
 profiling demands it (decide at M4 exit, not later — retrofit rewrites the authoring layer).
 
-### Kernel lane K2 — windowed-flash prefill kernel (head_dim 256 local; 512 global) [M4]
+### Kernel lane K2 — windowed-flash prefill kernel (head_dim 256 local; 512 global) [legacy Gemma lane]
 
 Flash-style online-softmax tiled prefill kernel:
 - **Local layers (40): banded attention.** Each query attends ≤1024-token window → tile the
   band only. Working set is O(window), independent of context. The memory-cliff fix is
-  **staged**: at **M2** the execution-model change alone (chunked prefill bounds the score
+  **staged**: the execution-model change alone (chunked prefill bounds the score
   tensor to q_chunk×ctx ≤ 2048×ctx, plus no-concat-grow KV) is what carries the 16K peak
-  gate; **K2 at M4** then removes the remaining ctx factor for the 40 local layers
+  correction; K2 then removes the remaining ctx factor for the 40 local layers
   (→ q_chunk×window), so they stop scaling with context entirely.
 - **Global layers (8): standard causal flash** at head_dim 512 with the K=V single-read
   trick from K1.
 Correctness gate: bitwise-stable greedy tokens vs the unfused reference path, logit max-abs
 within the two-sided fault-boundary threshold (08-correctness).
 
-### Kernel lane K3 — NAX/TensorOps experiments [M4, experimental sublane]
+### Kernel lane K3 — NAX/TensorOps experiments [legacy Gemma experimental lane]
 
 Apple's published M5 economics: NAX gives ~3.5–4.06× prefill vs M4 on 4-bit and bf16 models
 via Metal 4 TensorOps; MLX ≥0.30.1 already routes quantized matmuls to NAX ("NAX with JIT";
@@ -74,10 +79,10 @@ tile kernels for the fixed 12B shapes (3840×15360 etc.) if profiling shows a re
 Constraint to respect: naive MSL compute shaders that don't route through TensorOps get
 ~2–3 TFLOPS-class throughput, not NAX throughput — so any custom GEMM must use the Metal 4
 TensorOps/cooperative-tensor path, or it will LOSE to stock. K3 promotes only through the
-full A/B protocol; expected outcome is "stock wins prefill GEMM, custom wins attention" —
+  full A/B protocol; an expected outcome is "stock wins prefill GEMM, custom wins attention" —
 that's fine, the attention kernels (K1/K2) are the moat.
 
-## Quantization pipeline (weights)
+## Gemma quantization pipeline (weights)
 
 - **Base checkpoint: `google/gemma-4-12B-it-qat-q4_0-unquantized`** (bf16 weights out of the
   QAT pipeline; Google positions it exactly for custom downstream compilation). NOT the GGUF:
@@ -87,7 +92,7 @@ that's fine, the attention kernels (K1/K2) are the moat.
   affine g32/b4 with bias = −8·s represents that grid exactly (~5.0 effective bits/weight,
   ≈7.5 GB for 11.95B). MLX affine **g64**/b4 is the memory-lean default (~4.5 bits/weight,
   ≈6.7 GB) but is NOT the grid QAT trained for.
-- **E1 quant ablation (M2, MEASURED):** g32-grid-exact vs g64 vs mixed_4_6 (extra bits on
+- **Legacy E1 quant ablation:** g32-grid-exact vs g64 vs mixed_4_6 (extra bits on
   down_proj/first-last-⅛ layers; note lm_head is TIED to the 262144×3840 embedding — mixed
   recipes that upcast lm_head upcast ~1.0 GB of embedding, on a 12 GB budget that is a real
   trade). Gate the default on: greedy parity vs oracle, gemma-challenge eval-prompt quality
@@ -98,12 +103,18 @@ that's fine, the attention kernels (K1/K2) are the moat.
 - Activations bf16; softmax fp32 (MLX default); final logits fp32 with softcap
   `30·tanh(x/30)` fused Rust-side of the lm_head? No — native, single fused epilogue op.
 
+Qwen does not inherit this Q4 recipe, tied head, dimensions, activation, or softcap. Its P4
+controls are affine Q2 group 64/128 plus sensitivity-driven mixed scalar precision, with norms,
+`A_log`, `dt_bias`, convolution vectors, and FP32 recurrent runtime state initially protected.
+Any promoted operator consumes its packed format directly without reconstructing a full/layer
+floating tensor.
+
 ## Sampling (native epilogue)
 
 Greedy argmax native (token + logit returned per step). Sampled mode: temperature/top-k/
 top-p/min-p computed native-side on the fp32 logit vector with a seeded per-request RNG
-(vocab 262144 → do NOT ship logits across the ABI per token; ship the sampled token + the
-top-k logprobs requested). Repetition/presence/frequency penalties applied Rust-side via a
+(for each profile's vocabulary → do NOT ship logits across the ABI per token; ship the sampled
+token + the top-k logprobs requested). Repetition/presence/frequency penalties applied Rust-side via a
 small recent-token state passed into the step call (bounded window, documented).
 
 ## What is explicitly NOT in the native layer
