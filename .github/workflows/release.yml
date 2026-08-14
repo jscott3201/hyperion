@@ -38,6 +38,14 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Install exact uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.5"
+          python-version: "3.12.13"
+          enable-cache: false
+      - name: Install exact oracle Python
+        run: uv python install 3.12.13
       - name: Validate the external content-addressed model store
         run: |
           test -n "${HYPERION_M0_SOURCE_MODEL:-}"
@@ -67,6 +75,14 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Install exact uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.5"
+          python-version: "3.12.13"
+          enable-cache: false
+      - name: Install exact oracle Python
+        run: uv python install 3.12.13
       - name: Validate the external content-addressed model stores
         run: |
           test -n "${HYPERION_M0_SOURCE_MODEL:-}"
@@ -112,6 +128,14 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Install exact uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.5"
+          python-version: "3.12.13"
+          enable-cache: false
+      - name: Install exact oracle Python
+        run: uv python install 3.12.13
       - name: Recreate the locked bench-only oracle
         run: scripts/setup-oracle.sh
       - name: Rebuild the run-bound verifier

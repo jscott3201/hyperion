@@ -24,7 +24,7 @@
     "mlx_lm_package_sha256": "f9ffa88772d26e537a98aa39ab16488a7a0d13cc1fac5d665376132c94b49608",
     "mlx_lm_generate_sha256": "270778ad53eaca55a8533d82e6752660fe5d2605c4aa0879b48a50a91f69345f",
     "mlx_lm_server_sha256": "cdfcb4ac848636f9927851a0ec7a951584526530cb7832ba58049e4a9144db8b",
-    "lock_sha256": "b3603b4ebbc7f5883afe3d8cc10fc1767239837f5256985bd591b777c993dbaf"
+    "lock_sha256": "b59b9022be34f429962150b4aa6a8339b7d4250c6ec814294b5d0d47663c540e"
   },
   "worker_environment": {
     "LANG": "C",

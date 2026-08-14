@@ -15,43 +15,111 @@ concurrency:
 
 jobs:
   model-free:
-    name: model-free / Rust 1.95 / MLX 0.32
+    name: quick model-free gate
     runs-on: macos-26
     timeout-minutes: 20
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"
       MLX_ROOT: /opt/homebrew/opt/mlx
       HYPERION_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-      # The relocated uv base interpreter prefix is not byte-reproducible across
-      # machines (adhoc re-signature + residual per-machine structural drift).
-      # Relax the runtime-tree pin here; the self-hosted M5 release-gate enforces it.
-      HYPERION_RELAX_RUNTIME_TREE: "1"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Classify the change scope
+        id: scope
+        shell: bash
+        run: |
+          base_commit=$(git rev-parse --verify "${HYPERION_BASE_REF}^{commit}")
+          head_commit=$(git rev-parse "HEAD^{commit}")
+          if [[ "$base_commit" == "$head_commit" ]]; then
+            echo "CI base resolves to HEAD; refusing an empty comparison" >&2
+            exit 1
+          fi
+
+          code_changed=false
+          oracle_lock_changed=false
+          m3_runner_changed=false
+          changed_count=0
+          # Disabling rename detection keeps both sides of a code-to-doc rename visible.
+          while IFS= read -r -d '' changed_file; do
+            changed_count=$((changed_count + 1))
+            if [[ "$changed_file" == "oracle/pyproject.toml" || "$changed_file" == "oracle/uv.lock" ]]; then
+              oracle_lock_changed=true
+            fi
+            if [[ "$changed_file" == "scripts/run-m3-stream-parity.sh" || \
+              "$changed_file" == "scripts/test-m3-stream-parity-runner.sh" || \
+              "$changed_file" == "scripts/ci-pr.sh" || \
+              "$changed_file" == ".github/workflows/ci.yml" ]]; then
+              m3_runner_changed=true
+            fi
+            case "$changed_file" in
+              README.md | PROVENANCE.md | LICENSE-APACHE | LICENSE-MIT | \
+                docs/*.md | benchmarks/BENCHMARKS.md | eval-results/EVAL_RESULTS.md | \
+                benchmarks/m1/README.md | oracle/README.md | \
+                native/hyperion_mlx/tests/fixtures/README.md)
+                # Symlinks, submodules, and executable docs take the full path.
+                for treeish in "$HYPERION_BASE_REF" HEAD; do
+                  mode=$(git ls-tree --format='%(objectmode)' "$treeish" -- "$changed_file")
+                  if [[ -n "$mode" && "$mode" != "100644" ]]; then
+                    code_changed=true
+                  fi
+                done
+                ;;
+              *)
+                code_changed=true
+                ;;
+            esac
+          done < <(git diff --name-only --no-renames -z "$HYPERION_BASE_REF" HEAD --)
+
+          if (( changed_count == 0 )); then
+            echo "CI comparison contains no changed paths" >&2
+            exit 1
+          fi
+          {
+            echo "code_changed=$code_changed"
+            echo "oracle_lock_changed=$oracle_lock_changed"
+            echo "m3_runner_changed=$m3_runner_changed"
+          } >>"$GITHUB_OUTPUT"
+          echo "code_changed=$code_changed"
+          echo "oracle_lock_changed=$oracle_lock_changed"
+          echo "m3_runner_changed=$m3_runner_changed"
+      - name: Run documentation policy gate
+        if: steps.scope.outputs.code_changed == 'false'
+        run: |
+          git diff --check "$HYPERION_BASE_REF" HEAD --
+          scripts/test-append-only.sh
+          scripts/check-append-only.sh
       - name: Install exact Rust floor
+        if: steps.scope.outputs.code_changed == 'true'
         run: rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt
-      - name: Install exact uv
+      - name: Install exact uv for lock validation
+        if: steps.scope.outputs.oracle_lock_changed == 'true'
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: "0.11.5"
           python-version: "3.12.13"
           enable-cache: false
-      - name: Install exact oracle Python
-        run: uv python install 3.12.13
+      - name: Validate the oracle lock
+        if: steps.scope.outputs.oracle_lock_changed == 'true'
+        run: |
+          uv python install 3.12.13
+          uv lock --project oracle --check
       - name: Install native dependencies
+        if: steps.scope.outputs.code_changed == 'true'
         run: |
           brew install cmake jq mlx ripgrep
           test "$(brew list --versions mlx | awk '{print $2}')" = "0.32.0"
       - name: Ensure the optional Metal compiler is available
+        if: steps.scope.outputs.code_changed == 'true'
         run: |
           if ! xcrun metal --version >/dev/null 2>&1; then
             xcodebuild -downloadComponent MetalToolchain
           fi
           xcrun metal --version
-      - name: Recreate the locked model-free oracle
-        run: scripts/setup-oracle.sh
-      - name: Run cumulative model-free tier 1
+      - name: Run fast model-free tier 1
+        if: steps.scope.outputs.code_changed == 'true'
+        env:
+          HYPERION_RUN_M3_RUNNER_TEST: ${{ steps.scope.outputs.m3_runner_changed }}
         run: scripts/ci-pr.sh

@@ -26,7 +26,19 @@ if [[ ! -s "$hyp_build_dir/hyperion_canary.metallib" ]]; then
 fi
 
 if [[ "$mode" == "--all" ]]; then
-    ctest --test-dir "$hyp_build_dir" --output-on-failure -C Release
+    # Full M5 tests historically returned success when an artifact, golden, or GPU
+    # was absent. Preserve local self-skips, but never count one as a release pass.
+    ctest_log="$hyp_build_dir/ctest-all.log"
+    ctest \
+        --test-dir "$hyp_build_dir" \
+        --output-on-failure \
+        --verbose \
+        --output-log "$ctest_log" \
+        -C Release
+    if rg -n 'skipping|\[skip ' "$ctest_log"; then
+        echo "full native gate skipped a required M5 test" >&2
+        exit 1
+    fi
 else
     ctest \
         --test-dir "$hyp_build_dir" \
