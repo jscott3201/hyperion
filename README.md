@@ -48,7 +48,7 @@ accepted real-model parity or a performance claim.
 | Serving contracts | **Implemented:** OpenAI-style chat/model discovery and Anthropic-style messages/token counting; real SSE, cancellation, bounded single-flight admission, and non-streaming responses |
 | Tool contracts | **Implemented and contract-tested:** bounded declarations/history, `auto`/`none`, incremental Gemma parsing, validation/deduplication, and OpenAI/Anthropic streaming and non-streaming response shapes; real-model quality acceptance remains pending |
 | Memory and performance | Fail-closed governor implemented; the legacy M1 measurement remains deferred and the latest recorded legacy-M3 governor calibration does not pass its acceptance gate. **There is no accepted native performance claim yet.** |
-| Qwen | **Pinned oracle contract and load-boundary recognition only:** the source inventory, two unexecuted reference implementations, and first-party case inputs are frozen; `qwen3_5` still fails closed before Gemma/native initialization, and no Qwen payload, trace, strict config parser, graph, or support claim is accepted |
+| Qwen | **Model-free oracle foundation and load-boundary recognition only:** source/case identities, raw trace semantics, and two unexecuted producer recipes are frozen; their environments, weights, traces, tolerances, strict config parser, native graph, artifact acceptance, and support remain absent, while `qwen3_5` still fails closed before Gemma/native initialization |
 
 The following are still active work, not shipped capabilities:
 

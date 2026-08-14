@@ -10,7 +10,7 @@ truth for identity, acquisition status, license review, local hashes, and progra
 | Legacy M1 | `google/gemma-4-E4B-it-qat-q4_0-unquantized` | `476025a01dbf99361c062bbeca3d6a76bb4c4566` | verified and converted for the deferred M1 stock baseline |
 | Post-V1 MTP | `google/gemma-4-12B-it-qat-q4_0-unquantized-assistant` | `18934064dd4c5c6cc3621f6381e7d377fc8cb7bd` | recorded, not acquired, and not a P0–P7 dependency |
 | Post-V1 MTP | `google/gemma-4-E4B-it-qat-q4_0-unquantized-assistant` | `27f8d204f09f2be353d6ff0bf0d012792b13c79f` | recorded, not acquired, and not a P0–P7 dependency |
-| P2 | `Qwen/Qwen3.8-27B` | `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` | expected source/oracle contract pinned; no local payload, trace, conversion, execution, or acceptance |
+| P2 | `Qwen/Qwen3.8-27B` | `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` | source/case/trace/producer semantics pinned; no complete producer environment, local payload, real trace, conversion, execution, or acceptance |
 
 ## Accepted legacy M0 primary artifact
 
@@ -101,9 +101,12 @@ declares `apache-2.0`; each local model card is rechecked when acquired.
   SHA-256 `450ff5ada441702f54e8da2cd3c92a207ab1b3bdbaa6254427556d9afa4ff91a`.
   It records content hashes for small files and official LFS payload hashes for large files; the
   future high-memory run must still rehash every downloaded byte.
-- Oracle/case contract: [`oracle/qwen38/contract.json`](../../oracle/qwen38/contract.json) and
-  [`oracle/qwen38/cases.jsonl`](../../oracle/qwen38/cases.jsonl). Both implementation sources are
-  pinned but unexecuted; no numeric trace or agreement result is present.
+- Oracle foundation: [`oracle/qwen38/contract.json`](../../oracle/qwen38/contract.json),
+  [`oracle/qwen38/cases.jsonl`](../../oracle/qwen38/cases.jsonl),
+  [`oracle/qwen38/trace-schema.json`](../../oracle/qwen38/trace-schema.json), and
+  [`oracle/qwen38/producer-contracts.json`](../../oracle/qwen38/producer-contracts.json). The raw
+  trace layout and producer semantics are pinned, but environments and entrypoints are unbuilt;
+  no numeric trace or agreement result is present.
 - Expected architecture: outer `qwen3_5`, text `qwen3_5_text`, 64-layer hybrid text graph.
 - Initial component selection: text weights only. Vision and bundled MTP are omitted by an
   explicit converter inventory, never by a permissive loader glob.

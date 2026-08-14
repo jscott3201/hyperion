@@ -13,7 +13,8 @@ do not install from mutable `main`.
 ## Qwen3.8 P2 contract
 
 [`qwen38/`](qwen38/) contains a separate, model-free contract for the future dual-reference
-Qwen3.8 oracle. It pins source and implementation identities plus first-party case inputs, but it
-does not reuse this Gemma/MLX environment as proof that two Qwen references ran. The contract is
-explicitly unexecuted; weights, real traces, tolerances, agreement, native execution, and support
-all remain false.
+Qwen3.8 oracle. It pins source and implementation identities, first-party case inputs, the raw
+trace grammar, and two independent producer semantic modes. It does not reuse this Gemma/MLX
+environment as proof that two Qwen references ran; the Transformers arm requires its own lock.
+The contract remains explicitly unexecuted: producer environments, weights, real traces,
+tolerances, agreement, native execution, and support all remain false.

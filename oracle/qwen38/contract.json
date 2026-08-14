@@ -1,7 +1,14 @@
 {
-  "schema": "hyperion.qwen38-oracle-contract.v1",
+  "schema": "hyperion.qwen38-oracle-contract.v2",
+  "supersedes": {
+    "schema": "hyperion.qwen38-oracle-contract.v1",
+    "sha256": "d837027aadc58c530f996841c98172f5a6b7307bf5f9fb22b46d333375bd2a4d"
+  },
   "status": {
     "oracle_reference_only": true,
+    "trace_schema_frozen": true,
+    "producer_semantics_frozen": true,
+    "producer_environments_frozen": false,
     "weights_acquired": false,
     "local_model_tree_verified": false,
     "oracle_executed": false,
@@ -49,7 +56,7 @@
       "implementation_path": "src/transformers/models/qwen3_5/modeling_qwen3_5.py",
       "implementation_sha256": "90d929129ffc835d2652c604925c4f3842bc6e401e174ec6f0db2285dfb8f85a",
       "state": "source_pinned_unexecuted",
-      "execution_mode_status": "partial_intent_environment_and_producer_unfrozen",
+      "execution_mode_status": "semantic_mode_frozen_environment_unbuilt",
       "execution_intent": {
         "model_class": "Qwen3_5ForConditionalGeneration",
         "component": "text_inputs_only",
@@ -69,7 +76,7 @@
       "implementation_path": "mlx_lm/models/qwen3_5.py",
       "implementation_sha256": "cdcfbf22681d2005f4bdff53ab9ab06da7aeb71c0e89378f65f893beeaf0b47c",
       "state": "source_pinned_unexecuted",
-      "execution_mode_status": "partial_intent_environment_and_producer_unfrozen",
+      "execution_mode_status": "semantic_mode_frozen_environment_unbuilt",
       "execution_intent": {
         "model_class": "mlx_lm.models.qwen3_5.Model",
         "component": "text_only_sanitized",
@@ -81,6 +88,11 @@
       }
     }
   ],
+  "producer_contracts": {
+    "state": "semantic_modes_frozen_environments_unbuilt",
+    "path": "oracle/qwen38/producer-contracts.json",
+    "sha256": "6b828775a275ee5f8829b314120591be482e19d9750db3f10890b17c5d5dca60"
+  },
   "conversation": {
     "cases_path": "oracle/qwen38/cases.jsonl",
     "cases_sha256": "2a1c23a1baa9ea8566fce71d452272202eddf71e83190c930389fce94097fda3",
@@ -133,41 +145,21 @@
     "tool_declaration"
   ],
   "trace": {
-    "state": "channel_requirements_preregistered_no_payload",
-    "required_channels": [
-      "rendered_utf8",
-      "input_ids",
-      "position_ids",
-      "full_vocab_logits_f32",
-      "topk_ids_values_and_margins",
-      "greedy_token_ids",
-      "free_running_utf8",
-      "selected_hidden_states",
-      "selected_gdn_recurrent_state_f32",
-      "selected_gdn_conv_state",
-      "selected_full_attention_kv",
-      "instrumented_uninstrumented_control"
-    ],
-    "required_boundaries": [
-      "initial",
-      "post_prefill",
-      "post_decode",
-      "token_step",
-      "chunk_before_conv_width",
-      "chunk_at_conv_width",
-      "chunk_after_conv_width"
-    ],
+    "state": "schema_frozen_no_payload",
+    "schema_path": "oracle/qwen38/trace-schema.json",
+    "schema_sha256": "41afbb8fbe9c15f4b08f1e3196ea2c8920be166e7666bf639a28e83f100980f8",
     "bundle_rules": {
       "raw_oracle_outputs_separate": true,
-      "producer_authored_pass_ignored": true,
+      "producer_authored_pass_forbidden": true,
       "third_party_comparison_required": true,
       "exact_inventory_required": true,
       "external_inventory_digest_required": true,
+      "shared_verifier_outputs_sealed": true,
       "atomic_publication_required": true,
       "source_verified_before_and_after": true
     },
     "tolerances": {
-      "status": "unfrozen_requires_clean_and_fault_measurement"
+      "status": "unfrozen_requires_clean_repeat_and_injected_fault_measurement"
     }
   },
   "required_evidence_identities": [
@@ -175,16 +167,23 @@
     "source_tree",
     "oracle_implementation",
     "oracle_environment",
+    "environment_tree",
     "python_runtime",
     "device_backend",
+    "machine_profile",
+    "producer_contracts",
     "execution_mode",
+    "producer_command",
+    "producer_executable",
+    "process_inventory",
     "case_corpus",
     "conversation_profile",
     "trace_schema",
-    "producer_command",
-    "producer_executable",
-    "machine_profile",
+    "parameter_inventory",
+    "cache_topology",
+    "kernel_route_inventory",
     "raw_payload_inventory",
-    "comparison_harness"
+    "comparison_harness",
+    "detached_seal"
   ]
 }
