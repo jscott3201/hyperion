@@ -3,8 +3,6 @@ name: tier1
 on:
   pull_request:
     branches: [development]
-  push:
-    branches: [development]
 
 permissions:
   contents: read
