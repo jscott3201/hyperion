@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>hyperion — MLX inference engine for Gemma 4 on M5</title>
+<title>hyperion — archived Gemma-only goal overview</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Hanken+Grotesk:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -78,9 +78,10 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="#16a36a" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 17c3 0 4-9 6-9s2 5 4 5 3-8 5-8"/><circle cx="22" cy="5" r="1.6" fill="#16a36a" stroke="none"/></svg>
       <span>Hyperion · M5-native inference</span>
     </div>
-    <div class="eyebrow">Inference engine · goal package v0.2 · 2026-07-21</div>
+    <div class="eyebrow">ARCHIVED · Gemma-only goal package v0.2 · 2026-07-21</div>
     <h1>hyperion</h1>
-    <p class="lede">A clean-sheet Rust&nbsp;+&nbsp;MLX&nbsp;0.32 inference engine built exclusively around the Gemma&nbsp;4 architecture, tuned for the Apple&nbsp;M5 and a 16&nbsp;GB MacBook&nbsp;Pro — for non-coding agentic workloads in smart buildings and energy systems.</p>
+    <p class="lede">Historical Gemma&nbsp;4 overview retained for provenance. It is superseded by ADR&nbsp;0006 and the v0.3 dual-family Gemma&nbsp;4&nbsp;+&nbsp;Qwen <code>qwen3_5</code> goal package.</p>
+    <div class="tagline" style="color:var(--amber)">// not the active roadmap or current support matrix</div>
     <div class="tagline">// successor to Helios (Gemma math, FFI, evidence) + mlx-bonsai (serving, governor, eval) — Bonsai models retired on measured quality</div>
     <div class="tagline" style="color:var(--teal);margin-top:6px">// v0.2 — folds in the NunSpark exploration: target-verified exactness (not byte-identical), append-only rollback, a throughput-optimum governor, an n-gram drafter lane, and a deferred 26B-on-16GB streaming tier</div>
   </div>
@@ -188,7 +189,7 @@
   </section>
 
   <div class="foot">
-    hyperion goal package v0.2 · 16 spec files + 4 reference sheets · verified by adversarial review (v0.1: 8 findings fixed) + NunSpark exploration (v0.2: A1–A5, B1–B5, M9) ·<br>
+    ARCHIVED Gemma-only overview · superseded for forward scope by ADR 0006 / goal package v0.3 ·<br>
     grounded in live Gemma 4 / MLX 0.32 / M5 research + the Helios, mlx-bonsai &amp; NunSpark codebases · engine + quant are A12 identity-tuple fields — local/dev evidence, not a production claim
   </div>
 

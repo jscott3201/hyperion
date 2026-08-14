@@ -1,5 +1,8 @@
 # Gemma 4 family — engine-relevant facts (CONFIRMED from config.json ×5 unless tagged; 2026-07-21)
 
+> Family-specific reference: these facts remain authoritative for the Gemma adapter and are not
+> a shared geometry contract for Qwen. See ADR 0006.
+
 ## Master config table
 
 | Field | E2B | E4B | **12B (unified)** | 26B-A4B (MoE) | 31B |

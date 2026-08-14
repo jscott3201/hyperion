@@ -1,5 +1,9 @@
 # VERIFICATION — adversarial review pass (2026-07-21)
 
+> Historical scope: this verifies the v0.1/v0.2 Gemma-only package. ADR 0006 supersedes its
+> forward scope and milestone order. Its arithmetic/evidence remains valid only for the named
+> Gemma configurations until the dual-family phases receive their own review record.
+
 An adversarial reviewer (Opus 4.8 subagent) re-derived every number, cross-checked all files
 against the CONFIRMED reference sheets, and hunted for contradictions, overclaims, and
 executability blockers. **Verdict: executable as-is by a competent coding agent** — Gemma-4
@@ -24,7 +28,7 @@ T0 79.077%/−81.6%/2048-exact, ceiling 12,713,115,648 B).
 | 3 | MED | 00, 04 | bf16 12B (~24 GB) can't be resident on 16 GB → marked **off-device / streaming-only**; on-device oracle uses the SAME Q4 both sides. |
 | 4 | MED | 03, 10 | M2's 16K-peak gate was framed as needing K2 (M4) → clarified the **execution-model change (chunked prefill + no-concat-grow KV) carries it at M2**; K2 removes the residual ctx factor at M4. |
 | 5 | MED | 05, 10 | O(1) local ring at capacity 1024 with no slack lets rejected MTP drafts overwrite in-window KV → **ring capacity = 1024 + γ_max(8)**, reads exclude the speculative region. |
-| 6 | MED-LOW | 05 | Local-ring KV stated 0.67 GB; correct is 40×8×256×2×2×1024 = **0.335 GB** (propagated to totals: 32K KV ~0.6 GB, snapshot image ≤0.34 GB). Error was conservative (never broke budget). |
+| 6 | MED-LOW | 05 | At v0.1 the base 1024-token ring was corrected from 0.67 GB to 40×8×256×2×2×1024 = **0.335 GB** (snapshot image ≤0.34 GB). The later +8 speculative slack is not part of this historical figure; active `05` accounts for the full 1032-token allocation at 0.338 GB. |
 | 7 | LOW | 03, 10 | K1 titled "decode kernel (q_len=1)"; MTP verify is q_len=γ and global exits the vector path at q_len≥3 → K1 **covers q_len 1..γ_max**. |
 | 8 | LOW | 03 | "halving global-KV bandwidth" (K1) stated as payoff → relabeled: **CONFIRMED 37.5% storage reduction (arXiv); bandwidth win is ASPIRATIONAL, G2-gated.** |
 

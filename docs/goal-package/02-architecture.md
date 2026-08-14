@@ -1,5 +1,9 @@
 # 02 — Architecture
 
+> **Scope note (ADR 0006):** the detailed graph/KV material below describes the implemented
+> Gemma adapter. Shared serving policy must not expose those fields as universal architecture
+> requirements. Qwen receives its own config, tensor, graph, and state adapter.
+
 ## Workspace (lean; every crate on the live path — anti-pattern: Helios shipped 5 crates no
 other crate imported)
 
@@ -8,7 +12,7 @@ hyperion/
 ├── Cargo.toml                  # workspace, resolver 2, rust-version 1.95
 ├── crates/
 │   ├── hyperion-core/          # engine loop, request lifecycle, scheduler, governor policy
-│   ├── hyperion-model/         # Gemma 4 geometry/config validation, weights manifest, family matrix
+│   ├── hyperion-model/         # family dispatch + architecture-specific config/artifact validation
 │   ├── hyperion-tokenizer/     # in-process tokenizer (HF tokenizers), chat template (minijinja),
 │   │                           # tool-call wire format, thinking-mode transcript policy
 │   ├── hyperion-ffi/           # C ABI bindings + unsafe confinement (only crate with unsafe)
@@ -46,11 +50,31 @@ or `hyperion-bench`).
 - Chunked prefill (default chunk 2048) yields between chunks: cancellation checks, governor
   re-admission per chunk, and (post-v1) decode interleaving points.
 
-## Native boundary (C ABI — Helios shape, slimmed)
+## Family seam
+
+The Rust load boundary classifies the exact top-level Hugging Face `model_type` before loading a
+tokenizer/template or initializing native state. `gemma4[_unified]` delegates to the strict Gemma
+parser. `qwen3_5` is recognized but fails with a typed unavailable result until its strict parser,
+tensor plan, graph, and state topology exist. Recognition is never reported as executable support.
+
+The target architecture uses a closed family dispatch rather than one optional-field geometry:
+
+- Gemma adapter: sliding/global attention, optional shared K/V, PLE/MoE capabilities, Gemma state;
+- Qwen adapter: Gated DeltaNet/full-GQA pattern, recurrent+convolution state, Qwen state;
+- shared runtime: streams, packed operators, sampling, cancellation, memory telemetry, and
+  transactional state publication.
+
+Conversation and deployment profiles are independent consumers of a family adapter. Do not add
+an abstraction until it has a real second implementation, but do not leak Gemma assumptions across
+the current dispatcher.
+
+## Native boundary (C ABI — current Gemma shape, slimmed)
 
 Carried verbatim from the proven Helios/bonsai pattern:
 
-- Opaque handles: `HypModel`, `HypKvState`, `HypDrafter`, `HypStepResult` (magic-tagged).
+- Opaque handles: `HypModel`, `HypKvState`, `HypDrafter`, `HypStepResult` (magic-tagged). The
+  current state/geometry ABI is intentionally Gemma-specific. Qwen may replace private ABI types
+  rather than extend Gemma structs with unrelated optional fields.
 - Every function returns `HypStatus` (OK / INVALID_ARG / NOT_FOUND / IO / OOM_GOVERNOR /
   UNSUPPORTED / INTERNAL / CANCELLED); `hyp_last_error()` returns a thread-local message.
   No C++ exception crosses; no Rust panic crosses; every handle has create/free lifecycle
@@ -59,7 +83,7 @@ Carried verbatim from the proven Helios/bonsai pattern:
   out-params. No callbacks across the ABI. Streaming is composed Rust-side from step results.
 - Rich telemetry struct per step (Helios `Gemma4DecodeProfileInfo` heritage, slimmed):
   peak/active MLX bytes, OS phys_footprint, per-layer-type KV bytes, kv-eval ms split
-  (global vs local), governor state, and (M7) draft/accept counts.
+  (global vs local), governor state, and optional draft/accept counts.
 - Target ABI surface ≤ 25 functions. Additions require an ADR.
 
 ## Startup canary (fail loudly)
@@ -70,9 +94,9 @@ availability per Apple's MLX-on-M5 publication), assert MLX version == pinned 0.
 single MEASURED canary line. Unsupported hardware exits nonzero with a one-line reason. No
 fallback ladder.
 
-## Config-driven geometry (family support without family sprawl)
+## Gemma adapter: config-driven geometry
 
-`hyperion-model` parses HF `config.json` into a validated `Geometry` struct that covers all
+The Gemma branch of `hyperion-model` parses HF `config.json` into a validated `Geometry` struct that covers all
 five Gemma 4 sizes (see references/gemma4-family-facts.md):
 
 ```
@@ -86,9 +110,9 @@ moe{num_experts=128, top_k=8, moe_intermediate} (26B-A4B), max_position_embeddin
 ```
 
 Unsupported/unknown config fields fail loudly (no silent default-through — Helios lesson).
-The native graph is built FROM `Geometry`; there is no per-model C++ fork. MoE + PLE +
-shared-KV wiring have geometry-level tests in v1 (M8 runs E4B end-to-end; 26B/31B stay
-geometry-validated only, O-8).
+The native graph is built FROM `Geometry`; there is no per-checkpoint C++ fork inside the Gemma
+adapter. MoE + PLE + shared-KV wiring retain geometry-level tests; real-artifact support is
+claimed only by the P7 evidence matrix.
 
 Per-layer-kind dispatch (mask / cache-kind / layer-runner) is resolved **once per kind**, not
 per token — the pattern NunSpark's `ArchSpec`/`MaskPlan`/`LayerRunner` seam independently
@@ -100,7 +124,7 @@ explicitly:
   never layer 0 unconditionally. A rotating (sliding) cache clamps its offset to `window-1`, so
   building a global-attention mask from a sliding layer's cache silently truncates it once the
   sequence exceeds the window — a real crash (`broadcast_shapes`) NunSpark hit twice. This is a
-  correctness rule for the mask-construction code, tested at M2.
+  correctness rule for the Gemma mask-construction code and its regression tests.
 - **Stash cross-layer KV only when a downstream layer or the MTP drafter actually consumes it**
   — Gemma shares K/V across many layers; materializing and pinning every layer's KV wastes the
   16 GB budget. The layer runner captures a producer layer's `(k,v)` only when `Geometry` says

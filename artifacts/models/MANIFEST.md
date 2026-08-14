@@ -1,17 +1,18 @@
 # Model artifact manifest
 
 Tensor payloads under this directory are gitignored. This tracked manifest is the source of
-truth for identity, acquisition status, license review, local hashes, and milestone ownership.
+truth for identity, acquisition status, license review, local hashes, and program ownership.
 
-| Milestone | Repository | Immutable revision | Local status |
+| Owning program | Repository | Immutable revision | Local status |
 |---|---|---|---|
-| M0 | `google/gemma-4-12B-it-qat-q4_0-unquantized` | `b6ed86275a6a5735884e208bfed95b445a684ca2` | verified, converted, real generation passed |
-| M2 | `google/gemma-4-12B-it` | `707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7` | deferred; BF16 spot checks only |
-| M1 | `google/gemma-4-E4B-it-qat-q4_0-unquantized` | `476025a01dbf99361c062bbeca3d6a76bb4c4566` | verified and converted for the M1 stock baseline |
-| M7 | `google/gemma-4-12B-it-qat-q4_0-unquantized-assistant` | `18934064dd4c5c6cc3621f6381e7d377fc8cb7bd` | deferred for disk budget |
-| M8 | `google/gemma-4-E4B-it-qat-q4_0-unquantized-assistant` | `27f8d204f09f2be353d6ff0bf0d012792b13c79f` | deferred for disk budget |
+| Legacy M0 | `google/gemma-4-12B-it-qat-q4_0-unquantized` | `b6ed86275a6a5735884e208bfed95b445a684ca2` | verified, converted, real generation passed |
+| Legacy M2 | `google/gemma-4-12B-it` | `707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7` | recorded but not acquired; BF16 spot checks only if needed |
+| Legacy M1 | `google/gemma-4-E4B-it-qat-q4_0-unquantized` | `476025a01dbf99361c062bbeca3d6a76bb4c4566` | verified and converted for the deferred M1 stock baseline |
+| Post-V1 MTP | `google/gemma-4-12B-it-qat-q4_0-unquantized-assistant` | `18934064dd4c5c6cc3621f6381e7d377fc8cb7bd` | recorded, not acquired, and not a P0–P7 dependency |
+| Post-V1 MTP | `google/gemma-4-E4B-it-qat-q4_0-unquantized-assistant` | `27f8d204f09f2be353d6ff0bf0d012792b13c79f` | recorded, not acquired, and not a P0–P7 dependency |
+| P2 | `Qwen/Qwen3.8-27B` | `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` | identity pinned; not downloaded, converted, loadable, or accepted |
 
-## M0 primary artifact
+## Accepted legacy M0 primary artifact
 
 - Source directory: `artifacts/models/gemma4-12b-qat-source/`
 - Converted directory: `artifacts/models/gemma4-12b-qat-mlx-g64-b4/`
@@ -43,14 +44,14 @@ truth for identity, acquisition status, license review, local hashes, and milest
 - License/frontmatter review: local model-card frontmatter declares `apache-2.0` and links the
   Gemma 4 license; final source hash binds that reviewed card to the snapshot
 
-### Committed M0-derived oracle fixtures
+### Committed legacy-M0-derived oracle fixtures
 
 The four real-model oracle fixtures under `native/hyperion_mlx/tests/fixtures/` contain
 activations, logits, and token IDs generated from the converted M0 artifact—not checkpoint
 weight tensors. They are Apache-2.0-only and documented with exact sizes and SHA-256 hashes in
 the root `PROVENANCE.md` and the fixture-directory `README.md`.
 
-## M1 E4B baseline artifact
+## Deferred legacy M1 E4B baseline artifact
 
 - Source directory: `artifacts/models/gemma4-e4b-qat-source/`
 - Converted directory: `artifacts/models/gemma4-e4b-qat-mlx-g64-b4/`
@@ -83,7 +84,23 @@ the root `PROVENANCE.md` and the fixture-directory `README.md`.
 - License/frontmatter review: the pinned local model card declares `apache-2.0`; its hash is
   part of the source manifest
 
-The three deferred repositories remain required. Decision 0001 schedules them at the first
-milestone that consumes each artifact because downloading all five plus conversion output at
-session zero would leave inadequate local working space. Official Hub metadata for all five
-reviewed revisions declares `apache-2.0`; each local model card is rechecked when acquired.
+The three not-yet-acquired Gemma repositories remain recorded, not required for P0–P7. The BF16
+12B source may support an off-device spot-check if a gate calls for it; the two assistant
+checkpoints are acquired only if a post-V1 MTP lane is opened. Decision 0001's staged-download
+rationale remains historical evidence. Official Hub metadata for all five reviewed revisions
+declares `apache-2.0`; each local model card is rechecked when acquired.
+
+## P2 Qwen3.8 source identity
+
+- Repository/revision: `Qwen/Qwen3.8-27B` at
+  `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`.
+- Reviewed remote state: public, ungated, Apache-2.0; 18 BF16 safetensor shards; source payload
+  about 55.56 GB. These are remote inventory facts, not a local verification record.
+- Expected architecture: outer `qwen3_5`, text `qwen3_5_text`, 64-layer hybrid text graph.
+- Initial component selection: text weights only. Vision and bundled MTP are omitted by an
+  explicit converter inventory, never by a permissive loader glob.
+- Local status: no source or transformed Qwen payload has been acquired. No hash manifest,
+  conversion identity, quality result, or native support is accepted.
+- P2 must record local file/LFS hashes, exact config/index/tokenizer/template/generation hashes,
+  source license frontmatter, converter identity, consumed/omitted tensor lists, and final root
+  digest before any transformed artifact can enter an evidence run.

@@ -1,90 +1,117 @@
 # 01 — Goal contract
 
+Normative scope: [ADR 0006](../decisions/0006-dual-family-v1-scope-and-gates.md). Historical
+Gemma evidence remains valid; the old Gemma-only forward scope does not.
+
 ## North star
 
-One sentence: **the best-in-class local inference engine for the Gemma 4 family on M5 Macs,
-measured on agentic quality-per-watt-per-GB, not on generic benchmark theater.**
+**A native, evidence-driven Apple-silicon inference runtime where Gemma 4 and Qwen's hybrid
+`qwen3_5` architecture are first-class model families rather than accidental variants of one
+graph.**
 
-hyperion exists so that demanding local agentic workloads (facility diagnostics,
-recommendations, point tagging, and operator-assistance workflows) run on a 16 GB MacBook Pro M5
-with: fast time-to-first-token on long agent transcripts, decode throughput at or beyond the
-memory-bandwidth ceiling via speculative decoding, strict tool-call reliability, and evidence
-for every claim. It is also the dev/eval substrate for prompt & schema iteration ahead of
-hosted deployment (A12 posture: engine+quant are identity-tuple fields; hyperion results are
-iteration evidence, not production conformance).
+Hyperion targets demanding local agentic workloads on the 16 GB MacBook Pro M5: real streaming,
+strict tool behavior, bounded memory, checkpoint-correct conversations, and honest quality/
+latency evidence. Rust owns serving and policy; one C++/MLX runtime owns model execution behind a
+narrow C ABI. Python and third-party reference runtimes remain oracle/conversion tools only.
 
-## Why clean-sheet (ruled 2026-07-21)
+## Why clean-sheet
 
-- Helios/gemma4d proved the model math but its native execution model (define-by-run re-trace,
-  deferred global-first KV eval, concatenate-grow global KV, per-step reset_peak) is the direct
-  cause of decode-tail pathology (chat p99 510.9 ms vs p50 82.4 ms; code_review_8k p99
-  2161.7 ms) and the 16K memory cliff (peak 21.874 GB vs a 14 GB gate). Retrofitting the
-  execution model means rewriting the core anyway.
-- mlx-bonsai's model lane (Ternary Qwen3.6) is dropped on measured evidence: agentic stretch
-  1/3, expected-tool share 26.39%, well-formed 93.06% only after server repair, ~13–17 tok/s.
-  Its serving/verification infra is the best-of-breed carry.
-- M5 + MLX 0.32.0 + Gemma-4-only scope invalidates enough assumptions (NAX prefill economics,
-  head-dim kernel gaps, QAT checkpoints, official MTP drafter) that a from-scratch spine with
-  targeted organ transplants beats an in-place evolution.
+Helios/gemma4d proved Gemma math but its re-traced execution, concatenate-grown global KV,
+deferred evaluation, and hot-loop peak resets produced severe decode tails and a 16K memory
+cliff. mlx-bonsai contributed strong serving/governor/evidence machinery, while its tested
+ternary Qwen3.6 artifact failed the target agentic quality bar. That artifact result does not
+rule out the independently released Qwen3.8 dense hybrid architecture.
 
-## Scope
+The dual-family direction keeps proven mechanisms and rejects inherited family assumptions.
+Because the project is pre-1.0, private geometry, ABI, state, and artifact layouts are replaced
+when a cleaner design wins; no migration shims are required for experimental internals.
 
-| Tier | Models | Status in v1 |
+## V1 scope
+
+| Family/profile | V1 role | Evidence state at ADR 0006 |
 |---|---|---|
-| Primary | `gemma-4-12B-it` from QAT-q4_0-unquantized, 4-bit | All gates run here |
-| Secondary | `gemma-4-E4B-it` (QAT 4-bit) — edge/community tier | M8 gates on m5-16g |
-| Architected | `gemma-4-26B-A4B` (MoE), `gemma-4-31B` | Geometry + config validation only; runtime gated on 32 GB+ hardware (O-8) |
-| Supported geometry, ungated | `gemma-4-E2B` | O-3 |
+| Gemma 4 12B QAT Q4 | Current executable regression path | M0 accepted; native/product acceptance beyond M0 pending |
+| Gemma 4 E4B and other sizes | Preserve config-driven family capability; gate only with real evidence | Existing geometry/converted E4B evidence retained; no blanket acceptance |
+| `Qwen/Qwen3.8-27B` text at pinned revision | New native target: batch one, 16K total cached tokens, 16 GB M5 | Research/design and family recognition only initially |
+| Qwen vision and bundled MTP | Optional component graph | Post-V1 |
 
-Text-only v1. The 12B's encoder-free multimodal path (35M linear projector) is a designed-for
-post-v1 lane (O-5, nameplate-OCR commissioning use case), not a gate.
+For Qwen, 16K means rendered prompt + retained reasoning + answer + tool-loop history + reserved
+output. A request is admitted only after the output reserve and full live-memory equation fit.
 
-## Hard constraints (violations = stop and report)
+## Hard constraints
 
-1. **Platform floor:** Apple M5 generation, macOS 26.2+, MLX 0.32.0. No M1–M4 code paths,
-   no capability ladder. Startup canary asserts the floor and fails loudly (mlx-bonsai
-   ADR 0003 pattern). A stock mlx-lm reference path must always run on the same machine as
-   the correctness baseline.
-2. **Single native backend.** Rust owns serving/policy; one C++ MLX graph behind a narrow
-   C ABI. No Python anywhere on the request path; no helper-subprocess backend; no
-   stub-vs-helper-vs-native backend forks (Helios R5).
-3. **16 GB profile is the binding budget.** Device-derived ceiling (measured
-   `recommendedMaxWorkingSetSize` ≈ 12,713,115,648 B on m5-16g → effective budget
-   ≈ 12.06 GB, soft watermark 90%). Every milestone's G4 gate enforces it. The Helios 16K
-   behavior (21.874 GB peak) is the canonical failure this design must never reproduce.
-4. **Correctness before speed.** G1 parity outranks every throughput number. Greedy
-   token-exactness vs the pinned oracle; two-sided fault-boundary thresholds for logits.
-   Never move a floor or edit frozen fixtures to pass (A/B protocol, carried verbatim).
-   Speculative/MTP correctness is **target-verified** — every emitted token equals a real
-   verify-pass argmax, each greedy-divergence a logged sub-0.5 near-tie — **not** byte-identity
-   to single-token greedy (unachievable at fp16/bf16 scale; A1, 08).
-5. **Baseline-then-gate.** No invented absolute targets. M1 measures stock mlx-lm on this
-   exact machine; all promotion gates are relative to those MEASURED rows. (Known physics
-   for orientation only, never as a gate: ~153 GB/s ÷ ~7 GB Q4 working set ⇒ low-20s tok/s
-   dense-decode ceiling; NAX moves prefill ~3.5–4× vs M4 class, decode ~1.2×.)
-6. **Agentic contract:** ≥1 tool call per assistant turn supported (Gemma 4 emits parallel
-   calls), server-minted IDs, schema-validated, degrade-never-drop; thinking blocks stripped
-   across turns, retained within a turn's tool-call chain; greedy AND sampled modes (Gemma
-   defaults t=1.0/top-p 0.95/top-k 64) — greedy-only is a bonsai limitation, not a feature.
-7. **Evidence discipline:** MEASURED/DECIDED/ASPIRATIONAL ledger; append-only; exact
-   commands + machine state per row; A-C-C-A run ordering; candidate-min > baseline-max
-   noise bar; adversarial-refute review before any kernel promotion.
+1. **Platform floor:** Apple M5 generation, macOS 26.2+, MLX 0.32.0 exactly. No M1–M4 fallback
+   ladder. Any upgrade is an independently pinned, evidence-gated decision.
+2. **One native serving path:** Rust policy and one C++/MLX runtime; one MLX-owning engine thread;
+   narrow C ABI; no Python or helper subprocess on the request path; test doubles stay in tests.
+3. **Family semantics are separate:** architecture adapters own config/tensor/graph/state math;
+   checkpoint conversation profiles own tokenization/templates/stops/thinking/tools/defaults;
+   deployment profiles own transformed artifacts, cache formats, limits, and residency.
+4. **16 GB is binding:** use the device-derived effective budget and a fail-closed governor.
+   Predictions include weights, committed and staged state, KV, scratch, compiled resources,
+   allocator/server footprint, and reserve. Zero uncontrolled OOM is a standing gate.
+5. **Resident dense decode:** ordinary token-by-token decode cannot reread the full model from
+   SSD or rely on macOS swap. SSD is allowed for bounded conversion and cold components;
+   durable snapshots and named prefill/offline experiments are separately gated P8 work.
+6. **Transactional state:** Qwen recurrent and KV mutation, Gemma KV mutation, cancellation,
+   speculative work, and reload publish state only after successful evaluation. Identity mismatch
+   resets or recomputes state; no cross-family/profile reuse.
+7. **Correctness before speed:** pinned reference traces, real artifacts where feasible,
+   two-sided numeric gates, free-running behavior, and hostile-input tests outrank throughput.
+8. **Baseline before claims:** performance gates use preregistered A-arms, A-C-C-A ordering, and
+   non-overlapping promotion evidence. The deferred Gemma M1 outcome and future Qwen A-arm are
+   reported honestly.
+9. **Evidence identities:** every result binds artifact, conversation, deployment, state layout,
+   runtime/kernel, oracle, harness, corpus, machine state, and exact command.
+10. **Public contracts remain contracts:** greenfield freedom does not weaken API behavior,
+    security, artifact integrity, licensing, privacy, or user-data boundaries.
 
-## Non-goals (v1)
+## Family-specific initial posture
 
-Production internet-facing serving; multi-user tenancy beyond single-flight+small queue;
-SSD cache tier; KV compression for active decode (measured dead end: 0.000% active
-reduction, q4 breaks greedy); LoRA application (registry design carried, application
-deferred); TUI; DiffusionGemma; non-Gemma models; CUDA (the design should not preclude a
-later CUDA port, but zero CUDA code in v1).
+### Gemma 4
 
-## Definition of done (v1)
+Preserve the implemented sliding/global attention graph, K=V and shared-KV capabilities, PLE/MoE
+geometry, Gemma tokenizer/template/tool behavior, and current regression fixtures. These are
+Gemma capabilities, not universal fields every architecture must implement.
 
-M0–M8 accepted with gates green; ledger holds MEASURED rows for 12B-QAT-Q4 and E4B-QAT-Q4 on
-m5-16g covering decode/prefill/TTFT/peak at 1K/4K/8K/16K/32K, agent-eval floor met, governor
-calibrated to the **throughput optimum** (below the OOM ceiling; the M1 budget sweep located
-it) with zero uncontrolled OOM aborts across the suite, conversation-cache TTFT evidence
-recorded, the `near_tie_events` counter live (target-verified exactness auditable), and MTP
-either promoted at ≥ +25% protected aggregate or parked with evidence — both outcomes are
-acceptable completions for M7. M9 (26B-A4B streaming) is explicitly **out of the v1 DoD**
-(owner-gated, O-10).
+### Qwen3.8 / `qwen3_5`
+
+- text graph: 48 Gated DeltaNet recurrent layers + 16 gated full-GQA layers;
+- recurrent state: FP32 initially, explicit convolution state, transactional commit;
+- cache: KV only for the 16 full-attention layers, BF16 correctness control;
+- weights: resident affine Q2/mixed scalar controls first; learned scalar quantization next;
+- conversation: exact pinned Qwen tokenizer/template, thinking/effort/stops/tool grammar;
+- conversion: shard/layer bounded, resumable, hash-verifying, and atomically published.
+
+No Qwen field is defaulted into the Gemma geometry and no Gemma parser interprets Qwen output.
+
+## Non-goals for V1
+
+- Private ABI, geometry, cache, or artifact backward compatibility.
+- Qwen vision or either family's MTP as a V1 dependency.
+- Dynamic routed adapters/MixLoRA.
+- A Qwen 32K, 262K, or 1M local promise.
+- Transparent macOS swap or full-model SSD reads during normal dense decode.
+- Simultaneous residence of both large model artifacts on the 16 GB target.
+- Production internet-facing multi-tenancy, continuous batching, TUI, CUDA, or every model family.
+- Treating file-size arithmetic, aggregate perplexity, implementation, or family recognition as
+  accepted support/performance evidence.
+
+## Definition of done
+
+V1 is complete when P0–P4 and P6–P7 in `10-milestones-and-gates.md` are accepted. P5 acceptance
+is never required. If its optional custom-kernel lane is opened, a promote-or-park disposition
+with evidence is required before P7 closes; an unopened P5 needs no record.
+
+- pinned Gemma and Qwen text artifacts execute through clean family adapters behind the shared
+  serving/runtime policy;
+- checkpoint-specific conversation profiles reproduce stops, thinking, tools, and transcripts;
+- the selected Qwen artifact fits the complete 16K target under measured M5 admission with no
+  uncontrolled OOM or swap dependence;
+- promoted packed weight/cache formats are consumed directly by production kernels;
+- transactional state, cancellation, switching, isolation, and hostile-input gates pass;
+- performance and quality claims have preregistered, repeatable, identity-bound evidence; and
+- tracked specifications, ADRs, public documentation, and release behavior match implementation.
+
+A custom weight format, compressed KV, speculative decoding, vision, routed adapters, and
+longer contexts are not required if the simpler resident path meets these gates.

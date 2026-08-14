@@ -47,15 +47,16 @@ accepted real-model parity or a performance claim.
 | Native Gemma runtime | **Implemented, acceptance pending:** Gemma 4 12B QAT MLX-affine Q4/g64 graph, cache machinery, narrow C ABI, and model-free/tiny-fixture native tests |
 | Serving contracts | **Implemented:** OpenAI-style chat/model discovery and Anthropic-style messages/token counting; real SSE, cancellation, bounded single-flight admission, and non-streaming responses |
 | Tool contracts | **Implemented and contract-tested:** bounded declarations/history, `auto`/`none`, incremental Gemma parsing, validation/deduplication, and OpenAI/Anthropic streaming and non-streaming response shapes; real-model quality acceptance remains pending |
-| Memory and performance | Fail-closed governor implemented; M1 measurement remains deferred and the latest M3 governor calibration does not pass its acceptance gate. **There is no accepted native performance claim yet.** |
-| Qwen | **Research and design only:** no Qwen artifact is currently accepted or loadable through the native Hyperion runtime |
+| Memory and performance | Fail-closed governor implemented; the legacy M1 measurement remains deferred and the latest recorded legacy-M3 governor calibration does not pass its acceptance gate. **There is no accepted native performance claim yet.** |
+| Qwen | **Research and load-boundary recognition only:** the top-level `qwen3_5` discriminator is recognized and fails closed before Gemma/native initialization; no strict Qwen config parser, artifact, or graph is accepted or executable |
 
 The following are still active work, not shipped capabilities:
 
 - Thinking-lane SSE framing and transcript policy beyond the currently supported text path.
 - Real-model acceptance for the Gemma tool path, plus checkpoint-specific Qwen
   thinking/tool rendering and parsing.
-- A dual-family adapter boundary and native Qwen3.8 text graph.
+- The Qwen architecture adapter, checkpoint conversation profile, and native Qwen3.8 text graph;
+  the first fail-closed family dispatcher is implemented.
 - Low-bit Qwen artifact selection, measured 16K memory fit, and any promoted custom Metal weight
   or cache kernels.
 - Transactional model reload and complete process-lifetime graceful shutdown.
@@ -63,10 +64,10 @@ The following are still active work, not shipped capabilities:
 - Runtime qualification beyond M5-or-newer Apple GPUs and the exact pinned MLX version.
 - Constrained JSON, later speculative decoding, vision, and longer-context tiers.
 
-The tracked [milestone gates](docs/goal-package/10-milestones-and-gates.md) describe the current
-Gemma implementation program and evidence rules; they are being reconciled with the dual-family
-direction above. See the [risk register](docs/goal-package/11-risk-register.md) and
-[accepted ADRs](docs/decisions/) for the current engineering record.
+The tracked [phase gates](docs/goal-package/10-milestones-and-gates.md) and
+[dual-family scope ADR](docs/decisions/0006-dual-family-v1-scope-and-gates.md) define the active
+program and evidence rules. See the [risk register](docs/goal-package/11-risk-register.md) and
+[accepted ADRs](docs/decisions/) for the engineering record.
 
 ## Direction
 
@@ -198,10 +199,9 @@ Hyperion is open while the runtime contract is still being hardened. Issues, res
 reproductions, and focused pull requests are welcome. Before changing runtime behavior, read the
 [accepted ADRs](docs/decisions/), current
 [goal package](docs/goal-package/INDEX.md), and repository
-[agent/build law](docs/goal-package/AGENTS.md). The goal package still reflects the Gemma-first
-implementation sequence and is being revised for the dual-family direction; open an issue before
-starting a broad architectural rewrite. Keep changes focused, pair performance work with
-correctness evidence, and never weaken a frozen gate to make a result pass.
+[agent/build law](docs/goal-package/AGENTS.md). Keep changes focused, follow the dependency DAG,
+pair performance work with correctness evidence, and never weaken a frozen gate to make a result
+pass.
 
 ## License
 
