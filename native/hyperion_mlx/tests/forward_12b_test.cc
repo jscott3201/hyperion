@@ -164,7 +164,11 @@ int main() {
         bool pass = true;
         auto check = [&](const std::string& key, const mx::array& cand, float bound) -> void {
             auto it = golden_map.find(key);
-            if (it == golden_map.end()) { std::cerr << "  [skip " << key << ": absent]\n"; return; }
+            if (it == golden_map.end()) {
+                std::cerr << "  [missing " << key << "]\n";
+                pass = false;
+                return;
+            }
             const float r = sig_rel(cand, it->second);
             const bool ok = r <= bound;
             pass &= ok;

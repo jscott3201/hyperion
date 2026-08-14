@@ -4,10 +4,10 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 
-expected_lock_sha256=b3603b4ebbc7f5883afe3d8cc10fc1767239837f5256985bd591b777c993dbaf
+expected_lock_sha256=b59b9022be34f429962150b4aa6a8339b7d4250c6ec814294b5d0d47663c540e
 actual_lock_sha256=$(shasum -a 256 oracle/uv.lock | awk '{print $1}')
 if [[ "$actual_lock_sha256" != "$expected_lock_sha256" ]]; then
-    echo "oracle lock digest differs from the reviewed M0 lock" >&2
+    echo "oracle lock digest differs from the reviewed oracle lock" >&2
     exit 1
 fi
 if [[ ! -x oracle/.venv/bin/python ]]; then

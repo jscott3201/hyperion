@@ -10,3 +10,5 @@ dependencies = [
 
 [tool.uv]
 package = false
+# The pinned mlx-lm revision uses legacy setup.py metadata; bind its wheel generator too.
+build-constraint-dependencies = ["setuptools==83.0.0"]

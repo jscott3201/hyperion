@@ -33,6 +33,7 @@ if env | awk -F= '$1 ~ /^MLX_/ && $1 != "MLX_ROOT" { found=1 } $1 ~ /^CARGO_PROF
 fi
 
 scripts/verify-oracle.sh | tee "$run_root/preflight/oracle-verification.log"
+scripts/test-oracle-startup.sh
 {
     scripts/verify-m0-models.sh
     scripts/verify-m1-e4b-models.sh

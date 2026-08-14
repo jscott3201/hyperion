@@ -416,6 +416,13 @@ mod tests {
     /// The real M1-locked 12B artifact on the dev/M5 machine (git-ignored; the
     /// test self-skips on CI where it is absent).
     fn real_dir() -> PathBuf {
+        if let Some(configured) =
+            std::env::var_os("HYPERION_12B_ARTIFACT").filter(|value| !value.is_empty())
+        {
+            return PathBuf::from(configured)
+                .canonicalize()
+                .expect("HYPERION_12B_ARTIFACT must resolve to a real directory");
+        }
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../../artifacts/models/gemma4-12b-qat-mlx-g64-b4")
             .canonicalize()

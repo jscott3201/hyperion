@@ -4,6 +4,12 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 
+actual_uv=$(uv --version | awk '{print $2}')
+if [[ "$actual_uv" != "0.11.5" ]]; then
+    echo "oracle setup requires uv 0.11.5 exactly; found $actual_uv" >&2
+    exit 1
+fi
+uv lock --project oracle --check
 python_path=$(uv python find 3.12.13)
 if [[ "$("$python_path" -c 'import platform; print(platform.python_version())')" != "3.12.13" ]]; then
     echo "uv did not resolve the required oracle Python 3.12.13" >&2

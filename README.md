@@ -109,8 +109,8 @@ platform and pinned runtime before any model is loaded.
 
 ### Prepare the current Gemma 12B developer model
 
-Model preparation additionally requires `uv`, Python 3.12.13, `jq`, and the Hugging Face
-`hf` CLI.
+Model preparation additionally requires `uv` 0.11.5 exactly, Python 3.12.13, `jq`, and the
+Hugging Face `hf` CLI.
 The source checkpoint is about 23.9 GB and the converted artifact is about 6.3 GiB. Plan for
 at least 35 GB of free space, and potentially more if another Hugging Face cache retains a
 second copy.
@@ -162,11 +162,13 @@ cargo run --locked --release -p hyperion-server -- \
 The fast, model-free pull-request gate is:
 
 ```sh
-scripts/setup-oracle.sh  # one-time, no model weights required
 scripts/ci-pr.sh
 ```
 
-The complete gate also expects `jq` and `ripgrep`, matching the CI environment.
+It expects CMake, MLX 0.32.0, `jq`, and `ripgrep`, matching the CI environment. Hosted CI takes
+an even shorter policy-only path when a change is limited to documentation. Within CI, the
+exact Python oracle is recreated and byte-attested only by the protected release and measurement
+gates.
 
 For the native model-free suite alone:
 
