@@ -14,9 +14,10 @@ historical Gemma v0.2 research record; new Qwen inputs below use the frozen sour
   and [generation config](https://huggingface.co/Qwen/Qwen3.8-27B/blob/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/generation_config.json).
 - [Transformers Qwen3.5 implementation at `95940bf`](https://github.com/huggingface/transformers/blob/95940bf8775059a42f047256f076e4f607bc43ec/src/transformers/models/qwen3_5/modeling_qwen3_5.py)
   and [mlx-lm Qwen3.5 implementation at `8239c72`](https://github.com/ml-explore/mlx-lm/blob/8239c72de5a0e42c539e30489021db73c7fe258c/mlx_lm/models/qwen3_5.py).
-  The P2 contract pins source-file SHA-256 values and a partial execution intent. Both remain
-  unexecuted; their exact producer modes and environment receipts, real-weight traces,
-  tolerances, and measured agreement are not yet accepted oracle evidence.
+  The P2 contract pins source-file SHA-256 values, runtime-native state layouts, and exact
+  producer semantics. Both remain unexecuted; their independent environment/package receipts,
+  producer entrypoints, real-weight traces, tolerances, and measured agreement are not yet
+  accepted oracle evidence.
 - [Tracked Qwen3.8 oracle contract](../../oracle/qwen38/README.md), complete expected source
   inventory, and first-party case corpus. These prevent source/profile drift but contain no
   model-derived outputs.

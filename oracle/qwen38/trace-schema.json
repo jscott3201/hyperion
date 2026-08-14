@@ -1,0 +1,1095 @@
+{
+  "schema": "hyperion.qwen38-trace-schema.v1",
+  "state": "schema_frozen_no_payload",
+  "binds": {
+    "case_corpus_sha256": "2a1c23a1baa9ea8566fce71d452272202eddf71e83190c930389fce94097fda3",
+    "source_manifest_sha256": "450ff5ada441702f54e8da2cd3c92a207ab1b3bdbaa6254427556d9afa4ff91a",
+    "source_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+  },
+  "scope": {
+    "batch_size": 1,
+    "padding": false,
+    "prompt_tokens_min": 6,
+    "prompt_tokens_max": 512,
+    "max_generated_tokens": 16,
+    "weight_dtype": "bfloat16",
+    "gdn_recurrent_dtype": "float32",
+    "quantization": false,
+    "vision": false,
+    "mtp": false,
+    "adapters": false
+  },
+  "case_plan": {
+    "renderer_case_ids": [
+      "generate-canonical-dual-stop",
+      "generate-stop-endoftext",
+      "generate-stop-im-end",
+      "reject-invalid-reasoning-effort",
+      "reject-system-not-first",
+      "render-parallel-tool-calls",
+      "render-preserve-thinking-false",
+      "render-preserve-thinking-true",
+      "render-system-first",
+      "render-system-first-tools",
+      "render-thinking-default-xhigh",
+      "render-thinking-disabled",
+      "render-thinking-low",
+      "render-thinking-medium",
+      "render-tool-results-preserve-thinking-false",
+      "render-tool-results-preserve-thinking-true"
+    ],
+    "parser_case_ids": [
+      "parser-adjacent-calls",
+      "parser-every-byte-boundary",
+      "parser-malformed-fallback",
+      "parser-single-call"
+    ],
+    "behavior_cases": [
+      {
+        "case_id": "generate-canonical-dual-stop",
+        "max_steps": 16,
+        "stop_token_ids": [
+          248046,
+          248044
+        ]
+      },
+      {
+        "case_id": "generate-stop-endoftext",
+        "max_steps": 16,
+        "stop_token_ids": [
+          248044
+        ]
+      },
+      {
+        "case_id": "generate-stop-im-end",
+        "max_steps": 16,
+        "stop_token_ids": [
+          248046
+        ]
+      },
+      {
+        "case_id": "render-system-first-tools",
+        "max_steps": 16,
+        "stop_token_ids": [
+          248046,
+          248044
+        ]
+      },
+      {
+        "case_id": "render-thinking-default-xhigh",
+        "max_steps": 16,
+        "stop_token_ids": [
+          248046,
+          248044
+        ]
+      },
+      {
+        "case_id": "render-thinking-low",
+        "max_steps": 16,
+        "stop_token_ids": [
+          248046,
+          248044
+        ]
+      },
+      {
+        "case_id": "render-thinking-medium",
+        "max_steps": 16,
+        "stop_token_ids": [
+          248046,
+          248044
+        ]
+      },
+      {
+        "case_id": "render-tool-results-preserve-thinking-false",
+        "max_steps": 16,
+        "stop_token_ids": [
+          248046,
+          248044
+        ]
+      },
+      {
+        "case_id": "render-tool-results-preserve-thinking-true",
+        "max_steps": 16,
+        "stop_token_ids": [
+          248046,
+          248044
+        ]
+      }
+    ],
+    "render_rejection_codes": {
+      "reject-invalid-reasoning-effort": "invalid_reasoning_effort",
+      "reject-system-not-first": "system_message_must_be_first"
+    },
+    "stop_coverage_semantics": {
+      "canonical_dual_stop": "configured input and stop-policy coverage only; observed termination is separately receipted and this label does not claim either token was emitted",
+      "stop_endoftext": "configured input and stop-policy coverage only; observed termination is separately receipted and this label does not claim token 248044 was emitted",
+      "stop_im_end": "configured input and stop-policy coverage only; observed termination is separately receipted and this label does not claim token 248046 was emitted"
+    },
+    "state_probe_case_id": "generate-canonical-dual-stop",
+    "free_running_gap_closed_by_promoted_render_cases": true
+  },
+  "runs": [
+    {
+      "id": "behavior_monolithic",
+      "cases": "all_behavior_cases",
+      "fresh_process": true,
+      "fresh_cache_per_case": true,
+      "instrumented": false,
+      "prefill_schedule": "whole_prompt",
+      "decode": "fixed_step_greedy_until_stop_or_bound",
+      "state_snapshots": []
+    },
+    {
+      "id": "trace_monolithic",
+      "cases": "state_probe_only",
+      "fresh_process": true,
+      "fresh_cache_per_case": true,
+      "instrumented": true,
+      "prefill_schedule": "whole_prompt",
+      "decode": "fixed_step_greedy_until_stop_or_bound",
+      "state_snapshots": [
+        "post_prefill",
+        "post_first_decode_call_if_executed",
+        "terminal_call_if_distinct"
+      ]
+    },
+    {
+      "id": "trace_token_serial_prefill",
+      "cases": "state_probe_only",
+      "fresh_process": true,
+      "fresh_cache_per_case": true,
+      "instrumented": true,
+      "prefill_schedule": "one_token_calls",
+      "decode": "none",
+      "state_snapshots": [
+        "logical_prefix_3",
+        "logical_prefix_4",
+        "logical_prefix_5",
+        "post_prefill"
+      ]
+    },
+    {
+      "id": "trace_conv_boundary_prefill",
+      "cases": "state_probe_only",
+      "fresh_process": true,
+      "fresh_cache_per_case": true,
+      "instrumented": true,
+      "prefill_schedule": "chunks_3_1_1_remainder",
+      "decode": "none",
+      "state_snapshots": [
+        "logical_prefix_3",
+        "logical_prefix_4",
+        "logical_prefix_5",
+        "post_prefill"
+      ]
+    }
+  ],
+  "prefill_schedules": {
+    "whole_prompt": "one call consuming positions [0,T)",
+    "one_token_calls": "T calls consuming [i,i+1) for i=0..T-1 without sampling between calls",
+    "chunks_3_1_1_remainder": "calls consuming [0,3), [3,4), [4,5), and [5,T), without sampling between calls"
+  },
+  "prediction_frame": {
+    "prompt_call": "call 0 consumes prompt positions [0,T) and predicts emitted token 0",
+    "decode_call": "call i>0 consumes emitted token i-1 at position T+i-1 and predicts emitted token i",
+    "cache_length_after_call": "T+i for call i, before the token predicted by that call enters the cache",
+    "stop_policy": "include a predicted stop token in emitted IDs and UTF-8, then perform no later forward call",
+    "terminal_cache": "does not contain the terminal token predicted by the final executed call",
+    "high_level_generate_api": false
+  },
+  "frame_kinds": {
+    "generation_prediction": {
+      "sampled": true,
+      "call_span": "prompt [0,T) for call 0; one emitted token for each later call",
+      "prediction_index": "zero-based emitted-token index",
+      "boundary_tags": [
+        "post_prefill",
+        "post_decode",
+        "terminal"
+      ],
+      "termination": "none_until_terminal_then_stop_token_or_max_steps"
+    },
+    "teacher_forced_prefill": {
+      "sampled": false,
+      "call_span": "explicit half-open prompt-token range [start,end)",
+      "prediction_index": null,
+      "boundary_tags": [
+        "logical_prefix_3",
+        "logical_prefix_4",
+        "logical_prefix_5",
+        "post_prefill"
+      ],
+      "termination": "not_applicable"
+    }
+  },
+  "control_pair": {
+    "uninstrumented_run": "behavior_monolithic",
+    "instrumented_run": "trace_monolithic",
+    "case_id": "generate-canonical-dual-stop",
+    "fresh_state_for_each": true,
+    "comparison_authority": "third_party_verifier_after_measured_tolerances"
+  },
+  "selections": {
+    "hidden_sites": [
+      "embedding_output",
+      "decoder_output_0",
+      "decoder_output_2",
+      "decoder_output_3",
+      "decoder_output_30",
+      "decoder_output_31",
+      "decoder_output_32",
+      "decoder_output_62",
+      "decoder_output_63",
+      "final_norm_output"
+    ],
+    "prompt_hidden_positions": "ascending(sorted_unique(0,2,3,4,T-1) intersect [0,logical_prefix)) at each snapshot; descriptor stores the exact concrete IDs",
+    "decode_hidden_positions": "currently_consumed_position_only",
+    "hidden_site_boundaries": {
+      "embedding_output": "token embedding lookup output before decoder layer 0 and before any decoder-layer normalization",
+      "decoder_output_<i>": "post-MLP-residual output returned by the complete decoder block i, after both attention-or-GDN and MLP residual updates and before layer i+1",
+      "final_norm_output": "output of the final text-model RMSNorm applied after decoder layer 63 and before lm_head"
+    },
+    "gdn_state_layers": [
+      0,
+      2,
+      30,
+      62
+    ],
+    "full_attention_kv_layers": [
+      3,
+      31,
+      63
+    ],
+    "gdn_layer_rule": "layer_index_mod_4_in_0_1_2",
+    "full_attention_layer_rule": "layer_index_mod_4_equals_3"
+  },
+  "channels": [
+    {
+      "id": "rendered_utf8",
+      "applies_to": "renderer_success_cases",
+      "encoding": "utf8_no_bom_no_cleanup"
+    },
+    {
+      "id": "render_rejection",
+      "applies_to": "renderer_reject_cases",
+      "encoding": "canonical_json_project_code_plus_informational_native_text"
+    },
+    {
+      "id": "parser_outcome",
+      "applies_to": "shared_verifier_parser_cases",
+      "encoding": "canonical_json_exact_text_and_tool_calls"
+    },
+    {
+      "id": "input_ids",
+      "applies_to": "renderer_success_cases",
+      "stored_dtype": "u32le",
+      "axes": [
+        "batch",
+        "token"
+      ],
+      "shape": [
+        1,
+        "T"
+      ]
+    },
+    {
+      "id": "position_ids",
+      "applies_to": "model_runs",
+      "stored_dtype": "u32le",
+      "axes": [
+        "batch",
+        "token"
+      ],
+      "shape": [
+        1,
+        "call_tokens"
+      ]
+    },
+    {
+      "id": "full_vocab_logits",
+      "applies_to": "every_prediction_frame",
+      "stored_dtype": "f32le",
+      "axes": [
+        "batch",
+        "vocabulary"
+      ],
+      "shape": [
+        1,
+        248320
+      ],
+      "conversion": "cast_native_logits_to_float32_before_host_copy"
+    },
+    {
+      "id": "topk",
+      "applies_to": "every_prediction_frame",
+      "encoding": "canonical_json_ids_values_adjacent_margins_and_cutoff_margin"
+    },
+    {
+      "id": "greedy_token_ids",
+      "applies_to": "behavior_runs",
+      "stored_dtype": "u32le",
+      "axes": [
+        "emitted_token"
+      ],
+      "shape": [
+        "G"
+      ]
+    },
+    {
+      "id": "free_running_utf8",
+      "applies_to": "behavior_runs",
+      "encoding": "utf8_skip_special_tokens_false_cleanup_false"
+    },
+    {
+      "id": "selected_hidden_states",
+      "applies_to": "instrumented_numeric_snapshots",
+      "stored_dtype": "f32le",
+      "native_axes": [
+        "batch",
+        "selected_token",
+        "hidden"
+      ],
+      "shape": [
+        1,
+        "selected_positions",
+        5120
+      ],
+      "snapshot_rule": "materialize_before_later_cache_mutation"
+    },
+    {
+      "id": "native_gdn_recurrent_state",
+      "applies_to": "instrumented_numeric_snapshots_selected_gdn_layers",
+      "stored_dtype": "f32le",
+      "shape": [
+        1,
+        48,
+        128,
+        128
+      ],
+      "snapshot_rule": "materialize_before_later_cache_mutation"
+    },
+    {
+      "id": "native_gdn_conv_state",
+      "applies_to": "instrumented_numeric_snapshots_selected_gdn_layers",
+      "stored_dtype": "f32le",
+      "shape": "oracle_native",
+      "snapshot_rule": "materialize_before_later_cache_mutation"
+    },
+    {
+      "id": "native_full_attention_kv",
+      "applies_to": "instrumented_numeric_snapshots_selected_full_attention_layers",
+      "stored_dtype": "f32le",
+      "shape": "oracle_native",
+      "snapshot_rule": "materialize_before_later_cache_mutation"
+    }
+  ],
+  "native_layouts": {
+    "transformers": {
+      "gdn_recurrent_axes": [
+        "batch",
+        "value_head",
+        "key_feature",
+        "value_feature"
+      ],
+      "gdn_recurrent_shape": [
+        1,
+        48,
+        128,
+        128
+      ],
+      "gdn_conv_axes": [
+        "batch",
+        "conv_channel",
+        "retained_token"
+      ],
+      "gdn_conv_shape": [
+        1,
+        10240,
+        4
+      ],
+      "full_attention_kv_axes": [
+        "batch",
+        "kv_head",
+        "logical_token",
+        "head_feature"
+      ],
+      "full_attention_kv_shape": [
+        1,
+        4,
+        "L",
+        256
+      ]
+    },
+    "mlx_lm": {
+      "gdn_recurrent_axes": [
+        "batch",
+        "value_head",
+        "value_feature",
+        "key_feature"
+      ],
+      "gdn_recurrent_shape": [
+        1,
+        48,
+        128,
+        128
+      ],
+      "gdn_conv_axes": [
+        "batch",
+        "history",
+        "conv_channel"
+      ],
+      "gdn_conv_shape": [
+        1,
+        3,
+        10240
+      ],
+      "full_attention_kv_axes": [
+        "batch",
+        "kv_head",
+        "allocated_token",
+        "head_feature"
+      ],
+      "full_attention_kv_shape": [
+        1,
+        4,
+        "C",
+        256
+      ],
+      "logical_offset_required": true,
+      "capacity_constraint": "L<=C<L+256; record actual C because nonaligned chunk growth need not be a multiple of 256",
+      "capacity_recurrence": {
+        "initial_state": "L=0,C=0",
+        "no_growth": "when L+N<=C, set L=L+N and leave C unchanged",
+        "growth": "when L+N>C, first set C=L if prior C>0 and L mod 256 != 0, then set C=C+ceil(N/256)*256 and L=L+N",
+        "call_token_count": "N is the positive token count in the current forward call",
+        "step": 256
+      }
+    }
+  },
+  "canonical_normalization": {
+    "owner": "third_party_verifier",
+    "producer_canonical_state_is_not_raw_evidence": true,
+    "gdn_recurrent_axes": [
+      "batch",
+      "value_head",
+      "key_feature",
+      "value_feature"
+    ],
+    "gdn_recurrent_transform": {
+      "transformers": "identity",
+      "mlx_lm": "transpose_last_two"
+    },
+    "gdn_conv_axes": [
+      "batch",
+      "history_oldest_to_newest",
+      "conv_channel"
+    ],
+    "gdn_conv_shape": [
+      1,
+      3,
+      10240
+    ],
+    "gdn_conv_transform": {
+      "transformers": "take_last_3_then_transpose_0_2_1",
+      "mlx_lm": "identity"
+    },
+    "full_attention_kv_axes": [
+      "batch",
+      "kv_head",
+      "logical_token",
+      "head_feature"
+    ],
+    "full_attention_kv_transform": {
+      "transformers": "identity",
+      "mlx_lm": "slice_token_axis_to_logical_offset"
+    },
+    "kv_semantics": "post_key_norm_post_rope_keys_and_projected_values"
+  },
+  "topk": {
+    "width": 32,
+    "internal_rank_count": 33,
+    "ranking": "descending_float32_value_then_ascending_token_id",
+    "ids": 32,
+    "values": 32,
+    "adjacent_margins": 31,
+    "cutoff_margin": "rank_32_value_minus_rank_33_value",
+    "greedy": "rank_1_token_id",
+    "verifier_recomputes_from_full_logits": true
+  },
+  "serialization": {
+    "numeric_payload": "one_headerless_c_contiguous_little_endian_tensor_per_regular_file",
+    "allowed_numeric_dtypes": [
+      "f32le",
+      "u32le"
+    ],
+    "json": "utf8_no_bom_canonical_sorted_keys_no_nonfinite_numbers",
+    "jsonl": "one_canonical_json_object_per_line_final_newline_required",
+    "text": "utf8_no_bom_exact_bytes",
+    "compression": false,
+    "archives": false,
+    "executable_payloads": false,
+    "pickle_or_object_arrays": false,
+    "tensor_descriptor_required_fields": [
+      "axes",
+      "byte_length",
+      "call_index",
+      "call_token_end",
+      "call_token_start",
+      "canonical_transform",
+      "case_id",
+      "channel",
+      "frame_id",
+      "layer",
+      "logical_offset",
+      "logical_prefix",
+      "native_axes",
+      "native_dtype",
+      "oracle_id",
+      "path",
+      "record_type",
+      "run_id",
+      "run_instance_id",
+      "selected_position_ids",
+      "sha256",
+      "shape",
+      "site_or_role",
+      "stored_dtype"
+    ]
+  },
+  "record_schemas": {
+    "common_constraints": {
+      "records_are_closed": true,
+      "unknown_fields": "fatal",
+      "duplicate_records": "fatal",
+      "paths": "canonical_relative_utf8_no_empty_dot_dot_parent_absolute_backslash_or_alias_components",
+      "sha256": "lowercase_hex_64",
+      "identifiers": "nonempty_ascii_lower_kebab_or_contract_enumeration",
+      "frame_ids": "exactly <run_instance_id>/gen/<prediction_index> or <run_instance_id>/prefill/<logical_prefix>, with canonical unsigned decimal suffix and no leading zero except zero",
+      "integers": "json_integer_with_field_specific_nonnegative_or_token_id_bounds",
+      "numbers": "finite_only"
+    },
+    "events_jsonl": {
+      "record_types": [
+        "case_input",
+        "render_rejection",
+        "run_start",
+        "call",
+        "snapshot",
+        "run_end"
+      ],
+      "required_fields_by_type": {
+        "case_input": [
+          "case_id",
+          "input_ids_payload_path",
+          "oracle_id",
+          "prompt_tokens",
+          "record_type",
+          "rendered_payload_path",
+          "template_arguments_sha256"
+        ],
+        "render_rejection": [
+          "case_id",
+          "oracle_id",
+          "record_type",
+          "rejection_payload_path",
+          "stable_rejection_code"
+        ],
+        "run_start": [
+          "case_id",
+          "initial_cache_empty",
+          "initial_cache_offsets",
+          "input_ids_sha256",
+          "instrumented",
+          "max_steps",
+          "oracle_id",
+          "prefill_schedule",
+          "record_type",
+          "run_id",
+          "run_instance_id",
+          "stop_token_ids"
+        ],
+        "call": [
+          "boundary_tag",
+          "cache_length_after",
+          "cache_length_before",
+          "call_index",
+          "call_token_end",
+          "call_token_start",
+          "case_id",
+          "frame_id",
+          "frame_kind",
+          "is_stop",
+          "logical_prefix",
+          "oracle_id",
+          "predicted_token_id",
+          "prediction_index",
+          "record_type",
+          "run_id",
+          "run_instance_id",
+          "sampled",
+          "termination_reason"
+        ],
+        "snapshot": [
+          "boundary_tag",
+          "call_index",
+          "case_id",
+          "frame_id",
+          "logical_prefix",
+          "oracle_id",
+          "record_type",
+          "required_channel_ids",
+          "run_id",
+          "run_instance_id"
+        ],
+        "run_end": [
+          "call_count",
+          "case_id",
+          "emitted_token_count",
+          "emitted_tokens_payload_path",
+          "free_running_utf8_payload_path",
+          "oracle_id",
+          "record_type",
+          "run_id",
+          "run_instance_id",
+          "terminal_cache_length",
+          "termination_reason"
+        ]
+      },
+      "field_types": {
+        "boolean": [
+          "initial_cache_empty",
+          "instrumented",
+          "is_stop",
+          "sampled"
+        ],
+        "nonnegative_integer": [
+          "cache_length_after",
+          "cache_length_before",
+          "call_count",
+          "call_index",
+          "call_token_end",
+          "call_token_start",
+          "emitted_token_count",
+          "logical_prefix",
+          "max_steps",
+          "prompt_tokens",
+          "terminal_cache_length"
+        ],
+        "nonnegative_integer_array": [
+          "initial_cache_offsets"
+        ],
+        "nullable_nonnegative_integer": [
+          "predicted_token_id",
+          "prediction_index"
+        ],
+        "relative_payload_path": [
+          "emitted_tokens_payload_path",
+          "free_running_utf8_payload_path",
+          "input_ids_payload_path",
+          "rejection_payload_path",
+          "rendered_payload_path"
+        ],
+        "sha256": [
+          "input_ids_sha256",
+          "template_arguments_sha256"
+        ],
+        "string": [
+          "boundary_tag",
+          "case_id",
+          "frame_id",
+          "frame_kind",
+          "oracle_id",
+          "prefill_schedule",
+          "record_type",
+          "run_id",
+          "run_instance_id",
+          "stable_rejection_code",
+          "termination_reason"
+        ],
+        "u32_array": [
+          "stop_token_ids"
+        ],
+        "unique_string_array": [
+          "required_channel_ids"
+        ]
+      },
+      "digest_preimages": {
+        "input_ids_sha256": "SHA-256 of the exact bound input_ids payload bytes serialized as headerless C-contiguous u32le",
+        "template_arguments_sha256": "SHA-256 of canonical JSON for the exact case template_args object before any runtime default expansion"
+      },
+      "nullable_fields": [
+        "boundary_tag",
+        "emitted_tokens_payload_path",
+        "free_running_utf8_payload_path",
+        "predicted_token_id",
+        "prediction_index"
+      ],
+      "ordering": "case_input_or_rejection_before_runs; within each run run_start then contiguous calls and attached snapshots then exactly one run_end",
+      "parser_records": "forbidden_in_arm_events_and_owned_by_the_external_project_verifier",
+      "uniqueness_keys": [
+        "(oracle_id,case_id,record_type) for case_input and render_rejection",
+        "run_instance_id globally within one arm",
+        "(run_instance_id,call_index) and (run_instance_id,frame_id) for calls",
+        "(run_instance_id,boundary_tag) for snapshots"
+      ],
+      "foreign_key_rules": [
+        "every run case_id references one preceding case_input in the same arm; run_start.input_ids_sha256 equals that case input_ids descriptor sha256",
+        "case_input.prompt_tokens equals its input_ids tensor token-axis length T with 6<=T<=512; template_arguments_sha256 equals SHA-256 of the canonical JSON exact template-argument object bound by the case",
+        "every call, snapshot, and run_end references exactly one preceding run_start by run_instance_id with equal oracle_id case_id and run_id",
+        "every event payload path joins exactly one payload-manifest record with equal oracle_id case_id run_id run_instance_id frame_id and channel semantics"
+      ],
+      "call_conditionals": [
+        "generation_prediction requires sampled=true, integer predicted_token_id and prediction_index, and frame_id=run_instance_id/gen/<prediction_index>",
+        "teacher_forced_prefill requires sampled=false, prediction_index=null, is_stop=false, termination_reason=not_applicable, and frame_id=run_instance_id/prefill/<logical_prefix>",
+        "boundary_tag is null except at a declared snapshot boundary; each non-null tag has exactly one attached snapshot",
+        "is_stop=true iff predicted_token_id is in the run stop_token_ids; a terminal call uses termination_reason=stop_token iff is_stop=true, otherwise max_steps iff prediction_index=15, including when the sixteenth predicted token is also a stop"
+      ],
+      "snapshot_specification_mapping": {
+        "post_first_decode_call_if_executed": {
+          "boundary_tag": "post_decode",
+          "condition": "emit only on the first generation decode call after the prompt call"
+        },
+        "terminal_call_if_distinct": {
+          "boundary_tag": "terminal",
+          "condition": "emit only when the terminal call is distinct from the calls already tagged post_prefill or post_decode"
+        }
+      },
+      "cardinality_and_sequence": [
+        "exactly one case_input for every renderer-success case and exactly one render_rejection for every renderer-reject case; parser cases never appear in producer-owned arm events",
+        "exactly one run_start and one run_end for every case named by each run in the run-case matrix",
+        "call_index is contiguous from zero; the first call has call_token_start=cache_length_before=0; every call has cache_length_before=call_token_start and logical_prefix=call_token_end=cache_length_after; consecutive spans are contiguous and match the selected prefill schedule",
+        "behavior_monolithic and trace_monolithic execute one generation_prediction call per emitted token, with 1<=call_count=emitted_token_count<=16",
+        "trace_token_serial_prefill executes exactly T teacher_forced_prefill calls; trace_conv_boundary_prefill executes exactly four teacher_forced_prefill calls because T>=6",
+        "a stop-token call is terminal, is included in emitted payloads, and has no later call; max_steps terminates after exactly 16 emitted tokens",
+      "generation runs use max_steps and stop_token_ids exactly from case_plan.behavior_cases; no-decode prefill runs use max_steps=0 and stop_token_ids=[]",
+      "for generation runs run_end.termination_reason equals the terminal call termination_reason, call_count equals emitted_token_count, emitted_token_count equals the number of generation_prediction calls, and emitted_tokens_payload_path plus free_running_utf8_payload_path are both non-null and join exactly one run-end payload each",
+      "for no-decode prefill runs run_end has emitted_token_count=0, emitted_tokens_payload_path=null, free_running_utf8_payload_path=null, termination_reason=not_applicable, and terminal_cache_length=T",
+      "terminal_cache_length is T+emitted_token_count-1 for generation runs and T for no-decode prefill runs",
+        "every run_start asserts initial_cache_empty=true and initial_cache_offsets is the ordered 64-entry all-zero list before any call",
+        "snapshot boundaries and cardinality equal the selected run state_snapshots, using snapshot_specification_mapping for conditional specification names"
+      ]
+    },
+    "payload_manifest_jsonl": {
+      "record_types": [
+        "tensor",
+        "bytes"
+      ],
+      "tensor_required_fields_source": "serialization.tensor_descriptor_required_fields",
+      "bytes_required_fields": [
+        "byte_length",
+        "call_index",
+        "case_id",
+        "channel",
+        "encoding",
+        "frame_id",
+        "logical_prefix",
+        "oracle_id",
+        "path",
+        "record_type",
+        "run_id",
+        "run_instance_id",
+        "sha256",
+        "site_or_role"
+      ],
+      "field_types": {
+        "axes_native_axes": "arrays of nonempty unique axis-name strings",
+        "byte_length_call_index_call_spans_layer_logical_offset_logical_prefix": "nonnegative JSON integers or null only where channel_rules permit",
+        "case_id_channel_frame_id_oracle_id_run_id_run_instance_id_site_or_role": "nonempty strings or null only where channel_rules permit",
+        "canonical_transform": "one of identity, transpose_last_two, take_last_3_then_transpose_0_2_1, slice_token_axis_to_logical_offset",
+        "encoding": "one of utf8_no_bom_no_cleanup, canonical_json, utf8_skip_special_tokens_false_cleanup_false",
+        "native_dtype": "one of bfloat16, float32, int32, int64, uint32",
+        "path": "canonical relative path beneath payload/",
+        "record_type": "exactly tensor or bytes",
+        "selected_position_ids": "ascending unique u32 JSON array or null",
+        "sha256": "lowercase hex SHA-256",
+        "shape": "nonempty array of positive concrete JSON integers",
+        "stored_dtype": "exactly f32le or u32le"
+      },
+      "tensor_nullable_fields": [
+        "call_index",
+        "call_token_end",
+        "call_token_start",
+        "frame_id",
+        "layer",
+        "logical_offset",
+        "logical_prefix",
+        "run_id",
+        "run_instance_id",
+        "selected_position_ids"
+      ],
+      "bytes_nullable_fields": [
+        "call_index",
+        "frame_id",
+        "logical_prefix",
+        "run_id",
+        "run_instance_id"
+      ],
+      "channel_rules": [
+        "input_ids is case-level tensor site_or_role=input_sequence with all run frame call layer logical-offset and selected-position fields null",
+        "position_ids is call-level tensor site_or_role=logical_positions with non-null run frame call span and logical prefix; layer logical_offset and selected_position_ids are null",
+        "full_vocab_logits is call-level tensor site_or_role=last_position_logits with non-null run frame call span and logical prefix; layer logical_offset and selected_position_ids are null",
+        "greedy_token_ids is run-end tensor site_or_role=emitted_sequence with non-null run identity and all frame call layer logical-offset and selected-position fields null",
+        "selected_hidden_states is a snapshot tensor with a selected hidden site_or_role and layer null for embedding/final norm or the named decoder layer otherwise; prompt and teacher-forced snapshots use ascending(sorted_unique(0,2,3,4,T-1) intersect [0,logical_prefix)), while generation-decode snapshots use the singleton currently consumed absolute position T+prediction_index-1",
+        "native_gdn_recurrent_state and native_gdn_conv_state are snapshot tensors with site_or_role recurrent_state or conv_history and one selected GDN layer",
+        "native_full_attention_kv is a snapshot tensor with site_or_role K or V and one selected full-attention layer; mlx_lm logical_offset is non-null and both C and L exactly satisfy the frozen call-by-call capacity recurrence plus L<=C<L+256, Transformers logical_offset equals L",
+        "rendered_utf8 and render_rejection are case-level bytes with all run frame and call fields null and site_or_role rendered_prompt or rejection_record",
+        "topk is call-level canonical-json bytes with non-null run frame call and logical prefix and site_or_role ranked_logits_33",
+        "free_running_utf8 is run-end bytes with non-null run identity, null frame call and logical prefix, and site_or_role decoded_emitted_sequence"
+      ],
+      "foreign_key_rules": [
+        "every arm event payload path joins one descriptor with equal oracle case run instance frame and channel fields",
+        "every snapshot required_channel_id expands to the exact per-site per-layer channel inventory and joins one descriptor per expansion",
+        "no descriptor may reference a case run frame layer site or role outside the frozen case plan, run matrix, selections, and channel rules"
+      ],
+      "canonical_json_payload_schemas": {
+        "topk": {
+          "closed_object": true,
+          "required_fields": [
+            "adjacent_margins_f32",
+            "cutoff_margin_f32",
+            "greedy_token_id",
+            "rank_33_token_id",
+            "rank_33_value_f32",
+            "ranked_token_ids",
+            "ranked_values_f32"
+          ],
+          "field_types": {
+            "adjacent_margins_f32": "31 finite JSON numbers equal to ranked_values_f32[i]-ranked_values_f32[i+1] after float32 rounding",
+            "cutoff_margin_f32": "finite JSON number equal to ranked_values_f32[31]-rank_33_value_f32 after float32 rounding",
+            "greedy_token_id": "u32 equal to ranked_token_ids[0]",
+            "rank_33_token_id": "u32 token ID distinct from every ranked_token_ids entry",
+            "rank_33_value_f32": "finite JSON number exactly representing the float32 rank-33 logit",
+            "ranked_token_ids": "32 unique u32 token IDs in descending float32 value then ascending token-ID order",
+            "ranked_values_f32": "32 finite JSON numbers exactly representing the ordered float32 logits"
+          },
+          "verifier_rule": "recompute every field from the bound full_vocab_logits payload and reject any mismatch"
+        },
+        "render_rejection": {
+          "closed_object": true,
+          "required_fields": [
+            "case_id",
+            "native_exception_text",
+            "stable_rejection_code"
+          ],
+          "field_types": {
+            "case_id": "exact frozen renderer-reject case ID matching the event and manifest",
+            "native_exception_text": "informational UTF-8 string or null; never used as the stable comparison authority",
+            "stable_rejection_code": "exact case_plan.render_rejection_codes[case_id] value and exact event stable_rejection_code"
+          },
+          "stable_code_mapping": {
+            "reject-invalid-reasoning-effort": "invalid_reasoning_effort",
+            "reject-system-not-first": "system_message_must_be_first"
+          }
+        }
+      },
+      "closed_records": true,
+      "path_uniqueness_key": "path",
+      "path_must_be_beneath": "payload/",
+      "shape_rule": "tensor shapes contain only positive concrete JSON integers; symbolic dimensions are forbidden in produced bundles",
+      "tensor_byte_length_rule": "byte_length=4*product(shape) with checked unsigned-64-bit multiplication for both f32le and u32le",
+      "payload_byte_length_rule": "byte_length equals the regular-file length",
+      "hash_rule": "sha256 equals the regular-file bytes",
+      "one_record_per_payload": true,
+      "manifest_covers_every_payload_regular_file_exactly_once": true
+    },
+    "verifier_parser_outcomes_jsonl": {
+      "owner": "external_project_conversation_profile_verifier",
+      "location": "verifier/parser-outcomes.jsonl_outside_both_arm_roots",
+      "closed_records": true,
+      "required_fields": [
+        "actual_text",
+        "actual_tool_calls",
+        "case_corpus_sha256",
+        "case_id",
+        "expected_outcome_sha256",
+        "parser_harness_sha256",
+        "record_type"
+      ],
+      "record_type": "parser_outcome",
+      "field_types": {
+        "actual_text": "UTF-8 string preserving every non-tool byte exactly",
+        "actual_tool_calls": "ordered canonical-JSON array of closed name-and-arguments objects",
+        "case_corpus_sha256_parser_harness_sha256": "lowercase hex SHA-256 of the exact raw corpus and parser entrypoint bytes",
+        "case_id": "one frozen parser case ID",
+        "expected_outcome_sha256": "SHA-256 of canonical JSON containing the case expected_text and expected_tool_calls",
+        "record_type": "exactly parser_outcome"
+      },
+      "cardinality": "exactly one record for every parser case and no other case",
+      "comparison": "actual_text_and_actual_tool_calls_equal_the_exact_expected_values_bound_in_cases_jsonl",
+      "parser_harness_binding": "every record uses one identical parser_harness_sha256; it equals the detached seal parser_harness_sha256 and the matching parser_harness_path entry in the comparison-harness inventory",
+      "arm_producers_may_write": false
+    },
+    "receipt_json": {
+      "closed_schema": true,
+      "required_fields_source": "producer-contracts.receipt_required_fields",
+      "value_schema_source": "producer-contracts.receipt_field_contracts",
+      "producer_verdict_fields_forbidden": true,
+      "all_identity_hashes_verified_before_payload_acceptance": true
+    },
+    "detached_seal_json": {
+      "owner": "third_party_verifier",
+      "location": "outside_both_arm_roots",
+      "closed_schema": true,
+      "required_fields": [
+        "arm_inventory_sha256",
+        "bundle_inventory_sha256",
+        "comparison_harness_sha256",
+        "parser_harness_path",
+        "parser_harness_sha256",
+        "producer_contracts_sha256",
+        "schema",
+        "trace_schema_sha256"
+      ],
+      "field_types": {
+        "arm_inventory_sha256": "lowercase hex SHA-256 of arm_inventory_sha256_rule",
+        "bundle_inventory_sha256": "lowercase hex SHA-256 of bundle_inventory_sha256_rule",
+        "comparison_harness_sha256": "lowercase hex SHA-256 of a canonical path-byte_length-sha256 inventory for every verifier and comparison harness regular file",
+        "parser_harness_path": "canonical relative path to the sole parser entrypoint within the comparison-harness inventory",
+        "parser_harness_sha256": "lowercase hex SHA-256 of the exact parser_harness_path regular-file bytes and equal to every parser outcome record",
+        "producer_contracts_sha256": "exact raw producer-contracts.json SHA-256 bound by contract.json",
+        "schema": "exactly hyperion.qwen38-detached-seal.v1",
+        "trace_schema_sha256": "exact raw trace-schema.json SHA-256 bound by contract.json"
+      },
+      "producer_may_write": false,
+      "arm_inventory_sha256_rule": "sha256_of_canonical_json_array_sorted_by_path_of_every_arm_regular_file_path_byte_length_and_sha256",
+      "bundle_inventory_sha256_rule": "sha256_of_canonical_json_array_sorted_by_path_of_every_regular_file_under_arms_and_verifier_with_path_byte_length_and_sha256",
+      "seal_covers_events_manifest_receipt_every_payload_and_shared_verifier_outputs": true,
+      "integrity_binding_not_authentication_or_remote_attestation": true,
+      "trusted_verifier_controlled_path_and_runner_required": true
+    },
+    "required_payload_inventory": {
+      "renderer_success_case": [
+        "one rendered_utf8 bytes payload",
+        "one input_ids u32le tensor payload"
+      ],
+      "renderer_reject_case": [
+        "one render_rejection canonical-json payload",
+        "zero model-run payloads"
+      ],
+      "parser_case": [
+        "zero arm payloads; exactly one record in verifier/parser-outcomes.jsonl owned by the external project verifier"
+      ],
+      "every_call": [
+        "one position_ids u32le tensor payload",
+        "one full_vocab_logits f32le tensor payload",
+        "one topk canonical-json payload"
+      ],
+      "behavior_run_end": [
+        "one greedy_token_ids u32le tensor payload",
+        "one free_running_utf8 bytes payload"
+      ],
+      "instrumented_snapshot": [
+        "one selected_hidden_states f32le tensor for each of the ten selected site_or_role values",
+        "one native_gdn_recurrent_state and one native_gdn_conv_state f32le tensor for each of the four selected GDN layers",
+        "one native_full_attention_kv f32le tensor for each K and V site_or_role at each of the three selected full-attention layers"
+      ],
+      "forbidden": "missing, extra, duplicate, cross-run, cross-case, cross-oracle, symbolic-shape, unmanifested, or unreferenced payloads"
+    }
+  },
+  "validation_edges": [
+    {
+      "id": "instrumentation_control",
+      "left": "behavior_monolithic.generate-canonical-dual-stop",
+      "right": "trace_monolithic.generate-canonical-dual-stop",
+      "required_alignment": "all_generation_prediction_frames_logits_topk_tokens_and_termination"
+    },
+    {
+      "id": "post_prefill_all_schedules",
+      "left": "trace_monolithic.post_prefill",
+      "right": "trace_token_serial_prefill.post_prefill,trace_conv_boundary_prefill.post_prefill",
+      "required_alignment": "logits_hidden_normalized_gdn_recurrent_conv_and_logical_kv"
+    },
+    {
+      "id": "conv_boundary_prefixes",
+      "left": "trace_token_serial_prefill.logical_prefix_3_4_5",
+      "right": "trace_conv_boundary_prefill.logical_prefix_3_4_5",
+      "required_alignment": "teacher_forced_logits_hidden_normalized_gdn_recurrent_conv_and_logical_kv"
+    }
+  ],
+  "cross_oracle_comparison": {
+    "arms": [
+      "transformers",
+      "mlx_lm"
+    ],
+    "logical_join_key": [
+      "case_id",
+      "run_id",
+      "record_or_frame_kind",
+      "call_index",
+      "boundary_tag",
+      "logical_prefix",
+      "channel",
+      "site_or_role",
+      "layer",
+      "selected_position_ids"
+    ],
+    "cardinality": "every required comparable logical event and payload record from either arm has exactly one counterpart in the other arm; unmatched missing extra or duplicate records are fatal",
+    "descriptor_rule": "joined exact channels have identical logical descriptors and bytes; joined numeric channels have identical stored dtype axes and logical shape after verifier-owned normalization, while native raw shape and axes remain receipted",
+    "coverage": "compare every applicable channel declared by comparison_metrics at every required case run frame call snapshot site and layer; subset selection is forbidden",
+    "parser_rule": "parser outcomes are verifier-owned shared evidence and are validated once rather than treated as two independent model-arm votes",
+    "producer_may_filter_or_select_pairs": false
+  },
+  "bundle": {
+    "arm_root": "arms/<oracle_id>",
+    "arm_files": [
+      "events.jsonl",
+      "payload-manifest.jsonl",
+      "receipt.json"
+    ],
+    "payload_root": "payload",
+    "shared_verifier_root": "verifier",
+    "shared_verifier_files": [
+      "parser-outcomes.jsonl"
+    ],
+    "comparison_report": "absent_from_v1_raw_evidence_bundle; tolerance_and_comparison_report_schema_requires_a_reviewed_superseding_contract_after_clean_repeats_and_fault_injection",
+    "arms_publish_independently": true,
+    "producer_reads_other_arm": false,
+    "producer_authored_pass_fields_forbidden": true,
+    "third_party_verifier_required": true,
+    "detached_external_seal_required": true,
+    "exact_regular_file_inventory_required": true,
+    "symlinks_hardlinks_and_special_files_forbidden": true,
+    "atomic_publication_required_but_unimplemented": true
+  },
+  "comparison_metrics": {
+    "exact": [
+      "free_running_utf8",
+      "rendered_utf8",
+      "render_rejection_code",
+      "input_ids",
+      "position_ids",
+      "greedy_token_ids",
+      "termination_reason",
+      "parser_outcome"
+    ],
+    "numeric": {
+      "accumulation": "float64_in_canonical_row_major_order",
+      "nonfinite": "any_nonfinite_input_is_a_hard_failure_and_is_counted_before_reduction",
+      "max_abs": "max_i(abs(a_i-b_i))",
+      "max_relative": "max_i(abs(a_i-b_i)/max(abs(a_i),abs(b_i),2^-24))",
+      "root_mean_square": "sqrt(sum_i((a_i-b_i)^2)/N)",
+      "cosine_distance": "1-dot(a,b)/(l2(a)*l2(b)); both_zero=0; exactly_one_zero=1",
+      "topk_overlap": "cardinality(set(ids_a[0:32]) intersect set(ids_b[0:32]))/32",
+      "greedy_margin": "rank_1_value-rank_2_value",
+      "cutoff_margin": "rank_32_value-rank_33_value",
+      "reduction_axes": "all_elements_of_each_named_tensor_then_report_per_channel_layer_frame_and_global_max"
+    },
+    "state_diagnostics": {
+      "accumulation": "float64_in_canonical_row_major_order",
+      "l2_norm": "sqrt(sum_i(x_i^2))",
+      "state_max_magnitude": "max_i(abs(x_i))",
+      "finite_count": "sum_i(isfinite(x_i)); must equal product(shape)",
+      "scope": "report per state channel layer frame and global maximum where a maximum is defined"
+    },
+    "verifier_derived": [
+      "generated_tool_parse_under_pinned_conversation_profile",
+      "thinking_tag_boundary_sequence",
+      "stop_and_max_step_termination"
+    ]
+  },
+  "tolerances": {
+    "status": "unfrozen_requires_clean_repeat_and_injected_fault_measurement",
+    "numeric_thresholds": null,
+    "producer_may_decide_pass": false
+  }
+}

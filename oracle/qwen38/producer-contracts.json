@@ -1,0 +1,916 @@
+{
+  "schema": "hyperion.qwen38-producer-contracts.v1",
+  "state": "semantic_modes_frozen_environments_unbuilt",
+  "binds": {
+    "case_corpus_sha256": "2a1c23a1baa9ea8566fce71d452272202eddf71e83190c930389fce94097fda3",
+    "source_manifest_sha256": "450ff5ada441702f54e8da2cd3c92a207ab1b3bdbaa6254427556d9afa4ff91a",
+    "source_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+    "trace_schema_path": "oracle/qwen38/trace-schema.json",
+    "trace_schema_sha256": "41afbb8fbe9c15f4b08f1e3196ea2c8920be166e7666bf639a28e83f100980f8"
+  },
+  "common": {
+    "batch_size": 1,
+    "padding": false,
+    "weights": "verified_checkpoint_bfloat16",
+    "gdn_recurrent_state": "float32",
+    "mode": "evaluation_inference_only",
+    "generation": "direct_forward_fixed_step_greedy_no_generate_api",
+    "argmax": "float32_logits_descending_value_then_ascending_token_id",
+    "stop": "include_stop_then_no_later_forward",
+    "max_steps": 16,
+    "fresh_process_per_run": true,
+    "fresh_cache_per_case": true,
+    "attention_mask": null,
+    "logical_positions": "absolute_arange_from_cache_offset_with_no_padding",
+    "quantization": false,
+    "vision": false,
+    "mtp": false,
+    "adapters": false,
+    "network_during_execution": false,
+    "source_verified_before_and_after": true,
+    "producer_reads_other_arm": false,
+    "producer_compares_or_decides_pass": false,
+    "snapshots_materialized_before_cache_mutation": true,
+    "forward_result_materialized_before_next_call": true
+  },
+  "input_preparation": {
+    "state": "semantic_mode_frozen_output_bundle_unproduced",
+    "ownership": "each_arm_executes_the_same_checkpoint_profile_independently; equality_is_a_shared_dependency_check_not_a_model_math_vote",
+    "tokenizer_loader": "AutoTokenizer.from_pretrained(source_root,use_fast=False,local_files_only=True,trust_remote_code=False)",
+    "expected_class": "Qwen2Tokenizer",
+    "render_call": "tokenizer.apply_chat_template(messages,tools=(tools if tools else None),tokenize=False,**template_args)",
+    "tokenize_call": "tokenizer(rendered,add_special_tokens=False,padding=False,truncation=False,return_attention_mask=False,return_token_type_ids=False)['input_ids']",
+    "rendered_encoding": "utf8_no_bom_exact_no_cleanup",
+    "input_ids": "one_unpadded_sequence_exactly_matching_rendered_utf8",
+    "rejection_mapping": "project_owned_stable_code_with_native_exception_text_informational_only",
+    "parser_owner": "project_conversation_profile_verifier_not_either_model_oracle",
+    "arm_may_consume_other_arm_input_bundle": false,
+    "exact_input_bundle_sha256": "unfrozen_until_both_arms_independently_match",
+    "tokenizer_sources": {
+      "transformers": {
+        "repository": "huggingface/transformers",
+        "revision": "95940bf8775059a42f047256f076e4f607bc43ec",
+        "tokenization_auto_sha256": "06115e3944dd73a2379a440f8131208dfaf1639a3992f29dce2d17f0e34785e0",
+        "tokenization_qwen2_sha256": "fac4e6576bfe2369731be147a4e530f262bdf32f2ac50436f96f0d8bdd2fc628"
+      },
+      "mlx_lm": {
+        "distribution": "transformers==5.14.1_from_oracle_uv_lock",
+        "tokenization_auto_sha256": "9671978def50b490756a2b211c7c4036b0f8924bdd51105c6e7ca9dcceec0c8f",
+        "tokenization_qwen2_sha256": "fac4e6576bfe2369731be147a4e530f262bdf32f2ac50436f96f0d8bdd2fc628"
+      }
+    }
+  },
+  "separation": {
+    "dedicated_environment_per_arm": true,
+    "dedicated_entrypoint_per_arm": true,
+    "distinct_process_or_host": true,
+    "shared_current_oracle_environment_as_two_arms_forbidden": true,
+    "environment_and_entrypoint_aliases_forbidden": true
+  },
+  "trust_boundary": {
+    "trusted_isolated_runner_required": true,
+    "remote_hardware_attestation_provided": false,
+    "source_and_environment_mounted_immutable_during_each_child": true,
+    "concurrent_mutation_allowed": false,
+    "producer_receipt_is_evidence_not_self_authenticating_proof": true,
+    "external_verifier_recomputes_every_available_identity": true
+  },
+  "arms": [
+    {
+      "id": "transformers",
+      "repository": "huggingface/transformers",
+      "revision": "95940bf8775059a42f047256f076e4f607bc43ec",
+      "state": "semantic_mode_frozen_environment_missing",
+      "critical_sources": [
+        {
+          "path": "src/transformers/cache_utils.py",
+          "sha256": "0d5fd6901ce2b7108eff40e06d7ce29e9b0f9cc8ed2f40d2fb3a2e4d4f43e630"
+        },
+        {
+          "path": "src/transformers/integrations/hub_kernels.py",
+          "sha256": "50e5b5f938cdb2c5a2f7e90ae1ab3933cb2d505ab38c6c4f4d0226320df4b94a"
+        },
+        {
+          "path": "src/transformers/masking_utils.py",
+          "sha256": "e8c497af6979274fc6ae78980ad9893e7850bdb750e46d459f09178123992196"
+        },
+        {
+          "path": "src/transformers/modeling_rope_utils.py",
+          "sha256": "a8bf3f6a53760366fb5fa51cecc06a8707d3cded36fd8f3ac51e140c0718af21"
+        },
+        {
+          "path": "src/transformers/modeling_utils.py",
+          "sha256": "a7392c26dd2f005383cc3c1f8562638a6039d393ca03fb1933513479a6d264e4"
+        },
+        {
+          "path": "src/transformers/models/auto/tokenization_auto.py",
+          "sha256": "06115e3944dd73a2379a440f8131208dfaf1639a3992f29dce2d17f0e34785e0"
+        },
+        {
+          "path": "src/transformers/models/qwen2/tokenization_qwen2.py",
+          "sha256": "fac4e6576bfe2369731be147a4e530f262bdf32f2ac50436f96f0d8bdd2fc628"
+        },
+        {
+          "path": "src/transformers/models/qwen3_5/configuration_qwen3_5.py",
+          "sha256": "3c01b3cdcff8d77cbafac9841bc48c41e5a5b38637231f1bde3d843cd198dbaf"
+        },
+        {
+          "path": "src/transformers/models/qwen3_5/modeling_qwen3_5.py",
+          "sha256": "90d929129ffc835d2652c604925c4f3842bc6e401e174ec6f0db2285dfb8f85a"
+        }
+      ],
+      "environment": {
+        "lock_state": "separate_lock_required_before_execution",
+        "current_oracle_lock_may_not_be_used": true,
+        "python": "3.12.13_required_candidate_build_unselected",
+        "torch_wheel_and_backend": "unfrozen",
+        "accelerator": "recommended_single_cuda_80gb_class_unverified_until_host_selection",
+        "cpu_or_disk_offload": false,
+        "distributed_or_sharded": false
+      },
+      "load": {
+        "class": "Qwen3_5ForConditionalGeneration",
+        "loader": "Qwen3_5ForConditionalGeneration.from_pretrained",
+        "source": "verified_local_tree_only",
+        "torch_dtype": "torch.bfloat16",
+        "attn_implementation": "eager",
+        "device_placement": "entire_model_on_cuda_0_without_device_map",
+        "output_loading_info": true,
+        "local_files_only": true,
+        "trust_remote_code": false,
+        "strict_text_parameter_closure": true,
+        "executed_prefixes": [
+          "model.language_model.",
+          "lm_head."
+        ],
+        "allowed_loaded_but_unexecuted_prefixes": [
+          "model.visual."
+        ],
+        "required_ignored_prefixes": [
+          "mtp."
+        ],
+        "randomly_initialized_text_parameters_allowed": false
+      },
+      "execution": {
+        "forward_target": "Qwen3_5ForConditionalGeneration.forward",
+        "forward_kwargs": "input_ids,attention_mask=None,position_ids,past_key_values,use_cache=True,logits_to_keep=1; every vision/video/input_embedding/label argument omitted",
+        "model_eval": true,
+        "torch_inference_mode": true,
+        "autocast": false,
+        "torch_compile": false,
+        "attention_implementation": "eager",
+        "cache": "DynamicCache(config=model.config)",
+        "use_cache": true,
+        "logits_to_keep": 1,
+        "logits_selection": "outputs.logits[:, -1, :]",
+        "input_ids_dtype": "torch.int64",
+        "position_ids_dtype": "torch.int64",
+        "position_mapping": "four_equal_planes_[text,time,height,width]_shape_[4,1,call_tokens]_from_canonical_absolute_positions",
+        "hub_kernel_environment": "USE_HUB_KERNELS=NO_before_python_import",
+        "optional_imports_must_be_absent": [
+          "causal_conv1d",
+          "fla",
+          "flash_attn",
+          "kernels",
+          "xformers"
+        ],
+        "gdn_prefill_path": "pinned_torch_chunk_gated_delta_rule",
+        "gdn_decode_path": "pinned_torch_recurrent_gated_delta_rule",
+        "conv_path": "pinned_torch_causal_conv1d_functions",
+        "resolved_callable_origins_must_be_receipted": true
+      },
+      "instrumentation": {
+        "state": "algorithm_frozen_entrypoint_unbuilt",
+        "stock_forward_target": "Qwen3_5ForConditionalGeneration.forward",
+        "capture_route": "temporary_read_only_torch_forward_hooks",
+        "module_mapping": {
+          "embedding_output": "model.model.language_model.embed_tokens output",
+          "decoder_output_<i>": "model.model.language_model.layers[i] returned hidden tensor",
+          "final_norm_output": "model.model.language_model.norm output"
+        },
+        "selected_layers_only": [
+          0,
+          2,
+          3,
+          30,
+          31,
+          32,
+          62,
+          63
+        ],
+        "hook_returns_none": true,
+        "hooks_removed_after_each_forward_including_error": true,
+        "output_hidden_states_kwarg_used": false,
+        "global_monkeypatch": false,
+        "fresh_cache_stock_control": "behavior_monolithic_vs_trace_monolithic"
+      },
+      "determinism": {
+        "pythonhashseed": "0",
+        "cublas_workspace_config": ":4096:8",
+        "python_numpy_torch_seed": 0,
+        "deterministic_algorithms": "enabled_warn_only_false",
+        "cudnn_benchmark": false,
+        "float32_precision_apis": "torch.backends.fp32_precision='ieee';torch.backends.cuda.matmul.fp32_precision='ieee'",
+        "bfloat16_reduced_precision_and_split_k": [
+          false,
+          false
+        ],
+        "fp16_reduced_precision_and_split_k": [
+          false,
+          false
+        ],
+        "unsupported_deterministic_operation": "fatal"
+      },
+      "snapshot": "detach_clone_contiguous_device_sync_host_copy_then_hash"
+    },
+    {
+      "id": "mlx_lm",
+      "repository": "ml-explore/mlx-lm",
+      "revision": "8239c72de5a0e42c539e30489021db73c7fe258c",
+      "state": "semantic_mode_frozen_environment_candidate_unexecuted",
+      "critical_sources": [
+        {
+          "path": "mlx_lm/models/base.py",
+          "sha256": "61330e1c065739cd712bfeb09d673f33797cde7e613e95bf6d9ebbee9006f373"
+        },
+        {
+          "path": "mlx_lm/models/cache.py",
+          "sha256": "819ed95dcbf755652363cfdb15a639890447abb534a06dcefd52c7fff5055750"
+        },
+        {
+          "path": "mlx_lm/models/gated_delta.py",
+          "sha256": "79c8376a51c694b03e54d2f996ced6ea6c8c42868b8571529f97334db165a3e1"
+        },
+        {
+          "path": "mlx_lm/models/qwen3_5.py",
+          "sha256": "cdcfbf22681d2005f4bdff53ab9ab06da7aeb71c0e89378f65f893beeaf0b47c"
+        },
+        {
+          "path": "mlx_lm/models/qwen3_next.py",
+          "sha256": "3c572fe3fbb36721efab4d80d1bb6af11beb4ad1caae18deefc9fc84cbcd9b79"
+        },
+        {
+          "path": "mlx_lm/models/rope_utils.py",
+          "sha256": "9f68c938c040fa111d13f2ed95c70e8261515fb3b54f8a0a474c096baf4e087a"
+        },
+        {
+          "path": "mlx_lm/utils.py",
+          "sha256": "9473634d92dbba39d5133a7a92062c00a642aeb3b7477478d87a67ce5f34c22c"
+        }
+      ],
+      "environment": {
+        "lock_state": "existing_lock_candidate_unexecuted_for_qwen",
+        "lock_path": "oracle/uv.lock",
+        "lock_sha256": "b59b9022be34f429962150b4aa6a8339b7d4250c6ec814294b5d0d47663c540e",
+        "python": "3.12.x_lock_candidate_exact_executable_build_and_patch_unfrozen",
+        "mlx": "0.32.0",
+        "mlx_lm_revision": "8239c72de5a0e42c539e30489021db73c7fe258c",
+        "selected_mlx_metal_wheel": "unfrozen_until_host_selection",
+        "accelerator": "recommended_apple_silicon_metal_96gb_or_128gb_unverified_until_host_selection",
+        "pipeline_or_distributed": false
+      },
+      "load": {
+        "class": "mlx_lm.models.qwen3_5.Model",
+        "loader": "mlx_lm.utils.load_model(Path(source_root),lazy=False,strict=True,model_config=None)",
+        "source": "verified_full_unmodified_checkpoint_tree_then_pinned_Model.sanitize_to_text",
+        "model_file_config_field_must_be_absent": true,
+        "lazy": false,
+        "strict": true,
+        "strict_text_parameter_closure": true,
+        "source_selected_prefixes": [
+          "model.language_model.",
+          "lm_head."
+        ],
+        "runtime_parameter_prefixes": [
+          "language_model.lm_head.",
+          "language_model.model."
+        ],
+        "required_omitted_prefixes": [
+          "model.visual.",
+          "mtp."
+        ],
+        "randomly_initialized_text_parameters_allowed": false
+      },
+      "execution": {
+        "forward_target": "mlx_lm.models.qwen3_5.Model.__call__",
+        "forward_kwargs": "inputs,cache=cache,input_embeddings=None",
+        "model_training": false,
+        "device": "mlx_gpu_metal",
+        "stream": "default_gpu_stream",
+        "global_compile_wrapper": false,
+        "cache": "model.make_cache_48_arrayscache_16_kvcache",
+        "logits_selection": "logits[:, -1, :]",
+        "input_ids_dtype": "mx.int32",
+        "position_mapping": "cache_offset_driven_canonical_absolute_positions",
+        "gdn_primary_path": "stock_metal_eval_kernel",
+        "gdn_ops_fallback": "diagnostic_only_never_silent_primary",
+        "mx_eval_logits_and_all_cache_leaves_after_every_forward": true,
+        "mx_gpu_synchronize_before_host_copy": true,
+        "default_device_gpu_assertion": true,
+        "metal_available_assertion": true,
+        "stock_kernel_route_assertion_per_call": true,
+        "resolved_kernel_and_callable_origins_must_be_receipted": true
+      },
+      "instrumentation": {
+        "state": "algorithm_frozen_entrypoint_unbuilt",
+        "stock_forward_target": "mlx_lm.models.qwen3_5.Model.__call__",
+        "capture_route": "producer_entrypoint_explicit_text_orchestration_without_module_monkeypatch",
+        "object_paths": {
+          "embed_tokens": "model.language_model.model.embed_tokens",
+          "layers": "model.language_model.model.pipeline_layers",
+          "final_norm": "model.language_model.model.norm",
+          "lm_head": "model.language_model.lm_head"
+        },
+        "orchestration": [
+          "assert pipeline_size=1 pipeline_rank=0 ssm_idx=0 fa_idx=3 and exactly 64 pipeline_layers with the frozen layer-kind pattern",
+          "embed inputs once and capture embedding_output",
+          "build fa_mask with pinned create_attention_mask(hidden,cache[fa_idx]) and ssm_mask with pinned create_ssm_mask(hidden,cache[ssm_idx]) exactly once per call",
+          "for each ordered layer and cache entry choose ssm_mask for GDN or fa_mask for full attention, call the pinned layer, and capture selected post-block decoder outputs",
+          "apply the pinned final norm once, capture final_norm_output, then apply the untied pinned lm_head once",
+          "evaluate logits selected captures and every cache leaf together, synchronize the default Metal GPU stream, then host-copy snapshots"
+        ],
+        "global_monkeypatch": false,
+        "fresh_cache_stock_control": "behavior_monolithic_vs_trace_monolithic"
+      },
+      "determinism": {
+        "pythonhashseed": "0",
+        "python_numpy_mlx_seed": 0,
+        "greedy_only": true,
+        "unexpected_device_or_ops_fallback": "fatal"
+      },
+      "snapshot": "copy_materialize_mx_eval_gpu_sync_host_copy_then_hash"
+    }
+  ],
+  "parameter_closure": {
+    "state": "required_algorithm_frozen_implementation_pending",
+    "expected_source_tensor_counts": {
+      "mtp_omitted": 15,
+      "selected_text_and_lm_head": 851,
+      "total": 1199,
+      "vision_loaded_or_omitted_by_arm": 333
+    },
+    "requirements": [
+      "parse model.safetensors.index.json with duplicate-key rejection and require every weight_map entry to name a verified shard",
+      "parse every safetensors header with bounded lengths; reject duplicate tensor names, invalid dtype/shape, overlapping or out-of-range offsets, and unaccounted trailing payload bytes",
+      "require the index tensor-name set to equal the union of shard-header tensor names and require weight_map[name] to equal the unique shard whose header contains name",
+      "for every tensor require data-region byte length to equal checked dtype_size*product(shape), and require all declared tensor regions to form an exact nonoverlapping gap-free partition of each shard data payload with no leading inter-tensor or trailing bytes",
+      "classify every source tensor exactly once as selected text, loaded-but-unexecuted vision where allowed, or required omission MTP/vision",
+      "apply the pinned arm-specific rename and sanitation plan, recording every source-to-runtime mapping exactly once",
+      "require instantiated runtime text parameter names, shapes, and dtypes to equal the mapped selected inventory",
+      "reject every missing, unexpected, duplicate, unmapped, or randomly initialized text parameter"
+    ],
+    "execution_may_begin_before_implementation": false
+  },
+  "receipt_required_fields": [
+    "argv",
+    "backend_and_device",
+    "cache_inventory",
+    "case_corpus_sha256",
+    "command_environment_allowlist",
+    "contract_sha256",
+    "conversation_and_input_bundle_sha256",
+    "critical_import_origins_and_hashes",
+    "determinism_controls",
+    "effective_forward_routes_and_static_kwargs",
+    "environment_lock_sha256",
+    "environment_tree_identity",
+    "installed_distribution_inventory",
+    "machine_profile_without_serial_numbers",
+    "model_source_revision",
+    "oracle_id",
+    "oracle_implementation_revision",
+    "oracle_repository",
+    "parameter_dtype_device_and_prefix_inventory",
+    "per_call_kernel_route_evidence",
+    "process_inventory",
+    "producer_contracts_sha256",
+    "producer_entrypoint_sha256",
+    "publication_target",
+    "python_executable_and_abi",
+    "raw_payload_inventory_sha256",
+    "resolved_kernel_inventory",
+    "selected_distribution_artifact_hashes_and_direct_urls",
+    "source_manifest_sha256",
+    "source_post_verification",
+    "source_pre_verification",
+    "source_tree_identity",
+    "start_and_end_utc",
+    "trace_schema_sha256"
+  ],
+  "receipt_field_contracts": {
+    "closed_schema": true,
+    "sha256_fields": [
+      "case_corpus_sha256",
+      "contract_sha256",
+      "conversation_and_input_bundle_sha256",
+      "environment_lock_sha256",
+      "producer_contracts_sha256",
+      "producer_entrypoint_sha256",
+      "raw_payload_inventory_sha256",
+      "source_manifest_sha256",
+      "trace_schema_sha256"
+    ],
+    "commit_fields": [
+      "model_source_revision",
+      "oracle_implementation_revision"
+    ],
+    "string_fields": {
+      "oracle_id": "exactly transformers or mlx_lm",
+      "oracle_repository": "exact repository bound to oracle_id",
+      "publication_target": "canonical absolute path to the newly published arm root"
+    },
+    "nonempty_array_fields": {
+      "argv": "parent orchestrator ordered UTF-8 argv with argv[0] bound by producer_entrypoint_sha256; every child invocation is independently bound in process_inventory",
+      "cache_inventory": "exactly 128 ordered static cache-topology leaf entries: recurrent_state and conv_history for each of 48 GDN layers, K and V for each of 16 full-attention layers; dynamic offsets shapes and bytes live in trace events and payload manifests",
+      "critical_import_origins_and_hashes": "one closed entry for every frozen critical source and tokenizer source with import name resolved regular-file path distribution and SHA-256",
+      "effective_forward_routes_and_static_kwargs": "exactly two closed route entries named stock and instrumented, each binding its callable, signature, static kwargs, dynamic argument names, and any producer-owned capture adapter",
+      "installed_distribution_inventory": "every installed distribution with normalized name version resolved lock-source URL RECORD hash and complete installed-tree SHA-256",
+      "parameter_dtype_device_and_prefix_inventory": "every source tensor and runtime parameter joined exactly once with separate source and runtime names shapes dtypes and devices, including selected loaded-unexecuted and omitted classifications",
+      "per_call_kernel_route_evidence": "exactly 64 layer-route entries per executed forward call proving every GDN attention convolution and fallback route",
+      "process_inventory": "one input-preparation child plus exactly one fresh model-run child for every run/case pair in the trace run matrix",
+      "resolved_kernel_inventory": "closed ordered list of every model-math executable library metallib or generated-kernel definition identity without requiring an in-memory kernel to have a filesystem payload; OS framework images are represented by the backend/runtime receipt",
+      "selected_distribution_artifact_hashes_and_direct_urls": "every selected wheel or source archive with filename URL and SHA-256"
+    },
+    "nonempty_object_fields": {
+      "backend_and_device": "closed backend API device model pseudonymous device identity hardware capabilities driver runtime and effective default device",
+      "command_environment_allowlist": "closed map of only execution-consumed environment variables with secrets and unrelated host variables forbidden",
+      "determinism_controls": "closed effective values for every arm-specific determinism field, including split-K state",
+      "environment_tree_identity": "closed canonical site-packages-root inventory classified as distribution RECORD-owned or exact lock-reviewed environment bootstrap; no unclassified file or link may execute",
+      "machine_profile_without_serial_numbers": "closed OS kernel CPU or SoC physical RAM accelerator and host-class fields with serials and user identifiers forbidden",
+      "python_executable_and_abi": "closed canonical executable path implementation version build ABI and executable SHA-256",
+      "source_post_verification": "exact hyperion.qwen38-source-tree-identity.v1 record recomputed by the parent after every child exits",
+      "source_pre_verification": "exact hyperion.qwen38-source-tree-identity.v1 record recomputed by the parent before any child starts",
+      "source_tree_identity": "exact immutable source verification record selected for the arm and matched by every child pre/post identity hash",
+      "start_and_end_utc": "closed parent-orchestrator RFC3339 UTC interval containing every child interval"
+    },
+    "nested_required_fields": {
+      "backend_and_device": [
+        "accelerator",
+        "backend",
+        "capabilities_sha256",
+        "default_device",
+        "device_class",
+        "device_identity_sha256",
+        "device_name",
+        "driver",
+        "runtime"
+      ],
+      "cache_inventory_entry": [
+        "allocation_policy",
+        "cache_class",
+        "layer",
+        "native_axes",
+        "native_dtype",
+        "role"
+      ],
+      "critical_import_entry": [
+        "distribution",
+        "import_name",
+        "path",
+        "sha256"
+      ],
+      "determinism_controls": [
+        "contract_values",
+        "effective_values",
+        "unsupported_operation_observed"
+      ],
+      "distribution_entry": [
+        "installed_tree_sha256",
+        "name",
+        "record_sha256",
+        "resolved_source_url",
+        "version"
+      ],
+      "forward_route_entry": [
+        "callable_origin",
+        "callable_sha256",
+        "dynamic_arguments",
+        "instrumented",
+        "route_adapter",
+        "route_adapter_sha256",
+        "route_id",
+        "signature",
+        "static_kwargs",
+        "target"
+      ],
+      "environment_tree_identity": [
+        "bootstrap_file_count",
+        "bootstrap_inventory_sha256",
+        "environment_root",
+        "include_system_site_packages",
+        "inventory_sha256",
+        "payload_bytes",
+        "record_owned_file_count",
+        "regular_file_count",
+        "symlinks_and_hardlinks_rejected",
+        "unclassified_file_count"
+      ],
+      "kernel_route_entry": [
+        "attention_path",
+        "call_index",
+        "case_id",
+        "conv_path",
+        "gdn_path",
+        "layer",
+        "layer_kind",
+        "run_instance_id",
+        "unexpected_fallback_used"
+      ],
+      "machine_profile_without_serial_numbers": [
+        "accelerator",
+        "cpu_or_soc",
+        "kernel",
+        "os",
+        "physical_memory_bytes",
+        "serial_numbers_omitted"
+      ],
+      "memory_and_swap_before_peak_after": [
+        "accelerator_memory_authority",
+        "after_execution_bytes",
+        "after_load_bytes",
+        "before_load_bytes",
+        "diagnostic_only_noncomparable",
+        "memory_scope",
+        "peak_execution_bytes",
+        "sampling_interval_milliseconds",
+        "swap_after_bytes",
+        "swap_authority",
+        "swap_before_bytes",
+        "swap_peak_bytes",
+        "swap_scope",
+        "wired_memory_policy"
+      ],
+      "parameter_entry": [
+        "classification",
+        "runtime_device",
+        "runtime_dtype",
+        "runtime_name",
+        "runtime_shape",
+        "source_dtype",
+        "source_shape",
+        "source_tensor",
+        "transform"
+      ],
+      "python_executable_and_abi": [
+        "abi",
+        "build",
+        "executable_path",
+        "executable_sha256",
+        "implementation",
+        "stdlib_payload_bytes",
+        "stdlib_regular_file_count",
+        "stdlib_root",
+        "stdlib_symlinks_and_hardlinks_rejected",
+        "stdlib_tree_sha256",
+        "version"
+      ],
+      "process_entry": [
+        "argv",
+        "bytecode_writes_disabled",
+        "case_id",
+        "cwd",
+        "end_utc",
+        "environment_values_sha256",
+        "exit_code",
+        "memory_and_swap_before_peak_after",
+        "process_instance_id",
+        "process_kind",
+        "python_executable_sha256",
+        "run_id",
+        "run_instance_id",
+        "safe_path_enabled",
+        "source_post_identity_sha256",
+        "source_pre_identity_sha256",
+        "start_utc",
+        "sys_path",
+        "system_site_packages_disabled",
+        "user_site_disabled"
+      ],
+      "resolved_kernel_entry": [
+        "build_identity",
+        "generated_definition_sha256",
+        "kind",
+        "origin_file_sha256",
+        "origin_path",
+        "runtime_payload_sha256"
+      ],
+      "selected_distribution_artifact_entry": [
+        "direct_url",
+        "filename",
+        "name",
+        "sha256",
+        "version"
+      ],
+      "source_tree_identity": [
+        "exact_inventory",
+        "payload_bytes",
+        "payload_file_count",
+        "payload_tree_sha256",
+        "repository",
+        "revision",
+        "schema",
+        "symlinks_and_hardlinks_rejected"
+      ],
+      "start_and_end_utc": [
+        "end",
+        "start"
+      ]
+    },
+    "nested_field_types": {
+      "boolean": [
+        "determinism_controls.unsupported_operation_observed",
+        "environment_tree_identity.include_system_site_packages",
+        "environment_tree_identity.symlinks_and_hardlinks_rejected",
+        "forward_route_entry.instrumented",
+        "kernel_route_entry.unexpected_fallback_used",
+        "machine_profile_without_serial_numbers.serial_numbers_omitted",
+        "memory_and_swap_before_peak_after.diagnostic_only_noncomparable",
+        "process_entry.bytecode_writes_disabled",
+        "process_entry.safe_path_enabled",
+        "process_entry.system_site_packages_disabled",
+        "process_entry.user_site_disabled",
+        "python_executable_and_abi.stdlib_symlinks_and_hardlinks_rejected",
+        "source_tree_identity.exact_inventory",
+        "source_tree_identity.symlinks_and_hardlinks_rejected"
+      ],
+      "closed_object": [
+        "determinism_controls.contract_values",
+        "determinism_controls.effective_values",
+        "forward_route_entry.static_kwargs",
+        "process_entry.memory_and_swap_before_peak_after"
+      ],
+      "nonnegative_integer": [
+        "cache_inventory_entry.layer",
+        "environment_tree_identity.bootstrap_file_count",
+        "environment_tree_identity.payload_bytes",
+        "environment_tree_identity.record_owned_file_count",
+        "environment_tree_identity.regular_file_count",
+        "environment_tree_identity.unclassified_file_count",
+        "kernel_route_entry.call_index",
+        "kernel_route_entry.layer",
+        "machine_profile_without_serial_numbers.physical_memory_bytes",
+        "memory_and_swap_before_peak_after.after_execution_bytes",
+        "memory_and_swap_before_peak_after.after_load_bytes",
+        "memory_and_swap_before_peak_after.before_load_bytes",
+        "memory_and_swap_before_peak_after.peak_execution_bytes",
+        "memory_and_swap_before_peak_after.sampling_interval_milliseconds",
+        "memory_and_swap_before_peak_after.swap_after_bytes",
+        "memory_and_swap_before_peak_after.swap_before_bytes",
+        "memory_and_swap_before_peak_after.swap_peak_bytes",
+        "process_entry.exit_code",
+        "python_executable_and_abi.stdlib_payload_bytes",
+        "python_executable_and_abi.stdlib_regular_file_count",
+        "source_tree_identity.payload_bytes",
+        "source_tree_identity.payload_file_count"
+      ],
+      "positive_integer_array": [
+        "parameter_entry.runtime_shape",
+        "parameter_entry.source_shape"
+      ],
+      "sha256": [
+        "backend_and_device.capabilities_sha256",
+        "backend_and_device.device_identity_sha256",
+        "critical_import_entry.sha256",
+        "distribution_entry.installed_tree_sha256",
+        "distribution_entry.record_sha256",
+        "environment_tree_identity.bootstrap_inventory_sha256",
+        "environment_tree_identity.inventory_sha256",
+        "forward_route_entry.callable_sha256",
+        "forward_route_entry.route_adapter_sha256",
+        "process_entry.environment_values_sha256",
+        "process_entry.python_executable_sha256",
+        "process_entry.source_post_identity_sha256",
+        "process_entry.source_pre_identity_sha256",
+        "python_executable_and_abi.executable_sha256",
+        "python_executable_and_abi.stdlib_tree_sha256",
+        "resolved_kernel_entry.generated_definition_sha256",
+        "resolved_kernel_entry.origin_file_sha256",
+        "resolved_kernel_entry.runtime_payload_sha256",
+        "selected_distribution_artifact_entry.sha256",
+        "source_tree_identity.payload_tree_sha256"
+      ],
+      "string": [
+        "backend_and_device.accelerator",
+        "backend_and_device.backend",
+        "backend_and_device.default_device",
+        "backend_and_device.device_class",
+        "backend_and_device.device_name",
+        "backend_and_device.driver",
+        "backend_and_device.runtime",
+        "cache_inventory_entry.allocation_policy",
+        "cache_inventory_entry.cache_class",
+        "cache_inventory_entry.native_dtype",
+        "cache_inventory_entry.role",
+        "critical_import_entry.distribution",
+        "critical_import_entry.import_name",
+        "critical_import_entry.path",
+        "distribution_entry.name",
+        "distribution_entry.resolved_source_url",
+        "distribution_entry.version",
+        "environment_tree_identity.environment_root",
+        "forward_route_entry.callable_origin",
+        "forward_route_entry.route_adapter",
+        "forward_route_entry.route_id",
+        "forward_route_entry.signature",
+        "forward_route_entry.target",
+        "kernel_route_entry.attention_path",
+        "kernel_route_entry.case_id",
+        "kernel_route_entry.conv_path",
+        "kernel_route_entry.gdn_path",
+        "kernel_route_entry.layer_kind",
+        "kernel_route_entry.run_instance_id",
+        "machine_profile_without_serial_numbers.accelerator",
+        "machine_profile_without_serial_numbers.cpu_or_soc",
+        "machine_profile_without_serial_numbers.kernel",
+        "machine_profile_without_serial_numbers.os",
+        "memory_and_swap_before_peak_after.accelerator_memory_authority",
+        "memory_and_swap_before_peak_after.memory_scope",
+        "memory_and_swap_before_peak_after.swap_authority",
+        "memory_and_swap_before_peak_after.swap_scope",
+        "memory_and_swap_before_peak_after.wired_memory_policy",
+        "parameter_entry.classification",
+        "parameter_entry.runtime_device",
+        "parameter_entry.runtime_dtype",
+        "parameter_entry.runtime_name",
+        "parameter_entry.source_dtype",
+        "parameter_entry.source_tensor",
+        "parameter_entry.transform",
+        "process_entry.case_id",
+        "process_entry.cwd",
+        "process_entry.end_utc",
+        "process_entry.process_instance_id",
+        "process_entry.process_kind",
+        "process_entry.run_id",
+        "process_entry.run_instance_id",
+        "process_entry.start_utc",
+        "python_executable_and_abi.abi",
+        "python_executable_and_abi.build",
+        "python_executable_and_abi.executable_path",
+        "python_executable_and_abi.implementation",
+        "python_executable_and_abi.stdlib_root",
+        "python_executable_and_abi.version",
+        "resolved_kernel_entry.build_identity",
+        "resolved_kernel_entry.kind",
+        "resolved_kernel_entry.origin_path",
+        "selected_distribution_artifact_entry.direct_url",
+        "selected_distribution_artifact_entry.filename",
+        "selected_distribution_artifact_entry.name",
+        "selected_distribution_artifact_entry.version",
+        "source_tree_identity.repository",
+        "source_tree_identity.revision",
+        "source_tree_identity.schema",
+        "start_and_end_utc.end",
+        "start_and_end_utc.start"
+      ],
+      "string_array": [
+        "cache_inventory_entry.native_axes",
+        "forward_route_entry.dynamic_arguments",
+        "process_entry.argv",
+        "process_entry.sys_path"
+      ]
+    },
+    "nested_nullable_fields": [
+      "forward_route_entry.route_adapter",
+      "forward_route_entry.route_adapter_sha256",
+      "kernel_route_entry.attention_path",
+      "kernel_route_entry.conv_path",
+      "kernel_route_entry.gdn_path",
+      "parameter_entry.runtime_device",
+      "parameter_entry.runtime_dtype",
+      "parameter_entry.runtime_name",
+      "parameter_entry.runtime_shape",
+      "parameter_entry.transform",
+      "process_entry.case_id",
+      "process_entry.run_id",
+      "process_entry.run_instance_id",
+      "resolved_kernel_entry.generated_definition_sha256",
+      "resolved_kernel_entry.runtime_payload_sha256"
+    ],
+    "nested_digest_preimages": {
+      "backend_and_device.capabilities_sha256": "SHA-256 of canonical JSON containing the complete sorted backend capability name-and-effective-value map",
+      "backend_and_device.device_identity_sha256": "SHA-256 of b'hyperion-device-identity-v1\\0cuda\\0' followed by the 16 raw CUDA UUID bytes, or b'hyperion-device-identity-v1\\0metal\\0' followed by the unsigned 64-bit Metal registryID in big-endian order; only the digest is stored",
+      "critical_import_entry.sha256": "SHA-256 of the exact resolved regular-file import bytes",
+      "distribution_entry.installed_tree_sha256": "SHA-256 of the canonical JSON array sorted by normalized RECORD path containing path byte_length and observed sha256 for the exact RECORD-owned file set; missing extra or RECORD-hash-drift files are fatal",
+      "distribution_entry.record_sha256": "SHA-256 of the exact installed .dist-info/RECORD bytes",
+      "forward_route_entry.callable_sha256": "SHA-256 of the exact resolved regular source or executable file bytes containing the stock model callable used by the route",
+      "forward_route_entry.route_adapter_sha256": "SHA-256 of the exact producer entrypoint regular-file bytes implementing the instrumented hook or orchestration adapter; null for the stock route",
+      "environment_tree_identity.bootstrap_inventory_sha256": "SHA-256 of the canonical JSON array sorted by environment-root-relative path containing path byte_length and sha256 for every lock-reviewed bootstrap file not owned by a distribution RECORD, including any .pth or site customization file",
+      "environment_tree_identity.inventory_sha256": "SHA-256 of the canonical JSON array sorted by environment-root-relative path containing path byte_length sha256 and owning RECORD distribution or exact environment_bootstrap classification for every regular file",
+      "process_entry.environment_values_sha256": "SHA-256 of canonical JSON for the exact arm allowlist environment key-and-effective-value map inherited by that child",
+      "process_entry.python_executable_sha256": "SHA-256 of the exact Python executable regular-file bytes and equal to python_executable_and_abi.executable_sha256",
+      "process_entry.source_post_identity_sha256": "SHA-256 of canonical JSON for the exact post-execution hyperion.qwen38-source-tree-identity.v1 record and equal to the selected source_tree_identity",
+      "process_entry.source_pre_identity_sha256": "SHA-256 of canonical JSON for the exact pre-execution hyperion.qwen38-source-tree-identity.v1 record and equal to the selected source_tree_identity",
+      "python_executable_and_abi.executable_sha256": "SHA-256 of the exact Python executable regular-file bytes",
+      "python_executable_and_abi.stdlib_tree_sha256": "SHA-256 of the canonical JSON array sorted by stdlib-root-relative path containing path byte_length and sha256 for every regular file",
+      "resolved_kernel_entry.generated_definition_sha256": "for an in-memory generated kernel, SHA-256 of canonical JSON containing name input names output names source header init values grid and threadgroup; null for a purely file-backed kernel",
+      "resolved_kernel_entry.origin_file_sha256": "SHA-256 of the exact regular source file bytes that declare or load the kernel",
+      "resolved_kernel_entry.runtime_payload_sha256": "SHA-256 of exact loaded dylib metallib or executable payload bytes when a file-backed runtime payload exists; null for an in-memory-only generated kernel",
+      "selected_distribution_artifact_entry.sha256": "SHA-256 of the exact selected wheel or source-archive bytes",
+      "source_tree_identity.payload_tree_sha256": "exact hyperion.qwen38-source-tree-identity.v1 canonical path-length-content inventory digest"
+    },
+    "nested_semantic_rules": [
+      "every nested field is present exactly once; values obey nested_field_types, with null permitted only for nested_nullable_fields and all strings and arrays otherwise nonempty",
+      "cache_inventory is static topology with exactly 128 entries ordered by layer then role: GDN layers where layer mod 4 is 0,1,2 have recurrent_state and conv_history; full-attention layers where layer mod 4 is 3 have K and V; dynamic offsets shapes capacities and allocated bytes are forbidden here and are bound by trace events and payload manifests",
+      "per_call_kernel_route_evidence has exactly one entry for each executed call and layer 0..63; GDN layers have non-null gdn_path and conv_path with attention_path null, full-attention layers have non-null attention_path with gdn_path and conv_path null",
+      "kernel route layer_kind is gdn iff layer mod 4 is 0,1,2 and full_attention iff layer mod 4 is 3; unexpected_fallback_used is false in every accepted primary-arm record while the selected pure-Torch Transformers route is primary rather than an unexpected fallback",
+      "parameter classification is selected_text, loaded_unexecuted_vision, omitted_mtp, or omitted_vision; runtime fields and transform are all null exactly for omitted classifications and all non-null otherwise",
+      "parameter transform is identity, rename_only, rename_and_add_one, or rename_and_moveaxis_2_1 and matches the pinned arm sanitizer; every source tensor and runtime parameter participates in exactly one mapping",
+      "all byte counters use checked unsigned-64-bit bounds; layers are in 0..63; native and parameter shapes contain only positive JSON integers; all SHA-256 strings are lowercase hex",
+      "all paths are canonical absolute paths where host-resolved or canonical relative paths within their bound tree where inventory-relative; URLs are absolute HTTPS or the exact lock-resolved VCS source",
+      "effective_forward_routes_and_static_kwargs contains exactly stock and instrumented entries; each records only the frozen signature and static kwargs, dynamic_arguments are exact argument names whose per-call values join trace events and payloads, and route_adapter plus its hash are null exactly for stock",
+      "process_inventory contains exactly 13 entries: one input_preparation child with null case and run fields plus twelve model_run children covering every planned run/case pair with matching non-null IDs; every child uses a distinct process_instance_id, exit_code=0, python -B -s -P semantics, the same immutable source identity, and sys.path closed to the receipted environment and stdlib roots",
+      "each process_entry.memory_and_swap_before_peak_after is a closed diagnostic object whose authority scope interval and noncomparability fields equal receipt_field_contracts.per_arm_memory_diagnostic_profiles[oracle_id]; before load after load and after execution are boundary readings, peak execution uses the selected accelerator peak API and the maximum sampled host-global swap reading, and the accelerator peak counter is reset immediately after the after-load sample",
+      "memory and swap diagnostics are not acceptance metrics and are never compared across arms or hosts; they omit host RSS, CUDA reserved bytes, and untracked driver or OS allocations, while wired_memory_policy records the observed or deliberately selected host policy without implying equivalence",
+      "environment_tree_identity uses the canonical real site-packages root, inventories every regular file, assigns every distribution-owned file through its exact RECORD, binds every non-RECORD bootstrap file in bootstrap_inventory_sha256, and requires unclassified_file_count=0, include_system_site_packages=false, and symlinks_and_hardlinks_rejected=true",
+      "resolved kernel entries cover model-math code only and use generated_definition_sha256 exactly for in-memory generated kernels and runtime_payload_sha256 exactly when a file-backed runtime payload exists; origin_path and origin_file_sha256 are always required, while dyld shared-cache and OS framework identity belongs to backend_and_device",
+      "the effective environment values are PYTHONDONTWRITEBYTECODE=1 PYTHONHASHSEED=0 PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1, plus USE_HUB_KERNELS=NO and CUBLAS_WORKSPACE_CONFIG=:4096:8 for Transformers; CUDA_VISIBLE_DEVICES is the single receipted device selector",
+      "python_executable_and_abi inventories the canonical stdlib root separately and requires stdlib_symlinks_and_hardlinks_rejected=true; every child sys.path entry is a canonical real path under only the receipted stdlib or site-packages roots",
+      "start and end are RFC3339 UTC instants and end is not before start; exact_inventory, every link-rejection field, and serial_numbers_omitted are true; unsupported_operation_observed is false"
+    ],
+    "per_arm_environment_keys": {
+      "transformers": [
+        "CUBLAS_WORKSPACE_CONFIG",
+        "CUDA_VISIBLE_DEVICES",
+        "HF_HUB_OFFLINE",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONHASHSEED",
+        "PYTHONNOUSERSITE",
+        "PYTHONSAFEPATH",
+        "TRANSFORMERS_OFFLINE",
+        "USE_HUB_KERNELS"
+      ],
+      "mlx_lm": [
+        "HF_HUB_OFFLINE",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONHASHSEED",
+        "PYTHONNOUSERSITE",
+        "PYTHONSAFEPATH",
+        "TRANSFORMERS_OFFLINE"
+      ]
+    },
+    "per_arm_memory_diagnostic_profiles": {
+      "transformers": {
+        "accelerator_memory_authority": "torch.cuda.memory_allocated_and_max_memory_allocated_with_peak_reset_immediately_after_after_load_sample",
+        "diagnostic_only_noncomparable": true,
+        "memory_scope": "model_process_accelerator_allocator_active_bytes",
+        "sampling_interval_milliseconds": 10,
+        "swap_authority": "linux_proc_meminfo_swap_total_minus_swap_free_at_boundaries_and_parent_10ms_samples",
+        "swap_scope": "host_global_used_swap_bytes"
+      },
+      "mlx_lm": {
+        "accelerator_memory_authority": "mx.metal.get_active_memory_and_get_peak_memory_with_peak_reset_immediately_after_after_load_sample",
+        "diagnostic_only_noncomparable": true,
+        "memory_scope": "model_process_accelerator_allocator_active_bytes",
+        "sampling_interval_milliseconds": 10,
+        "swap_authority": "macos_sysctlbyname_vm.swapusage_used_at_boundaries_and_parent_10ms_samples",
+        "swap_scope": "host_global_used_swap_bytes"
+      }
+    },
+    "digest_preimages": {
+      "conversation_and_input_bundle_sha256": "SHA-256 of canonical JSON sorted by case_id containing case_id template_arguments_sha256 rendered byte_length rendered_sha256 input_ids_count and input_ids_sha256 for every renderer-success case plus stable rejection code for every renderer-reject case",
+      "raw_payload_inventory_sha256": "SHA-256 of the canonical JSON array sorted by path containing path byte_length and sha256 for every payload regular file and no other file",
+      "environment_lock_sha256": "SHA-256 of the exact selected lock-file bytes",
+      "producer_entrypoint_sha256": "SHA-256 of the exact regular-file entrypoint bytes",
+      "contract_sha256": "SHA-256 of oracle/qwen38/contract.json raw bytes",
+      "case_corpus_sha256": "SHA-256 of oracle/qwen38/cases.jsonl raw bytes",
+      "producer_contracts_sha256": "SHA-256 of oracle/qwen38/producer-contracts.json raw bytes",
+      "source_manifest_sha256": "SHA-256 of oracle/qwen38/source-manifest.json raw bytes",
+      "trace_schema_sha256": "SHA-256 of oracle/qwen38/trace-schema.json raw bytes"
+    },
+    "semantic_rules": [
+      "all arrays and objects are nonempty, duplicate-free under their natural identity key, closed to unknown fields, and sorted where order has no execution meaning",
+      "model_source_revision equals the pinned Qwen checkpoint revision while oracle_implementation_revision and oracle_repository equal the selected arm",
+      "parent source_pre_verification source_post_verification and source_tree_identity are byte-equivalent canonical objects with exact inventory true and symlink/hardlink rejection true; every child source identity hash equals that object",
+      "backend_and_device.device_identity_sha256 uses the exact domain-separated CUDA-UUID or big-endian Metal-registryID preimage above; the raw identifier, serial numbers, usernames, and hostnames are excluded from the receipt",
+      "each parameter entry has nonempty source_tensor source_shape and source_dtype; runtime_name runtime_shape runtime_dtype runtime_device and transform are all null exactly for an omitted classification and are all non-null for selected or loaded-unexecuted classifications",
+      "cache parameter package process kernel and payload inventories are mutually consistent with the source manifest trace events payload manifest and effective forward route; parent timestamps contain every child interval",
+      "empty placeholder attacker-controlled producer verdict agreement tolerance pass accepted or skipped values are forbidden"
+    ]
+  },
+  "publication": {
+    "state": "required_behavior_not_implemented",
+    "sibling_staging_directory": true,
+    "files_and_directories_fsynced": true,
+    "same_filesystem_atomic_rename": true,
+    "parent_directory_fsynced": true,
+    "existing_target_refused": true,
+    "manifest_written_last": true,
+    "no_skip_or_partial_success": true
+  },
+  "unfrozen": [
+    "transformers_dependency_lock_and_wheel_hashes",
+    "transformers_torch_cuda_and_cudnn_builds",
+    "transformers_gpu_model_driver_and_uuid",
+    "mlx_selected_wheel_machine_and_macos_build",
+    "both_installed_package_tree_digests",
+    "both_producer_entrypoints",
+    "both_clean_execution_receipts",
+    "both_exact_python_builds_and_executables",
+    "run_to_run_variance",
+    "numeric_tolerances",
+    "raw_payload_identities",
+    "rendered_and_tokenized_input_bundle_identity",
+    "cross_oracle_agreement",
+    "native_support"
+  ]
+}

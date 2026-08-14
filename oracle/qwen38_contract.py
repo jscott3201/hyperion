@@ -13,13 +13,24 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 
-CONTRACT_SCHEMA = "hyperion.qwen38-oracle-contract.v1"
+CONTRACT_SCHEMA = "hyperion.qwen38-oracle-contract.v2"
+PREVIOUS_CONTRACT_SCHEMA = "hyperion.qwen38-oracle-contract.v1"
+PREVIOUS_CONTRACT_SHA256 = "d837027aadc58c530f996841c98172f5a6b7307bf5f9fb22b46d333375bd2a4d"
 SOURCE_SCHEMA = "hyperion.qwen38-source-manifest.v1"
-VALIDATION_SCHEMA = "hyperion.qwen38-oracle-contract-validation.v1"
+TRACE_SCHEMA = "hyperion.qwen38-trace-schema.v1"
+PRODUCER_SCHEMA = "hyperion.qwen38-producer-contracts.v1"
+VALIDATION_SCHEMA = "hyperion.qwen38-oracle-contract-validation.v2"
 SOURCE_REPOSITORY = "Qwen/Qwen3.8-27B"
 SOURCE_REVISION = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
 SOURCE_MANIFEST_SHA256 = "450ff5ada441702f54e8da2cd3c92a207ab1b3bdbaa6254427556d9afa4ff91a"
 CASES_SHA256 = "2a1c23a1baa9ea8566fce71d452272202eddf71e83190c930389fce94097fda3"
+TRACE_SCHEMA_SHA256 = "41afbb8fbe9c15f4b08f1e3196ea2c8920be166e7666bf639a28e83f100980f8"
+TRACE_SCHEMA_CANONICAL_SHA256 = "17c3fbbca3272443ac15e979445438e2d0e10b6e52d9a48c2d8d211f3d05e699"
+PRODUCER_CONTRACTS_SHA256 = "6b828775a275ee5f8829b314120591be482e19d9750db3f10890b17c5d5dca60"
+PRODUCER_CONTRACTS_CANONICAL_SHA256 = (
+    "3d55072241cfbe589662a3ece5786f9fe5e7de909e46b1f57f85f90ca93e09bc"
+)
+MLX_ORACLE_LOCK_SHA256 = "b59b9022be34f429962150b4aa6a8339b7d4250c6ec814294b5d0d47663c540e"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 CASE_ID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -31,6 +42,9 @@ PARSER_TOOL_BLOCK_RE = re.compile(
 
 STATUS = {
     "oracle_reference_only": True,
+    "trace_schema_frozen": True,
+    "producer_semantics_frozen": True,
+    "producer_environments_frozen": False,
     "weights_acquired": False,
     "local_model_tree_verified": False,
     "oracle_executed": False,
@@ -103,27 +117,52 @@ REQUIRED_COVERAGE = [
 
 REQUIRED_TRACE_CHANNELS = [
     "rendered_utf8",
+    "render_rejection",
+    "parser_outcome",
     "input_ids",
     "position_ids",
-    "full_vocab_logits_f32",
-    "topk_ids_values_and_margins",
+    "full_vocab_logits",
+    "topk",
     "greedy_token_ids",
     "free_running_utf8",
     "selected_hidden_states",
-    "selected_gdn_recurrent_state_f32",
-    "selected_gdn_conv_state",
-    "selected_full_attention_kv",
-    "instrumented_uninstrumented_control",
+    "native_gdn_recurrent_state",
+    "native_gdn_conv_state",
+    "native_full_attention_kv",
 ]
 
-REQUIRED_TRACE_BOUNDARIES = [
-    "initial",
-    "post_prefill",
-    "post_decode",
-    "token_step",
-    "chunk_before_conv_width",
-    "chunk_at_conv_width",
-    "chunk_after_conv_width",
+REQUIRED_TRACE_RUNS = [
+    "behavior_monolithic",
+    "trace_monolithic",
+    "trace_token_serial_prefill",
+    "trace_conv_boundary_prefill",
+]
+
+BEHAVIOR_CASE_IDS = [
+    "generate-canonical-dual-stop",
+    "generate-stop-endoftext",
+    "generate-stop-im-end",
+    "render-system-first-tools",
+    "render-thinking-default-xhigh",
+    "render-thinking-low",
+    "render-thinking-medium",
+    "render-tool-results-preserve-thinking-false",
+    "render-tool-results-preserve-thinking-true",
+]
+
+GDN_STATE_LAYERS = [0, 2, 30, 62]
+FULL_ATTENTION_KV_LAYERS = [3, 31, 63]
+HIDDEN_SITES = [
+    "embedding_output",
+    "decoder_output_0",
+    "decoder_output_2",
+    "decoder_output_3",
+    "decoder_output_30",
+    "decoder_output_31",
+    "decoder_output_32",
+    "decoder_output_62",
+    "decoder_output_63",
+    "final_norm_output",
 ]
 
 REQUIRED_EVIDENCE_IDENTITIES = [
@@ -131,17 +170,24 @@ REQUIRED_EVIDENCE_IDENTITIES = [
     "source_tree",
     "oracle_implementation",
     "oracle_environment",
+    "environment_tree",
     "python_runtime",
     "device_backend",
+    "machine_profile",
+    "producer_contracts",
     "execution_mode",
+    "producer_command",
+    "producer_executable",
+    "process_inventory",
     "case_corpus",
     "conversation_profile",
     "trace_schema",
-    "producer_command",
-    "producer_executable",
-    "machine_profile",
+    "parameter_inventory",
+    "cache_topology",
+    "kernel_route_inventory",
     "raw_payload_inventory",
     "comparison_harness",
+    "detached_seal",
 ]
 
 EXPECTED_ORACLES = [
@@ -152,7 +198,7 @@ EXPECTED_ORACLES = [
         "implementation_path": "src/transformers/models/qwen3_5/modeling_qwen3_5.py",
         "implementation_sha256": "90d929129ffc835d2652c604925c4f3842bc6e401e174ec6f0db2285dfb8f85a",
         "state": "source_pinned_unexecuted",
-        "execution_mode_status": "partial_intent_environment_and_producer_unfrozen",
+        "execution_mode_status": "semantic_mode_frozen_environment_unbuilt",
         "execution_intent": {
             "model_class": "Qwen3_5ForConditionalGeneration",
             "component": "text_inputs_only",
@@ -172,7 +218,7 @@ EXPECTED_ORACLES = [
         "implementation_path": "mlx_lm/models/qwen3_5.py",
         "implementation_sha256": "cdcfbf22681d2005f4bdff53ab9ab06da7aeb71c0e89378f65f893beeaf0b47c",
         "state": "source_pinned_unexecuted",
-        "execution_mode_status": "partial_intent_environment_and_producer_unfrozen",
+        "execution_mode_status": "semantic_mode_frozen_environment_unbuilt",
         "execution_intent": {
             "model_class": "mlx_lm.models.qwen3_5.Model",
             "component": "text_only_sanitized",
@@ -747,15 +793,1904 @@ def load_cases(path: Path) -> list[dict[str, Any]]:
     return cases
 
 
+def _require_exact_value(actual: Any, expected: Any, context: str) -> None:
+    if actual != expected:
+        raise ContractError(f"{context} differs from the reviewed contract")
+
+
+def validate_trace_schema_value(schema: Any, cases: list[dict[str, Any]]) -> dict[str, Any]:
+    schema = _exact_keys(
+        schema,
+        {
+            "schema",
+            "state",
+            "binds",
+            "scope",
+            "case_plan",
+            "runs",
+            "prefill_schedules",
+            "prediction_frame",
+            "frame_kinds",
+            "control_pair",
+            "selections",
+            "channels",
+            "native_layouts",
+            "canonical_normalization",
+            "topk",
+            "serialization",
+            "record_schemas",
+            "validation_edges",
+            "cross_oracle_comparison",
+            "bundle",
+            "comparison_metrics",
+            "tolerances",
+        },
+        "trace schema",
+    )
+    if schema["schema"] != TRACE_SCHEMA or schema["state"] != "schema_frozen_no_payload":
+        raise ContractError("trace schema identity or state differs")
+    _require_exact_value(
+        schema["binds"],
+        {
+            "case_corpus_sha256": CASES_SHA256,
+            "source_manifest_sha256": SOURCE_MANIFEST_SHA256,
+            "source_revision": SOURCE_REVISION,
+        },
+        "trace schema bindings",
+    )
+    _require_exact_value(
+        schema["scope"],
+        {
+            "batch_size": 1,
+            "padding": False,
+            "prompt_tokens_min": 6,
+            "prompt_tokens_max": 512,
+            "max_generated_tokens": 16,
+            "weight_dtype": "bfloat16",
+            "gdn_recurrent_dtype": "float32",
+            "quantization": False,
+            "vision": False,
+            "mtp": False,
+            "adapters": False,
+        },
+        "trace scope",
+    )
+
+    case_by_id = {case["id"]: case for case in cases}
+    plan = _exact_keys(
+        schema["case_plan"],
+        {
+            "renderer_case_ids",
+            "parser_case_ids",
+            "behavior_cases",
+            "render_rejection_codes",
+            "stop_coverage_semantics",
+            "state_probe_case_id",
+            "free_running_gap_closed_by_promoted_render_cases",
+        },
+        "trace case plan",
+    )
+    renderer_ids = _string_list(plan["renderer_case_ids"], "trace renderer cases")
+    parser_ids = _string_list(plan["parser_case_ids"], "trace parser cases")
+    if renderer_ids != sorted(case["id"] for case in cases if case["kind"] != "parser"):
+        raise ContractError("trace renderer cases do not cover the exact non-parser corpus")
+    if parser_ids != sorted(case["id"] for case in cases if case["kind"] == "parser"):
+        raise ContractError("trace parser cases do not cover the exact parser corpus")
+    behavior_cases = plan["behavior_cases"]
+    if not isinstance(behavior_cases, list) or len(behavior_cases) != len(BEHAVIOR_CASE_IDS):
+        raise ContractError("trace behavior case count differs")
+    behavior_ids = []
+    for index, behavior in enumerate(behavior_cases):
+        behavior = _exact_keys(
+            behavior,
+            {"case_id", "max_steps", "stop_token_ids"},
+            f"trace behavior case {index}",
+        )
+        case_id = _string(behavior["case_id"], f"trace behavior case {index} ID")
+        if case_id not in case_by_id:
+            raise ContractError(f"trace behavior case is absent from the corpus: {case_id}")
+        case = case_by_id[case_id]
+        if case["kind"] not in {"render", "generation"}:
+            raise ContractError(f"trace behavior case cannot be executed: {case_id}")
+        if case["template_args"].get("add_generation_prompt") is not True:
+            raise ContractError(f"trace behavior case lacks a generation prompt: {case_id}")
+        if behavior["max_steps"] != 16:
+            raise ContractError(f"trace behavior case changes the generation bound: {case_id}")
+        if behavior["stop_token_ids"] not in ([248046, 248044], [248046], [248044]):
+            raise ContractError(f"trace behavior case has an invalid stop policy: {case_id}")
+        if case["kind"] == "generation" and (
+            behavior["max_steps"] != case["max_steps"]
+            or behavior["stop_token_ids"] != case["stop_token_ids"]
+        ):
+            raise ContractError(f"trace behavior case changes a committed generation input: {case_id}")
+        behavior_ids.append(case_id)
+    if behavior_ids != BEHAVIOR_CASE_IDS:
+        raise ContractError("trace behavior cases or ordering differ")
+    _require_exact_value(
+        plan["render_rejection_codes"],
+        {
+            "reject-invalid-reasoning-effort": "invalid_reasoning_effort",
+            "reject-system-not-first": "system_message_must_be_first",
+        },
+        "trace render rejection codes",
+    )
+    _require_exact_value(
+        plan["stop_coverage_semantics"],
+        {
+            "canonical_dual_stop": (
+                "configured input and stop-policy coverage only; observed termination is separately "
+                "receipted and this label does not claim either token was emitted"
+            ),
+            "stop_endoftext": (
+                "configured input and stop-policy coverage only; observed termination is separately "
+                "receipted and this label does not claim token 248044 was emitted"
+            ),
+            "stop_im_end": (
+                "configured input and stop-policy coverage only; observed termination is separately "
+                "receipted and this label does not claim token 248046 was emitted"
+            ),
+        },
+        "trace stop coverage semantics",
+    )
+    required_behavior_coverage = {
+        "thinking_default",
+        "thinking_low",
+        "thinking_medium",
+        "system_with_tools",
+        "preserve_thinking_false",
+        "preserve_thinking_true",
+    }
+    behavior_coverage = {
+        tag for case_id in behavior_ids for tag in case_by_id[case_id]["coverage"]
+    }
+    if not required_behavior_coverage.issubset(behavior_coverage):
+        raise ContractError("trace behavior plan omits thinking, tool, or preserved-history generation")
+    if plan["state_probe_case_id"] != "generate-canonical-dual-stop":
+        raise ContractError("trace state-probe case differs")
+    if plan["free_running_gap_closed_by_promoted_render_cases"] is not True:
+        raise ContractError("trace schema does not close free-running behavior coverage")
+
+    runs = schema["runs"]
+    if not isinstance(runs, list) or len(runs) != 4:
+        raise ContractError("trace run matrix differs")
+    validated_runs = []
+    for index, run in enumerate(runs):
+        run = _exact_keys(
+            run,
+            {
+                "id",
+                "cases",
+                "fresh_process",
+                "fresh_cache_per_case",
+                "instrumented",
+                "prefill_schedule",
+                "decode",
+                "state_snapshots",
+            },
+            f"trace run {index}",
+        )
+        if run["fresh_process"] is not True or run["fresh_cache_per_case"] is not True:
+            raise ContractError(f"trace run can reuse mutable state: {run['id']}")
+        if not isinstance(run["state_snapshots"], list):
+            raise ContractError(f"trace run snapshots must be a list: {run['id']}")
+        validated_runs.append(run)
+    runs = validated_runs
+    run_ids = [_string(run["id"], f"trace run {index} ID") for index, run in enumerate(runs)]
+    if run_ids != REQUIRED_TRACE_RUNS:
+        raise ContractError("trace run IDs or ordering differ")
+    _require_exact_value(
+        [run["prefill_schedule"] for run in runs],
+        ["whole_prompt", "whole_prompt", "one_token_calls", "chunks_3_1_1_remainder"],
+        "trace prefill run matrix",
+    )
+    _require_exact_value(
+        schema["prefill_schedules"],
+        {
+            "whole_prompt": "one call consuming positions [0,T)",
+            "one_token_calls": "T calls consuming [i,i+1) for i=0..T-1 without sampling between calls",
+            "chunks_3_1_1_remainder": "calls consuming [0,3), [3,4), [4,5), and [5,T), without sampling between calls",
+        },
+        "trace prefill schedules",
+    )
+    prediction = _exact_keys(
+        schema["prediction_frame"],
+        {
+            "prompt_call",
+            "decode_call",
+            "cache_length_after_call",
+            "stop_policy",
+            "terminal_cache",
+            "high_level_generate_api",
+        },
+        "prediction frame",
+    )
+    if prediction["high_level_generate_api"] is not False:
+        raise ContractError("trace schema permits a high-level generation API")
+    if prediction["cache_length_after_call"] != (
+        "T+i for call i, before the token predicted by that call enters the cache"
+    ):
+        raise ContractError("prediction-frame cache semantics differ")
+    if prediction["stop_policy"] != (
+        "include a predicted stop token in emitted IDs and UTF-8, then perform no later forward call"
+    ):
+        raise ContractError("prediction-frame stop semantics differ")
+    _require_exact_value(
+        schema["frame_kinds"],
+        {
+            "generation_prediction": {
+                "sampled": True,
+                "call_span": "prompt [0,T) for call 0; one emitted token for each later call",
+                "prediction_index": "zero-based emitted-token index",
+                "boundary_tags": ["post_prefill", "post_decode", "terminal"],
+                "termination": "none_until_terminal_then_stop_token_or_max_steps",
+            },
+            "teacher_forced_prefill": {
+                "sampled": False,
+                "call_span": "explicit half-open prompt-token range [start,end)",
+                "prediction_index": None,
+                "boundary_tags": [
+                    "logical_prefix_3",
+                    "logical_prefix_4",
+                    "logical_prefix_5",
+                    "post_prefill",
+                ],
+                "termination": "not_applicable",
+            },
+        },
+        "trace frame kinds",
+    )
+    _require_exact_value(
+        schema["control_pair"],
+        {
+            "uninstrumented_run": "behavior_monolithic",
+            "instrumented_run": "trace_monolithic",
+            "case_id": "generate-canonical-dual-stop",
+            "fresh_state_for_each": True,
+            "comparison_authority": "third_party_verifier_after_measured_tolerances",
+        },
+        "instrumentation control pair",
+    )
+
+    selections = _exact_keys(
+        schema["selections"],
+        {
+            "hidden_sites",
+            "prompt_hidden_positions",
+            "decode_hidden_positions",
+            "hidden_site_boundaries",
+            "gdn_state_layers",
+            "full_attention_kv_layers",
+            "gdn_layer_rule",
+            "full_attention_layer_rule",
+        },
+        "trace selections",
+    )
+    if selections["hidden_sites"] != HIDDEN_SITES:
+        raise ContractError("trace hidden-state sites differ")
+    if selections["gdn_state_layers"] != GDN_STATE_LAYERS:
+        raise ContractError("trace GDN state layers differ")
+    if selections["full_attention_kv_layers"] != FULL_ATTENTION_KV_LAYERS:
+        raise ContractError("trace full-attention state layers differ")
+    if any(layer % 4 == 3 for layer in selections["gdn_state_layers"]):
+        raise ContractError("trace selects a full-attention layer as GDN")
+    if any(layer % 4 != 3 for layer in selections["full_attention_kv_layers"]):
+        raise ContractError("trace selects a GDN layer as full attention")
+    if selections["prompt_hidden_positions"] != (
+        "ascending(sorted_unique(0,2,3,4,T-1) intersect [0,logical_prefix)) at each "
+        "snapshot; descriptor stores the exact concrete IDs"
+    ):
+        raise ContractError("trace hidden positions differ")
+    _require_exact_value(
+        selections["hidden_site_boundaries"],
+        {
+            "embedding_output": (
+                "token embedding lookup output before decoder layer 0 and before any "
+                "decoder-layer normalization"
+            ),
+            "decoder_output_<i>": (
+                "post-MLP-residual output returned by the complete decoder block i, after both "
+                "attention-or-GDN and MLP residual updates and before layer i+1"
+            ),
+            "final_norm_output": (
+                "output of the final text-model RMSNorm applied after decoder layer 63 and "
+                "before lm_head"
+            ),
+        },
+        "trace hidden-site boundaries",
+    )
+
+    channels = schema["channels"]
+    if not isinstance(channels, list):
+        raise ContractError("trace channels must be a list")
+    channel_ids = []
+    for index, channel in enumerate(channels):
+        if not isinstance(channel, dict):
+            raise ContractError(f"trace channel {index} must be an object")
+        channel_ids.append(_string(channel.get("id"), f"trace channel {index} ID"))
+    if channel_ids != REQUIRED_TRACE_CHANNELS:
+        raise ContractError("trace channels or ordering differ")
+    if len(set(channel_ids)) != len(channel_ids):
+        raise ContractError("trace channels contain duplicates")
+    channel_fields = {
+        "rendered_utf8": {"id", "applies_to", "encoding"},
+        "render_rejection": {"id", "applies_to", "encoding"},
+        "parser_outcome": {"id", "applies_to", "encoding"},
+        "input_ids": {"id", "applies_to", "stored_dtype", "axes", "shape"},
+        "position_ids": {"id", "applies_to", "stored_dtype", "axes", "shape"},
+        "full_vocab_logits": {
+            "id",
+            "applies_to",
+            "stored_dtype",
+            "axes",
+            "shape",
+            "conversion",
+        },
+        "topk": {"id", "applies_to", "encoding"},
+        "greedy_token_ids": {"id", "applies_to", "stored_dtype", "axes", "shape"},
+        "free_running_utf8": {"id", "applies_to", "encoding"},
+        "selected_hidden_states": {
+            "id",
+            "applies_to",
+            "stored_dtype",
+            "native_axes",
+            "shape",
+            "snapshot_rule",
+        },
+        "native_gdn_recurrent_state": {
+            "id",
+            "applies_to",
+            "stored_dtype",
+            "shape",
+            "snapshot_rule",
+        },
+        "native_gdn_conv_state": {
+            "id",
+            "applies_to",
+            "stored_dtype",
+            "shape",
+            "snapshot_rule",
+        },
+        "native_full_attention_kv": {
+            "id",
+            "applies_to",
+            "stored_dtype",
+            "shape",
+            "snapshot_rule",
+        },
+    }
+    for index, channel in enumerate(channels):
+        _exact_keys(channel, channel_fields[channel["id"]], f"trace channel {index}")
+    channel_by_id = {channel["id"]: channel for channel in channels}
+    if channel_by_id["full_vocab_logits"].get("shape") != [1, 248320]:
+        raise ContractError("full-vocabulary trace shape differs")
+    if channel_by_id["native_gdn_recurrent_state"].get("shape") != [1, 48, 128, 128]:
+        raise ContractError("GDN recurrent trace shape differs")
+    for channel_id in (
+        "selected_hidden_states",
+        "native_gdn_recurrent_state",
+        "native_gdn_conv_state",
+        "native_full_attention_kv",
+    ):
+        if channel_by_id[channel_id].get("snapshot_rule") != (
+            "materialize_before_later_cache_mutation"
+        ):
+            raise ContractError(f"trace snapshot can alias mutable cache state: {channel_id}")
+
+    layouts = _exact_keys(schema["native_layouts"], {"transformers", "mlx_lm"}, "native layouts")
+    transformers_layout = _exact_keys(
+        layouts["transformers"],
+        {
+            "gdn_recurrent_axes",
+            "gdn_recurrent_shape",
+            "gdn_conv_axes",
+            "gdn_conv_shape",
+            "full_attention_kv_axes",
+            "full_attention_kv_shape",
+        },
+        "Transformers native layout",
+    )
+    mlx_layout = _exact_keys(
+        layouts["mlx_lm"],
+        {
+            "gdn_recurrent_axes",
+            "gdn_recurrent_shape",
+            "gdn_conv_axes",
+            "gdn_conv_shape",
+            "full_attention_kv_axes",
+            "full_attention_kv_shape",
+            "logical_offset_required",
+            "capacity_constraint",
+            "capacity_recurrence",
+        },
+        "mlx-lm native layout",
+    )
+    if transformers_layout["gdn_recurrent_axes"] != [
+        "batch",
+        "value_head",
+        "key_feature",
+        "value_feature",
+    ]:
+        raise ContractError("Transformers recurrent axes differ")
+    if mlx_layout["gdn_recurrent_axes"] != [
+        "batch",
+        "value_head",
+        "value_feature",
+        "key_feature",
+    ]:
+        raise ContractError("mlx-lm recurrent axes differ")
+    if transformers_layout["gdn_conv_shape"] != [1, 10240, 4]:
+        raise ContractError("Transformers convolution-cache shape differs")
+    if mlx_layout["gdn_conv_shape"] != [1, 3, 10240]:
+        raise ContractError("mlx-lm convolution-cache shape differs")
+    if mlx_layout["full_attention_kv_shape"] != [1, 4, "C", 256]:
+        raise ContractError("mlx-lm allocated KV shape differs")
+    if mlx_layout["logical_offset_required"] is not True:
+        raise ContractError("mlx-lm logical KV offset is not required")
+    if mlx_layout["capacity_constraint"] != (
+        "L<=C<L+256; record actual C because nonaligned chunk growth need not be a multiple of 256"
+    ):
+        raise ContractError("mlx-lm allocated KV capacity constraint differs")
+    _require_exact_value(
+        mlx_layout["capacity_recurrence"],
+        {
+            "initial_state": "L=0,C=0",
+            "no_growth": "when L+N<=C, set L=L+N and leave C unchanged",
+            "growth": (
+                "when L+N>C, first set C=L if prior C>0 and L mod 256 != 0, "
+                "then set C=C+ceil(N/256)*256 and L=L+N"
+            ),
+            "call_token_count": "N is the positive token count in the current forward call",
+            "step": 256,
+        },
+        "mlx-lm allocated KV capacity recurrence",
+    )
+
+    normalization = _exact_keys(
+        schema["canonical_normalization"],
+        {
+            "owner",
+            "producer_canonical_state_is_not_raw_evidence",
+            "gdn_recurrent_axes",
+            "gdn_recurrent_transform",
+            "gdn_conv_axes",
+            "gdn_conv_shape",
+            "gdn_conv_transform",
+            "full_attention_kv_axes",
+            "full_attention_kv_transform",
+            "kv_semantics",
+        },
+        "canonical normalization",
+    )
+    if normalization["owner"] != "third_party_verifier":
+        raise ContractError("a producer owns trace normalization")
+    if normalization["producer_canonical_state_is_not_raw_evidence"] is not True:
+        raise ContractError("producer-normalized state can replace raw evidence")
+    _require_exact_value(
+        normalization["gdn_recurrent_transform"],
+        {"transformers": "identity", "mlx_lm": "transpose_last_two"},
+        "GDN recurrent normalization",
+    )
+    _require_exact_value(
+        normalization["gdn_conv_transform"],
+        {
+            "transformers": "take_last_3_then_transpose_0_2_1",
+            "mlx_lm": "identity",
+        },
+        "GDN convolution normalization",
+    )
+    _require_exact_value(
+        normalization["full_attention_kv_transform"],
+        {"transformers": "identity", "mlx_lm": "slice_token_axis_to_logical_offset"},
+        "full-attention KV normalization",
+    )
+
+    _require_exact_value(
+        schema["topk"],
+        {
+            "width": 32,
+            "internal_rank_count": 33,
+            "ranking": "descending_float32_value_then_ascending_token_id",
+            "ids": 32,
+            "values": 32,
+            "adjacent_margins": 31,
+            "cutoff_margin": "rank_32_value_minus_rank_33_value",
+            "greedy": "rank_1_token_id",
+            "verifier_recomputes_from_full_logits": True,
+        },
+        "trace top-k contract",
+    )
+    serialization = _exact_keys(
+        schema["serialization"],
+        {
+            "numeric_payload",
+            "allowed_numeric_dtypes",
+            "json",
+            "jsonl",
+            "text",
+            "compression",
+            "archives",
+            "executable_payloads",
+            "pickle_or_object_arrays",
+            "tensor_descriptor_required_fields",
+        },
+        "trace serialization",
+    )
+    if serialization.get("numeric_payload") != (
+        "one_headerless_c_contiguous_little_endian_tensor_per_regular_file"
+    ):
+        raise ContractError("numeric trace serialization differs")
+    if serialization.get("allowed_numeric_dtypes") != ["f32le", "u32le"]:
+        raise ContractError("numeric trace dtypes differ")
+    for forbidden_flag in (
+        "compression",
+        "archives",
+        "executable_payloads",
+        "pickle_or_object_arrays",
+    ):
+        if serialization.get(forbidden_flag) is not False:
+            raise ContractError(f"trace serialization permits {forbidden_flag}")
+    descriptor_fields = _string_list(
+        serialization.get("tensor_descriptor_required_fields"),
+        "tensor descriptor required fields",
+    )
+    if descriptor_fields != sorted(descriptor_fields):
+        raise ContractError("tensor descriptor fields must be sorted")
+    records = _exact_keys(
+        schema["record_schemas"],
+        {
+            "common_constraints",
+            "events_jsonl",
+            "payload_manifest_jsonl",
+            "verifier_parser_outcomes_jsonl",
+            "receipt_json",
+            "detached_seal_json",
+            "required_payload_inventory",
+        },
+        "trace record schemas",
+    )
+    common_records = _exact_keys(
+        records["common_constraints"],
+        {
+            "records_are_closed",
+            "unknown_fields",
+            "duplicate_records",
+            "paths",
+            "sha256",
+            "identifiers",
+            "frame_ids",
+            "integers",
+            "numbers",
+        },
+        "trace common record constraints",
+    )
+    if common_records["records_are_closed"] is not True:
+        raise ContractError("trace records are not closed")
+    if common_records["frame_ids"] != (
+        "exactly <run_instance_id>/gen/<prediction_index> or "
+        "<run_instance_id>/prefill/<logical_prefix>, with canonical unsigned decimal suffix "
+        "and no leading zero except zero"
+    ):
+        raise ContractError("trace frame-ID grammar differs")
+    event_records = _exact_keys(
+        records["events_jsonl"],
+        {
+            "record_types",
+            "required_fields_by_type",
+            "field_types",
+            "digest_preimages",
+            "nullable_fields",
+            "ordering",
+            "parser_records",
+            "uniqueness_keys",
+            "foreign_key_rules",
+            "call_conditionals",
+            "snapshot_specification_mapping",
+            "cardinality_and_sequence",
+        },
+        "trace event records",
+    )
+    if event_records["record_types"] != [
+        "case_input",
+        "render_rejection",
+        "run_start",
+        "call",
+        "snapshot",
+        "run_end",
+    ]:
+        raise ContractError("trace event record types differ")
+    _require_exact_value(
+        event_records["digest_preimages"],
+        {
+            "input_ids_sha256": (
+                "SHA-256 of the exact bound input_ids payload bytes serialized as headerless "
+                "C-contiguous u32le"
+            ),
+            "template_arguments_sha256": (
+                "SHA-256 of canonical JSON for the exact case template_args object before any "
+                "runtime default expansion"
+            ),
+        },
+        "trace event digest preimages",
+    )
+    _require_exact_value(
+        event_records["snapshot_specification_mapping"],
+        {
+            "post_first_decode_call_if_executed": {
+                "boundary_tag": "post_decode",
+                "condition": "emit only on the first generation decode call after the prompt call",
+            },
+            "terminal_call_if_distinct": {
+                "boundary_tag": "terminal",
+                "condition": (
+                    "emit only when the terminal call is distinct from the calls already tagged "
+                    "post_prefill or post_decode"
+                ),
+            },
+        },
+        "trace snapshot specification mapping",
+    )
+    payload_records = _exact_keys(
+        records["payload_manifest_jsonl"],
+        {
+            "record_types",
+            "tensor_required_fields_source",
+            "bytes_required_fields",
+            "field_types",
+            "tensor_nullable_fields",
+            "bytes_nullable_fields",
+            "channel_rules",
+            "foreign_key_rules",
+            "canonical_json_payload_schemas",
+            "closed_records",
+            "path_uniqueness_key",
+            "path_must_be_beneath",
+            "shape_rule",
+            "tensor_byte_length_rule",
+            "payload_byte_length_rule",
+            "hash_rule",
+            "one_record_per_payload",
+            "manifest_covers_every_payload_regular_file_exactly_once",
+        },
+        "trace payload records",
+    )
+    for flag in (
+        "closed_records",
+        "one_record_per_payload",
+        "manifest_covers_every_payload_regular_file_exactly_once",
+    ):
+        if payload_records[flag] is not True:
+            raise ContractError(f"trace payload records weaken {flag}")
+    canonical_payloads = _exact_keys(
+        payload_records["canonical_json_payload_schemas"],
+        {"topk", "render_rejection"},
+        "trace canonical JSON payload schemas",
+    )
+    topk_payload = _exact_keys(
+        canonical_payloads["topk"],
+        {"closed_object", "required_fields", "field_types", "verifier_rule"},
+        "trace top-k payload schema",
+    )
+    if topk_payload["closed_object"] is not True or topk_payload["required_fields"] != [
+        "adjacent_margins_f32",
+        "cutoff_margin_f32",
+        "greedy_token_id",
+        "rank_33_token_id",
+        "rank_33_value_f32",
+        "ranked_token_ids",
+        "ranked_values_f32",
+    ]:
+        raise ContractError("trace top-k payload schema differs")
+    rejection_payload = _exact_keys(
+        canonical_payloads["render_rejection"],
+        {"closed_object", "required_fields", "field_types", "stable_code_mapping"},
+        "trace render-rejection payload schema",
+    )
+    if rejection_payload["closed_object"] is not True or rejection_payload[
+        "required_fields"
+    ] != ["case_id", "native_exception_text", "stable_rejection_code"]:
+        raise ContractError("trace render-rejection payload schema differs")
+    _require_exact_value(
+        rejection_payload["stable_code_mapping"],
+        {
+            "reject-invalid-reasoning-effort": "invalid_reasoning_effort",
+            "reject-system-not-first": "system_message_must_be_first",
+        },
+        "trace render-rejection stable-code mapping",
+    )
+    parser_records = _exact_keys(
+        records["verifier_parser_outcomes_jsonl"],
+        {
+            "owner",
+            "location",
+            "closed_records",
+            "required_fields",
+            "record_type",
+            "field_types",
+            "cardinality",
+            "comparison",
+            "parser_harness_binding",
+            "arm_producers_may_write",
+        },
+        "trace verifier parser records",
+    )
+    if parser_records["arm_producers_may_write"] is not False:
+        raise ContractError("an arm producer may author parser evidence")
+    receipt_records = _exact_keys(
+        records["receipt_json"],
+        {
+            "closed_schema",
+            "required_fields_source",
+            "value_schema_source",
+            "producer_verdict_fields_forbidden",
+            "all_identity_hashes_verified_before_payload_acceptance",
+        },
+        "trace receipt records",
+    )
+    if not all(
+        receipt_records[field] is True
+        for field in (
+            "closed_schema",
+            "producer_verdict_fields_forbidden",
+            "all_identity_hashes_verified_before_payload_acceptance",
+        )
+    ):
+        raise ContractError("trace receipt schema is not fail-closed")
+    detached_seal = _exact_keys(
+        records["detached_seal_json"],
+        {
+            "owner",
+            "location",
+            "closed_schema",
+            "required_fields",
+            "field_types",
+            "producer_may_write",
+            "arm_inventory_sha256_rule",
+            "bundle_inventory_sha256_rule",
+            "seal_covers_events_manifest_receipt_every_payload_and_shared_verifier_outputs",
+            "integrity_binding_not_authentication_or_remote_attestation",
+            "trusted_verifier_controlled_path_and_runner_required",
+        },
+        "trace detached seal",
+    )
+    if (
+        detached_seal["owner"] != "third_party_verifier"
+        or detached_seal["producer_may_write"] is not False
+        or detached_seal["closed_schema"] is not True
+    ):
+        raise ContractError("trace detached seal ownership differs")
+    if detached_seal["required_fields"] != [
+        "arm_inventory_sha256",
+        "bundle_inventory_sha256",
+        "comparison_harness_sha256",
+        "parser_harness_path",
+        "parser_harness_sha256",
+        "producer_contracts_sha256",
+        "schema",
+        "trace_schema_sha256",
+    ]:
+        raise ContractError("trace detached seal field set differs")
+    if (
+        detached_seal[
+            "seal_covers_events_manifest_receipt_every_payload_and_shared_verifier_outputs"
+        ]
+        is not True
+    ):
+        raise ContractError("trace detached seal omits shared verifier evidence")
+    if (
+        detached_seal["integrity_binding_not_authentication_or_remote_attestation"] is not True
+        or detached_seal["trusted_verifier_controlled_path_and_runner_required"] is not True
+    ):
+        raise ContractError("trace detached seal overclaims authentication")
+    if set(detached_seal["field_types"]) != set(detached_seal["required_fields"]):
+        raise ContractError("trace detached seal field types do not close its field set")
+    validation_edges = schema["validation_edges"]
+    if not isinstance(validation_edges, list) or [edge.get("id") for edge in validation_edges] != [
+        "instrumentation_control",
+        "post_prefill_all_schedules",
+        "conv_boundary_prefixes",
+    ]:
+        raise ContractError("trace validation edges differ")
+    cross_oracle = _exact_keys(
+        schema["cross_oracle_comparison"],
+        {
+            "arms",
+            "logical_join_key",
+            "cardinality",
+            "descriptor_rule",
+            "coverage",
+            "parser_rule",
+            "producer_may_filter_or_select_pairs",
+        },
+        "trace cross-oracle comparison",
+    )
+    if cross_oracle["arms"] != ["transformers", "mlx_lm"]:
+        raise ContractError("trace cross-oracle arms differ")
+    if cross_oracle["logical_join_key"] != [
+        "case_id",
+        "run_id",
+        "record_or_frame_kind",
+        "call_index",
+        "boundary_tag",
+        "logical_prefix",
+        "channel",
+        "site_or_role",
+        "layer",
+        "selected_position_ids",
+    ]:
+        raise ContractError("trace cross-oracle join key differs")
+    if cross_oracle["producer_may_filter_or_select_pairs"] is not False:
+        raise ContractError("a trace producer may select cross-oracle pairs")
+    bundle = _exact_keys(
+        schema["bundle"],
+        {
+            "arm_root",
+            "arm_files",
+            "payload_root",
+            "shared_verifier_root",
+            "shared_verifier_files",
+            "comparison_report",
+            "arms_publish_independently",
+            "producer_reads_other_arm",
+            "producer_authored_pass_fields_forbidden",
+            "third_party_verifier_required",
+            "detached_external_seal_required",
+            "exact_regular_file_inventory_required",
+            "symlinks_hardlinks_and_special_files_forbidden",
+            "atomic_publication_required_but_unimplemented",
+        },
+        "trace bundle",
+    )
+    for required_flag in (
+        "arms_publish_independently",
+        "producer_authored_pass_fields_forbidden",
+        "third_party_verifier_required",
+        "detached_external_seal_required",
+        "exact_regular_file_inventory_required",
+        "symlinks_hardlinks_and_special_files_forbidden",
+        "atomic_publication_required_but_unimplemented",
+    ):
+        if bundle.get(required_flag) is not True:
+            raise ContractError(f"trace bundle rule is not fail-closed: {required_flag}")
+    if bundle.get("producer_reads_other_arm") is not False:
+        raise ContractError("a trace producer may read the other arm")
+    if bundle["comparison_report"] != (
+        "absent_from_v1_raw_evidence_bundle; tolerance_and_comparison_report_schema_requires_a_"
+        "reviewed_superseding_contract_after_clean_repeats_and_fault_injection"
+    ):
+        raise ContractError("trace bundle overclaims a comparison report")
+    _require_exact_value(
+        {
+            "arm_root": bundle["arm_root"],
+            "arm_files": bundle["arm_files"],
+            "payload_root": bundle["payload_root"],
+            "shared_verifier_root": bundle["shared_verifier_root"],
+            "shared_verifier_files": bundle["shared_verifier_files"],
+        },
+        {
+            "arm_root": "arms/<oracle_id>",
+            "arm_files": ["events.jsonl", "payload-manifest.jsonl", "receipt.json"],
+            "payload_root": "payload",
+            "shared_verifier_root": "verifier",
+            "shared_verifier_files": ["parser-outcomes.jsonl"],
+        },
+        "trace bundle paths",
+    )
+    comparison_metrics = _exact_keys(
+        schema["comparison_metrics"],
+        {"exact", "numeric", "state_diagnostics", "verifier_derived"},
+        "trace comparison metrics",
+    )
+    for key in ("exact", "verifier_derived"):
+        _string_list(comparison_metrics[key], f"trace comparison metrics {key}")
+    numeric_metrics = _exact_keys(
+        comparison_metrics["numeric"],
+        {
+            "accumulation",
+            "nonfinite",
+            "max_abs",
+            "max_relative",
+            "root_mean_square",
+            "cosine_distance",
+            "topk_overlap",
+            "greedy_margin",
+            "cutoff_margin",
+            "reduction_axes",
+        },
+        "trace numeric metric formulas",
+    )
+    if numeric_metrics["accumulation"] != "float64_in_canonical_row_major_order":
+        raise ContractError("trace numeric accumulation order differs")
+    state_diagnostics = _exact_keys(
+        comparison_metrics["state_diagnostics"],
+        {"accumulation", "l2_norm", "state_max_magnitude", "finite_count", "scope"},
+        "trace state diagnostic formulas",
+    )
+    if state_diagnostics["finite_count"] != (
+        "sum_i(isfinite(x_i)); must equal product(shape)"
+    ):
+        raise ContractError("trace state finite-count rule differs")
+    if schema["tolerances"] != {
+        "status": "unfrozen_requires_clean_repeat_and_injected_fault_measurement",
+        "numeric_thresholds": None,
+        "producer_may_decide_pass": False,
+    }:
+        raise ContractError("trace schema invents a tolerance or producer verdict")
+    if hashlib.sha256(canonical_json(schema)).hexdigest() != TRACE_SCHEMA_CANONICAL_SHA256:
+        raise ContractError("trace schema differs from the reviewed canonical semantics")
+    return schema
+
+
+def _validate_critical_sources(value: Any, expected: list[dict[str, str]], context: str) -> None:
+    if not isinstance(value, list):
+        raise ContractError(f"{context} must be a list")
+    for index, source in enumerate(value):
+        source = _exact_keys(source, {"path", "sha256"}, f"{context}[{index}]")
+        _safe_relative_path(source["path"], f"{context}[{index}].path")
+        _sha256(source["sha256"], f"{context}[{index}].sha256")
+    if value != expected:
+        raise ContractError(f"{context} differs from the reviewed source pins")
+
+
+def validate_producer_contracts_value(repo_root: Path, value: Any) -> dict[str, Any]:
+    value = _exact_keys(
+        value,
+        {
+            "schema",
+            "state",
+            "binds",
+            "common",
+            "input_preparation",
+            "separation",
+            "trust_boundary",
+            "arms",
+            "parameter_closure",
+            "receipt_required_fields",
+            "receipt_field_contracts",
+            "publication",
+            "unfrozen",
+        },
+        "producer contracts",
+    )
+    if value["schema"] != PRODUCER_SCHEMA:
+        raise ContractError("producer-contract schema differs")
+    if value["state"] != "semantic_modes_frozen_environments_unbuilt":
+        raise ContractError("producer contracts claim an environment or execution")
+    _require_exact_value(
+        value["binds"],
+        {
+            "case_corpus_sha256": CASES_SHA256,
+            "source_manifest_sha256": SOURCE_MANIFEST_SHA256,
+            "source_revision": SOURCE_REVISION,
+            "trace_schema_path": "oracle/qwen38/trace-schema.json",
+            "trace_schema_sha256": TRACE_SCHEMA_SHA256,
+        },
+        "producer bindings",
+    )
+    _require_exact_value(
+        value["common"],
+        {
+            "batch_size": 1,
+            "padding": False,
+            "weights": "verified_checkpoint_bfloat16",
+            "gdn_recurrent_state": "float32",
+            "mode": "evaluation_inference_only",
+            "generation": "direct_forward_fixed_step_greedy_no_generate_api",
+            "argmax": "float32_logits_descending_value_then_ascending_token_id",
+            "stop": "include_stop_then_no_later_forward",
+            "max_steps": 16,
+            "fresh_process_per_run": True,
+            "fresh_cache_per_case": True,
+            "attention_mask": None,
+            "logical_positions": "absolute_arange_from_cache_offset_with_no_padding",
+            "quantization": False,
+            "vision": False,
+            "mtp": False,
+            "adapters": False,
+            "network_during_execution": False,
+            "source_verified_before_and_after": True,
+            "producer_reads_other_arm": False,
+            "producer_compares_or_decides_pass": False,
+            "snapshots_materialized_before_cache_mutation": True,
+            "forward_result_materialized_before_next_call": True,
+        },
+        "common producer semantics",
+    )
+    input_preparation = _exact_keys(
+        value["input_preparation"],
+        {
+            "state",
+            "ownership",
+            "tokenizer_loader",
+            "expected_class",
+            "render_call",
+            "tokenize_call",
+            "rendered_encoding",
+            "input_ids",
+            "rejection_mapping",
+            "parser_owner",
+            "arm_may_consume_other_arm_input_bundle",
+            "exact_input_bundle_sha256",
+            "tokenizer_sources",
+        },
+        "producer input preparation",
+    )
+    if input_preparation["arm_may_consume_other_arm_input_bundle"] is not False:
+        raise ContractError("a producer may consume the other arm input bundle")
+    tokenizer_sources = _exact_keys(
+        input_preparation["tokenizer_sources"],
+        {"transformers", "mlx_lm"},
+        "producer tokenizer sources",
+    )
+    for arm_id, source in tokenizer_sources.items():
+        if not isinstance(source, dict):
+            raise ContractError(f"producer tokenizer source {arm_id} must be an object")
+        _sha256(source.get("tokenization_auto_sha256"), f"{arm_id} tokenization_auto hash")
+        _sha256(source.get("tokenization_qwen2_sha256"), f"{arm_id} tokenization_qwen2 hash")
+    _require_exact_value(
+        value["separation"],
+        {
+            "dedicated_environment_per_arm": True,
+            "dedicated_entrypoint_per_arm": True,
+            "distinct_process_or_host": True,
+            "shared_current_oracle_environment_as_two_arms_forbidden": True,
+            "environment_and_entrypoint_aliases_forbidden": True,
+        },
+        "producer separation",
+    )
+    _require_exact_value(
+        value["trust_boundary"],
+        {
+            "trusted_isolated_runner_required": True,
+            "remote_hardware_attestation_provided": False,
+            "source_and_environment_mounted_immutable_during_each_child": True,
+            "concurrent_mutation_allowed": False,
+            "producer_receipt_is_evidence_not_self_authenticating_proof": True,
+            "external_verifier_recomputes_every_available_identity": True,
+        },
+        "producer trust boundary",
+    )
+    arms = value["arms"]
+    if not isinstance(arms, list) or len(arms) != 2:
+        raise ContractError("producer contracts must define exactly two arms")
+    by_id: dict[str, dict[str, Any]] = {}
+    arm_keys = {
+        "id",
+        "repository",
+        "revision",
+        "state",
+        "critical_sources",
+        "environment",
+        "load",
+        "execution",
+        "instrumentation",
+        "determinism",
+        "snapshot",
+    }
+    for index, arm in enumerate(arms):
+        arm = _exact_keys(arm, arm_keys, f"producer arm {index}")
+        arm_id = _string(arm["id"], f"producer arm {index} ID")
+        if arm_id in by_id:
+            raise ContractError(f"producer arm repeats ID: {arm_id}")
+        _commit(arm["revision"], f"producer arm {arm_id} revision")
+        by_id[arm_id] = arm
+    if list(by_id) != ["transformers", "mlx_lm"]:
+        raise ContractError("producer arm IDs or ordering differ")
+    if by_id["transformers"]["repository"] == by_id["mlx_lm"]["repository"]:
+        raise ContractError("producer arms use the same implementation source")
+
+    transformers = by_id["transformers"]
+    if transformers["revision"] != "95940bf8775059a42f047256f076e4f607bc43ec":
+        raise ContractError("Transformers producer revision differs")
+    if transformers["state"] != "semantic_mode_frozen_environment_missing":
+        raise ContractError("Transformers producer overclaims an environment")
+    _validate_critical_sources(
+        transformers["critical_sources"],
+        [
+            {
+                "path": "src/transformers/cache_utils.py",
+                "sha256": "0d5fd6901ce2b7108eff40e06d7ce29e9b0f9cc8ed2f40d2fb3a2e4d4f43e630",
+            },
+            {
+                "path": "src/transformers/integrations/hub_kernels.py",
+                "sha256": "50e5b5f938cdb2c5a2f7e90ae1ab3933cb2d505ab38c6c4f4d0226320df4b94a",
+            },
+            {
+                "path": "src/transformers/masking_utils.py",
+                "sha256": "e8c497af6979274fc6ae78980ad9893e7850bdb750e46d459f09178123992196",
+            },
+            {
+                "path": "src/transformers/modeling_rope_utils.py",
+                "sha256": "a8bf3f6a53760366fb5fa51cecc06a8707d3cded36fd8f3ac51e140c0718af21",
+            },
+            {
+                "path": "src/transformers/modeling_utils.py",
+                "sha256": "a7392c26dd2f005383cc3c1f8562638a6039d393ca03fb1933513479a6d264e4",
+            },
+            {
+                "path": "src/transformers/models/auto/tokenization_auto.py",
+                "sha256": "06115e3944dd73a2379a440f8131208dfaf1639a3992f29dce2d17f0e34785e0",
+            },
+            {
+                "path": "src/transformers/models/qwen2/tokenization_qwen2.py",
+                "sha256": "fac4e6576bfe2369731be147a4e530f262bdf32f2ac50436f96f0d8bdd2fc628",
+            },
+            {
+                "path": "src/transformers/models/qwen3_5/configuration_qwen3_5.py",
+                "sha256": "3c01b3cdcff8d77cbafac9841bc48c41e5a5b38637231f1bde3d843cd198dbaf",
+            },
+            {
+                "path": "src/transformers/models/qwen3_5/modeling_qwen3_5.py",
+                "sha256": "90d929129ffc835d2652c604925c4f3842bc6e401e174ec6f0db2285dfb8f85a",
+            },
+        ],
+        "Transformers critical sources",
+    )
+    tf_environment = _exact_keys(
+        transformers["environment"],
+        {
+            "lock_state",
+            "current_oracle_lock_may_not_be_used",
+            "python",
+            "torch_wheel_and_backend",
+            "accelerator",
+            "cpu_or_disk_offload",
+            "distributed_or_sharded",
+        },
+        "Transformers producer environment",
+    )
+    if tf_environment.get("lock_state") != "separate_lock_required_before_execution":
+        raise ContractError("Transformers producer does not require a separate lock")
+    if tf_environment.get("current_oracle_lock_may_not_be_used") is not True:
+        raise ContractError("Transformers producer may reuse the mlx-lm oracle lock")
+    if tf_environment.get("torch_wheel_and_backend") != "unfrozen":
+        raise ContractError("Transformers producer invents a Torch/backend identity")
+    if tf_environment.get("cpu_or_disk_offload") is not False:
+        raise ContractError("Transformers producer permits offload")
+    if tf_environment.get("distributed_or_sharded") is not False:
+        raise ContractError("Transformers producer permits sharding")
+    tf_load = _exact_keys(
+        transformers["load"],
+        {
+            "class",
+            "loader",
+            "source",
+            "torch_dtype",
+            "attn_implementation",
+            "device_placement",
+            "output_loading_info",
+            "local_files_only",
+            "trust_remote_code",
+            "strict_text_parameter_closure",
+            "executed_prefixes",
+            "allowed_loaded_but_unexecuted_prefixes",
+            "required_ignored_prefixes",
+            "randomly_initialized_text_parameters_allowed",
+        },
+        "Transformers producer load",
+    )
+    if tf_load.get("class") != "Qwen3_5ForConditionalGeneration":
+        raise ContractError("Transformers producer class differs")
+    if tf_load.get("source") != "verified_local_tree_only":
+        raise ContractError("Transformers producer source differs")
+    if tf_load.get("strict_text_parameter_closure") is not True:
+        raise ContractError("Transformers producer lacks strict text-parameter closure")
+    if tf_load.get("executed_prefixes") != ["model.language_model.", "lm_head."]:
+        raise ContractError("Transformers executed tensor scope differs")
+    if tf_load.get("allowed_loaded_but_unexecuted_prefixes") != ["model.visual."]:
+        raise ContractError("Transformers vision scope differs")
+    if tf_load.get("required_ignored_prefixes") != ["mtp."]:
+        raise ContractError("Transformers MTP scope differs")
+    if tf_load.get("local_files_only") is not True or tf_load.get("trust_remote_code") is not False:
+        raise ContractError("Transformers load is not offline and code-closed")
+    if tf_load.get("randomly_initialized_text_parameters_allowed") is not False:
+        raise ContractError("Transformers load permits random text parameters")
+    tf_execution = _exact_keys(
+        transformers["execution"],
+        {
+            "forward_target",
+            "forward_kwargs",
+            "model_eval",
+            "torch_inference_mode",
+            "autocast",
+            "torch_compile",
+            "attention_implementation",
+            "cache",
+            "use_cache",
+            "logits_to_keep",
+            "logits_selection",
+            "input_ids_dtype",
+            "position_ids_dtype",
+            "position_mapping",
+            "hub_kernel_environment",
+            "optional_imports_must_be_absent",
+            "gdn_prefill_path",
+            "gdn_decode_path",
+            "conv_path",
+            "resolved_callable_origins_must_be_receipted",
+        },
+        "Transformers producer execution",
+    )
+    if tf_execution.get("attention_implementation") != "eager":
+        raise ContractError("Transformers attention mode differs")
+    if tf_execution.get("hub_kernel_environment") != "USE_HUB_KERNELS=NO_before_python_import":
+        raise ContractError("Transformers hub kernels are not disabled before import")
+    if tf_execution.get("optional_imports_must_be_absent") != [
+        "causal_conv1d",
+        "fla",
+        "flash_attn",
+        "kernels",
+        "xformers",
+    ]:
+        raise ContractError("Transformers optional-kernel denial list differs")
+    if tf_execution.get("cache") != "DynamicCache(config=model.config)":
+        raise ContractError("Transformers cache mode differs")
+    if (
+        tf_execution.get("model_eval") is not True
+        or tf_execution.get("torch_inference_mode") is not True
+        or tf_execution.get("use_cache") is not True
+        or tf_execution.get("logits_to_keep") != 1
+    ):
+        raise ContractError("Transformers direct-forward mode differs")
+    if tf_execution.get("position_mapping") != (
+        "four_equal_planes_[text,time,height,width]_shape_[4,1,call_tokens]_from_canonical_absolute_positions"
+    ):
+        raise ContractError("Transformers position mapping differs")
+    if tf_execution.get("input_ids_dtype") != "torch.int64" or tf_execution.get(
+        "position_ids_dtype"
+    ) != "torch.int64":
+        raise ContractError("Transformers input dtype differs")
+    if not all(
+        tf_execution.get(key) is False
+        for key in ("autocast", "torch_compile")
+    ):
+        raise ContractError("Transformers producer permits a hidden execution transform")
+    if tf_execution.get("resolved_callable_origins_must_be_receipted") is not True:
+        raise ContractError("Transformers callable origins are not receipted")
+    _require_exact_value(
+        transformers["instrumentation"],
+        {
+            "state": "algorithm_frozen_entrypoint_unbuilt",
+            "stock_forward_target": "Qwen3_5ForConditionalGeneration.forward",
+            "capture_route": "temporary_read_only_torch_forward_hooks",
+            "module_mapping": {
+                "embedding_output": "model.model.language_model.embed_tokens output",
+                "decoder_output_<i>": (
+                    "model.model.language_model.layers[i] returned hidden tensor"
+                ),
+                "final_norm_output": "model.model.language_model.norm output",
+            },
+            "selected_layers_only": [0, 2, 3, 30, 31, 32, 62, 63],
+            "hook_returns_none": True,
+            "hooks_removed_after_each_forward_including_error": True,
+            "output_hidden_states_kwarg_used": False,
+            "global_monkeypatch": False,
+            "fresh_cache_stock_control": "behavior_monolithic_vs_trace_monolithic",
+        },
+        "Transformers instrumentation",
+    )
+    _require_exact_value(
+        transformers["determinism"],
+        {
+            "pythonhashseed": "0",
+            "cublas_workspace_config": ":4096:8",
+            "python_numpy_torch_seed": 0,
+            "deterministic_algorithms": "enabled_warn_only_false",
+            "cudnn_benchmark": False,
+            "float32_precision_apis": (
+                "torch.backends.fp32_precision='ieee';"
+                "torch.backends.cuda.matmul.fp32_precision='ieee'"
+            ),
+            "bfloat16_reduced_precision_and_split_k": [False, False],
+            "fp16_reduced_precision_and_split_k": [False, False],
+            "unsupported_deterministic_operation": "fatal",
+        },
+        "Transformers determinism",
+    )
+    if transformers["snapshot"] != "detach_clone_contiguous_device_sync_host_copy_then_hash":
+        raise ContractError("Transformers snapshot semantics differ")
+
+    mlx_lm = by_id["mlx_lm"]
+    if mlx_lm["revision"] != "8239c72de5a0e42c539e30489021db73c7fe258c":
+        raise ContractError("mlx-lm producer revision differs")
+    if mlx_lm["state"] != "semantic_mode_frozen_environment_candidate_unexecuted":
+        raise ContractError("mlx-lm producer overclaims execution")
+    _validate_critical_sources(
+        mlx_lm["critical_sources"],
+        [
+            {
+                "path": "mlx_lm/models/base.py",
+                "sha256": "61330e1c065739cd712bfeb09d673f33797cde7e613e95bf6d9ebbee9006f373",
+            },
+            {
+                "path": "mlx_lm/models/cache.py",
+                "sha256": "819ed95dcbf755652363cfdb15a639890447abb534a06dcefd52c7fff5055750",
+            },
+            {
+                "path": "mlx_lm/models/gated_delta.py",
+                "sha256": "79c8376a51c694b03e54d2f996ced6ea6c8c42868b8571529f97334db165a3e1",
+            },
+            {
+                "path": "mlx_lm/models/qwen3_5.py",
+                "sha256": "cdcfbf22681d2005f4bdff53ab9ab06da7aeb71c0e89378f65f893beeaf0b47c",
+            },
+            {
+                "path": "mlx_lm/models/qwen3_next.py",
+                "sha256": "3c572fe3fbb36721efab4d80d1bb6af11beb4ad1caae18deefc9fc84cbcd9b79",
+            },
+            {
+                "path": "mlx_lm/models/rope_utils.py",
+                "sha256": "9f68c938c040fa111d13f2ed95c70e8261515fb3b54f8a0a474c096baf4e087a",
+            },
+            {
+                "path": "mlx_lm/utils.py",
+                "sha256": "9473634d92dbba39d5133a7a92062c00a642aeb3b7477478d87a67ce5f34c22c",
+            },
+        ],
+        "mlx-lm critical sources",
+    )
+    mlx_environment = _exact_keys(
+        mlx_lm["environment"],
+        {
+            "lock_state",
+            "lock_path",
+            "lock_sha256",
+            "python",
+            "mlx",
+            "mlx_lm_revision",
+            "selected_mlx_metal_wheel",
+            "accelerator",
+            "pipeline_or_distributed",
+        },
+        "mlx-lm producer environment",
+    )
+    if mlx_environment.get("lock_state") != "existing_lock_candidate_unexecuted_for_qwen":
+        raise ContractError("mlx-lm environment state differs")
+    lock_path = _regular_repo_file(repo_root, mlx_environment.get("lock_path"), "mlx-lm lock")
+    lock_hash = _sha256(mlx_environment.get("lock_sha256"), "mlx-lm lock hash")
+    if lock_hash != MLX_ORACLE_LOCK_SHA256 or sha256_file(lock_path) != lock_hash:
+        raise ContractError("mlx-lm candidate lock identity differs")
+    if mlx_environment.get("selected_mlx_metal_wheel") != "unfrozen_until_host_selection":
+        raise ContractError("mlx-lm producer invents a host wheel")
+    if mlx_environment.get("pipeline_or_distributed") is not False:
+        raise ContractError("mlx-lm producer permits pipeline or distributed execution")
+    mlx_load = _exact_keys(
+        mlx_lm["load"],
+        {
+            "class",
+            "loader",
+            "source",
+            "model_file_config_field_must_be_absent",
+            "lazy",
+            "strict",
+            "strict_text_parameter_closure",
+            "source_selected_prefixes",
+            "runtime_parameter_prefixes",
+            "required_omitted_prefixes",
+            "randomly_initialized_text_parameters_allowed",
+        },
+        "mlx-lm producer load",
+    )
+    if mlx_load.get("class") != "mlx_lm.models.qwen3_5.Model":
+        raise ContractError("mlx-lm producer class differs")
+    if mlx_load.get("source") != (
+        "verified_full_unmodified_checkpoint_tree_then_pinned_Model.sanitize_to_text"
+    ):
+        raise ContractError("mlx-lm producer source or sanitize order differs")
+    if mlx_load.get("strict_text_parameter_closure") is not True:
+        raise ContractError("mlx-lm producer lacks strict text-parameter closure")
+    if mlx_load.get("source_selected_prefixes") != ["model.language_model.", "lm_head."]:
+        raise ContractError("mlx-lm source tensor scope differs")
+    if mlx_load.get("runtime_parameter_prefixes") != [
+        "language_model.lm_head.",
+        "language_model.model.",
+    ]:
+        raise ContractError("mlx-lm runtime parameter scope differs")
+    if mlx_load.get("required_omitted_prefixes") != ["model.visual.", "mtp."]:
+        raise ContractError("mlx-lm omitted tensor scope differs")
+    if mlx_load.get("lazy") is not False or mlx_load.get("strict") is not True:
+        raise ContractError("mlx-lm load is not eager and strict")
+    if mlx_load.get("randomly_initialized_text_parameters_allowed") is not False:
+        raise ContractError("mlx-lm load permits random text parameters")
+    mlx_execution = _exact_keys(
+        mlx_lm["execution"],
+        {
+            "forward_target",
+            "forward_kwargs",
+            "model_training",
+            "device",
+            "stream",
+            "global_compile_wrapper",
+            "cache",
+            "logits_selection",
+            "input_ids_dtype",
+            "position_mapping",
+            "gdn_primary_path",
+            "gdn_ops_fallback",
+            "mx_eval_logits_and_all_cache_leaves_after_every_forward",
+            "mx_gpu_synchronize_before_host_copy",
+            "default_device_gpu_assertion",
+            "metal_available_assertion",
+            "stock_kernel_route_assertion_per_call",
+            "resolved_kernel_and_callable_origins_must_be_receipted",
+        },
+        "mlx-lm producer execution",
+    )
+    if mlx_execution.get("cache") != "model.make_cache_48_arrayscache_16_kvcache":
+        raise ContractError("mlx-lm cache mode differs")
+    if mlx_execution.get("input_ids_dtype") != "mx.int32":
+        raise ContractError("mlx-lm input dtype differs")
+    if mlx_execution.get("model_training") is not False or mlx_execution.get("device") != "mlx_gpu_metal":
+        raise ContractError("mlx-lm primary device or evaluation mode differs")
+    if mlx_execution.get("gdn_primary_path") != "stock_metal_eval_kernel":
+        raise ContractError("mlx-lm primary GDN path differs")
+    if mlx_execution.get("gdn_ops_fallback") != "diagnostic_only_never_silent_primary":
+        raise ContractError("mlx-lm ops fallback can silently become primary")
+    for required_flag in (
+        "mx_eval_logits_and_all_cache_leaves_after_every_forward",
+        "mx_gpu_synchronize_before_host_copy",
+        "default_device_gpu_assertion",
+        "metal_available_assertion",
+        "stock_kernel_route_assertion_per_call",
+        "resolved_kernel_and_callable_origins_must_be_receipted",
+    ):
+        if mlx_execution.get(required_flag) is not True:
+            raise ContractError(f"mlx-lm execution omits {required_flag}")
+    if mlx_execution.get("global_compile_wrapper") is not False:
+        raise ContractError("mlx-lm producer permits a global compile wrapper")
+    _require_exact_value(
+        mlx_lm["instrumentation"],
+        {
+            "state": "algorithm_frozen_entrypoint_unbuilt",
+            "stock_forward_target": "mlx_lm.models.qwen3_5.Model.__call__",
+            "capture_route": (
+                "producer_entrypoint_explicit_text_orchestration_without_module_monkeypatch"
+            ),
+            "object_paths": {
+                "embed_tokens": "model.language_model.model.embed_tokens",
+                "layers": "model.language_model.model.pipeline_layers",
+                "final_norm": "model.language_model.model.norm",
+                "lm_head": "model.language_model.lm_head",
+            },
+            "orchestration": [
+                (
+                    "assert pipeline_size=1 pipeline_rank=0 ssm_idx=0 fa_idx=3 and exactly 64 "
+                    "pipeline_layers with the frozen layer-kind pattern"
+                ),
+                "embed inputs once and capture embedding_output",
+                (
+                    "build fa_mask with pinned create_attention_mask(hidden,cache[fa_idx]) and "
+                    "ssm_mask with pinned create_ssm_mask(hidden,cache[ssm_idx]) exactly once "
+                    "per call"
+                ),
+                (
+                    "for each ordered layer and cache entry choose ssm_mask for GDN or fa_mask "
+                    "for full attention, call the pinned layer, and capture selected post-block "
+                    "decoder outputs"
+                ),
+                (
+                    "apply the pinned final norm once, capture final_norm_output, then apply the "
+                    "untied pinned lm_head once"
+                ),
+                (
+                    "evaluate logits selected captures and every cache leaf together, synchronize "
+                    "the default Metal GPU stream, then host-copy snapshots"
+                ),
+            ],
+            "global_monkeypatch": False,
+            "fresh_cache_stock_control": "behavior_monolithic_vs_trace_monolithic",
+        },
+        "mlx-lm instrumentation",
+    )
+    _require_exact_value(
+        mlx_lm["determinism"],
+        {
+            "pythonhashseed": "0",
+            "python_numpy_mlx_seed": 0,
+            "greedy_only": True,
+            "unexpected_device_or_ops_fallback": "fatal",
+        },
+        "mlx-lm determinism",
+    )
+    if mlx_lm["snapshot"] != "copy_materialize_mx_eval_gpu_sync_host_copy_then_hash":
+        raise ContractError("mlx-lm snapshot semantics differ")
+
+    receipt_fields = _string_list(value["receipt_required_fields"], "producer receipt fields")
+    if receipt_fields != sorted(receipt_fields):
+        raise ContractError("producer receipt fields must be sorted")
+    required_receipt_fields = {
+        "argv",
+        "backend_and_device",
+        "cache_inventory",
+        "case_corpus_sha256",
+        "command_environment_allowlist",
+        "contract_sha256",
+        "conversation_and_input_bundle_sha256",
+        "critical_import_origins_and_hashes",
+        "determinism_controls",
+        "effective_forward_routes_and_static_kwargs",
+        "environment_lock_sha256",
+        "environment_tree_identity",
+        "installed_distribution_inventory",
+        "machine_profile_without_serial_numbers",
+        "model_source_revision",
+        "oracle_id",
+        "oracle_implementation_revision",
+        "oracle_repository",
+        "parameter_dtype_device_and_prefix_inventory",
+        "per_call_kernel_route_evidence",
+        "process_inventory",
+        "producer_contracts_sha256",
+        "producer_entrypoint_sha256",
+        "publication_target",
+        "python_executable_and_abi",
+        "raw_payload_inventory_sha256",
+        "resolved_kernel_inventory",
+        "selected_distribution_artifact_hashes_and_direct_urls",
+        "source_manifest_sha256",
+        "source_pre_verification",
+        "source_post_verification",
+        "source_tree_identity",
+        "start_and_end_utc",
+        "trace_schema_sha256",
+    }
+    if set(receipt_fields) != required_receipt_fields:
+        raise ContractError("producer receipt field set differs")
+    receipt_contracts = _exact_keys(
+        value["receipt_field_contracts"],
+        {
+            "closed_schema",
+            "sha256_fields",
+            "commit_fields",
+            "string_fields",
+            "nonempty_array_fields",
+            "nonempty_object_fields",
+            "nested_required_fields",
+            "nested_field_types",
+            "nested_nullable_fields",
+            "nested_digest_preimages",
+            "nested_semantic_rules",
+            "per_arm_environment_keys",
+            "per_arm_memory_diagnostic_profiles",
+            "digest_preimages",
+            "semantic_rules",
+        },
+        "producer receipt field contracts",
+    )
+    if receipt_contracts["closed_schema"] is not True:
+        raise ContractError("producer receipt schema is open")
+    typed_receipt_fields = set(
+        _string_list(receipt_contracts["sha256_fields"], "receipt SHA-256 fields")
+    ) | set(_string_list(receipt_contracts["commit_fields"], "receipt commit fields"))
+    for key in ("string_fields", "nonempty_array_fields", "nonempty_object_fields"):
+        mapping = receipt_contracts[key]
+        if not isinstance(mapping, dict) or not mapping:
+            raise ContractError(f"producer receipt {key} must be a nonempty object")
+        typed_receipt_fields.update(mapping)
+    if typed_receipt_fields != required_receipt_fields:
+        raise ContractError("producer receipt value types do not cover the exact field set")
+    nested_fields = receipt_contracts["nested_required_fields"]
+    if not isinstance(nested_fields, dict) or not nested_fields:
+        raise ContractError("producer receipt nested schemas are absent")
+    for key, fields in nested_fields.items():
+        if _string_list(fields, f"producer receipt nested schema {key}") != sorted(fields):
+            raise ContractError(f"producer receipt nested schema {key} is not sorted")
+    _require_exact_value(
+        nested_fields["memory_and_swap_before_peak_after"],
+        [
+            "accelerator_memory_authority",
+            "after_execution_bytes",
+            "after_load_bytes",
+            "before_load_bytes",
+            "diagnostic_only_noncomparable",
+            "memory_scope",
+            "peak_execution_bytes",
+            "sampling_interval_milliseconds",
+            "swap_after_bytes",
+            "swap_authority",
+            "swap_before_bytes",
+            "swap_peak_bytes",
+            "swap_scope",
+            "wired_memory_policy",
+        ],
+        "producer memory diagnostic field set",
+    )
+    nested_field_types = _exact_keys(
+        receipt_contracts["nested_field_types"],
+        {
+            "boolean",
+            "closed_object",
+            "nonnegative_integer",
+            "positive_integer_array",
+            "sha256",
+            "string",
+            "string_array",
+        },
+        "producer receipt nested field types",
+    )
+    expected_nested_paths = {
+        f"{schema_name}.{field}"
+        for schema_name, fields in nested_fields.items()
+        for field in fields
+    }
+    typed_nested_paths: list[str] = []
+    for field_type, paths in nested_field_types.items():
+        typed_paths = _string_list(paths, f"producer receipt nested {field_type} fields")
+        if typed_paths != sorted(typed_paths):
+            raise ContractError(f"producer receipt nested {field_type} fields are not sorted")
+        typed_nested_paths.extend(typed_paths)
+    if len(typed_nested_paths) != len(set(typed_nested_paths)) or set(
+        typed_nested_paths
+    ) != expected_nested_paths:
+        raise ContractError("producer receipt nested field types do not close the field set")
+    nullable_nested_paths = _string_list(
+        receipt_contracts["nested_nullable_fields"],
+        "producer receipt nested nullable fields",
+    )
+    if nullable_nested_paths != sorted(nullable_nested_paths) or not set(
+        nullable_nested_paths
+    ).issubset(expected_nested_paths):
+        raise ContractError("producer receipt nested nullability differs")
+    nested_digest_preimages = receipt_contracts["nested_digest_preimages"]
+    if not isinstance(nested_digest_preimages, dict) or set(nested_digest_preimages) != set(
+        nested_field_types["sha256"]
+    ):
+        raise ContractError("producer receipt nested digest preimages differ")
+    for path, preimage in nested_digest_preimages.items():
+        _string(preimage, f"producer receipt nested digest preimage {path}")
+    _string_list(
+        receipt_contracts["nested_semantic_rules"],
+        "producer receipt nested semantic rules",
+    )
+    environment_keys = _exact_keys(
+        receipt_contracts["per_arm_environment_keys"],
+        {"transformers", "mlx_lm"},
+        "producer receipt environment keys",
+    )
+    for arm_id, fields in environment_keys.items():
+        if _string_list(fields, f"producer receipt environment {arm_id}") != sorted(fields):
+            raise ContractError(f"producer receipt environment {arm_id} is not sorted")
+    _require_exact_value(
+        environment_keys,
+        {
+            "transformers": [
+                "CUBLAS_WORKSPACE_CONFIG",
+                "CUDA_VISIBLE_DEVICES",
+                "HF_HUB_OFFLINE",
+                "PYTHONDONTWRITEBYTECODE",
+                "PYTHONHASHSEED",
+                "PYTHONNOUSERSITE",
+                "PYTHONSAFEPATH",
+                "TRANSFORMERS_OFFLINE",
+                "USE_HUB_KERNELS",
+            ],
+            "mlx_lm": [
+                "HF_HUB_OFFLINE",
+                "PYTHONDONTWRITEBYTECODE",
+                "PYTHONHASHSEED",
+                "PYTHONNOUSERSITE",
+                "PYTHONSAFEPATH",
+                "TRANSFORMERS_OFFLINE",
+            ],
+        },
+        "producer receipt environment allowlists",
+    )
+    memory_profiles = _exact_keys(
+        receipt_contracts["per_arm_memory_diagnostic_profiles"],
+        {"transformers", "mlx_lm"},
+        "producer receipt memory diagnostic profiles",
+    )
+    _require_exact_value(
+        memory_profiles,
+        {
+            "transformers": {
+                "accelerator_memory_authority": (
+                    "torch.cuda.memory_allocated_and_max_memory_allocated_with_peak_reset_"
+                    "immediately_after_after_load_sample"
+                ),
+                "diagnostic_only_noncomparable": True,
+                "memory_scope": "model_process_accelerator_allocator_active_bytes",
+                "sampling_interval_milliseconds": 10,
+                "swap_authority": (
+                    "linux_proc_meminfo_swap_total_minus_swap_free_at_boundaries_and_parent_"
+                    "10ms_samples"
+                ),
+                "swap_scope": "host_global_used_swap_bytes",
+            },
+            "mlx_lm": {
+                "accelerator_memory_authority": (
+                    "mx.metal.get_active_memory_and_get_peak_memory_with_peak_reset_"
+                    "immediately_after_after_load_sample"
+                ),
+                "diagnostic_only_noncomparable": True,
+                "memory_scope": "model_process_accelerator_allocator_active_bytes",
+                "sampling_interval_milliseconds": 10,
+                "swap_authority": (
+                    "macos_sysctlbyname_vm.swapusage_used_at_boundaries_and_parent_10ms_"
+                    "samples"
+                ),
+                "swap_scope": "host_global_used_swap_bytes",
+            },
+        },
+        "producer receipt memory diagnostic profiles",
+    )
+    digest_preimages = receipt_contracts["digest_preimages"]
+    if not isinstance(digest_preimages, dict) or set(digest_preimages) != set(
+        receipt_contracts["sha256_fields"]
+    ):
+        raise ContractError("producer receipt digest preimages differ from its digest fields")
+    _string_list(receipt_contracts["semantic_rules"], "producer receipt semantic rules")
+    parameter_closure = _exact_keys(
+        value["parameter_closure"],
+        {
+            "state",
+            "expected_source_tensor_counts",
+            "requirements",
+            "execution_may_begin_before_implementation",
+        },
+        "producer parameter closure",
+    )
+    if (
+        parameter_closure["state"] != "required_algorithm_frozen_implementation_pending"
+        or parameter_closure["execution_may_begin_before_implementation"] is not False
+    ):
+        raise ContractError("producer parameter closure overclaims or permits execution")
+    _require_exact_value(
+        parameter_closure["expected_source_tensor_counts"],
+        {
+            "mtp_omitted": 15,
+            "selected_text_and_lm_head": 851,
+            "total": 1199,
+            "vision_loaded_or_omitted_by_arm": 333,
+        },
+        "producer source tensor counts",
+    )
+    _string_list(parameter_closure["requirements"], "producer parameter closure requirements")
+    publication = _exact_keys(
+        value["publication"],
+        {
+            "state",
+            "sibling_staging_directory",
+            "files_and_directories_fsynced",
+            "same_filesystem_atomic_rename",
+            "parent_directory_fsynced",
+            "existing_target_refused",
+            "manifest_written_last",
+            "no_skip_or_partial_success",
+        },
+        "producer publication",
+    )
+    if publication.get("state") != "required_behavior_not_implemented":
+        raise ContractError("producer publication overclaims implementation")
+    for required_flag in (
+        "sibling_staging_directory",
+        "files_and_directories_fsynced",
+        "same_filesystem_atomic_rename",
+        "parent_directory_fsynced",
+        "existing_target_refused",
+        "manifest_written_last",
+        "no_skip_or_partial_success",
+    ):
+        if publication.get(required_flag) is not True:
+            raise ContractError(f"producer publication weakens {required_flag}")
+    unfrozen = _string_list(value["unfrozen"], "producer unfrozen identities")
+    required_unfrozen = {
+        "transformers_dependency_lock_and_wheel_hashes",
+        "transformers_torch_cuda_and_cudnn_builds",
+        "transformers_gpu_model_driver_and_uuid",
+        "mlx_selected_wheel_machine_and_macos_build",
+        "both_installed_package_tree_digests",
+        "both_producer_entrypoints",
+        "both_clean_execution_receipts",
+        "both_exact_python_builds_and_executables",
+        "run_to_run_variance",
+        "numeric_tolerances",
+        "raw_payload_identities",
+        "rendered_and_tokenized_input_bundle_identity",
+        "cross_oracle_agreement",
+        "native_support",
+    }
+    if set(unfrozen) != required_unfrozen:
+        raise ContractError("producer unfrozen identity set differs")
+    if (
+        hashlib.sha256(canonical_json(value)).hexdigest()
+        != PRODUCER_CONTRACTS_CANONICAL_SHA256
+    ):
+        raise ContractError("producer contracts differ from the reviewed canonical semantics")
+    return value
+
+
+def mlx_kv_capacity_after_calls(call_token_counts: list[int]) -> tuple[int, int]:
+    """Return the pinned mlx-lm KVCache logical length and allocated capacity."""
+
+    logical_offset = 0
+    capacity = 0
+    for index, call_tokens in enumerate(call_token_counts):
+        if type(call_tokens) is not int or call_tokens <= 0:
+            raise ContractError(f"MLX KV call {index} token count must be a positive integer")
+        if logical_offset + call_tokens > capacity:
+            if capacity > 0 and logical_offset % 256 != 0:
+                capacity = logical_offset
+            capacity += ((call_tokens + 255) // 256) * 256
+        logical_offset += call_tokens
+    return logical_offset, capacity
+
+
+def normalize_synthetic_layout(
+    values: list[int],
+    shape: list[int],
+    transform: str,
+    *,
+    logical_offset: int | None = None,
+    call_token_counts: list[int] | None = None,
+) -> tuple[list[int], list[int]]:
+    """Exercise reviewed axis transforms without accepting a real trace payload."""
+
+    if not shape or any(type(dimension) is not int or dimension <= 0 for dimension in shape):
+        raise ContractError("synthetic tensor shape must contain positive integers")
+    element_count = 1
+    for dimension in shape:
+        element_count *= dimension
+    if len(values) != element_count:
+        raise ContractError("synthetic tensor element count differs from its shape")
+    if transform == "identity":
+        return list(values), list(shape)
+    if transform == "transpose_last_two":
+        if len(shape) < 2:
+            raise ContractError("last-two transpose requires rank >= 2")
+        rows, columns = shape[-2:]
+        outer = element_count // (rows * columns)
+        output = []
+        for outer_index in range(outer):
+            base = outer_index * rows * columns
+            for column in range(columns):
+                for row in range(rows):
+                    output.append(values[base + row * columns + column])
+        return output, [*shape[:-2], columns, rows]
+    if transform == "take_last_3_then_transpose_0_2_1":
+        if len(shape) != 3 or shape[-1] != 4:
+            raise ContractError("convolution normalization requires [B,C,4]")
+        batch, channels, retained = shape
+        output = []
+        for batch_index in range(batch):
+            for history in range(1, retained):
+                for channel in range(channels):
+                    output.append(values[(batch_index * channels + channel) * retained + history])
+        return output, [batch, 3, channels]
+    if transform == "slice_token_axis_to_logical_offset":
+        if len(shape) != 4 or logical_offset is None or call_token_counts is None:
+            raise ContractError(
+                "KV normalization requires rank 4, a logical offset, and call token counts"
+            )
+        batch, heads, capacity, features = shape
+        if (
+            logical_offset <= 0
+            or logical_offset > capacity
+            or capacity >= logical_offset + 256
+        ):
+            raise ContractError("KV capacity does not satisfy L<=C<L+256")
+        expected_offset, expected_capacity = mlx_kv_capacity_after_calls(call_token_counts)
+        if (logical_offset, capacity) != (expected_offset, expected_capacity):
+            raise ContractError("KV capacity does not satisfy the pinned mlx-lm recurrence")
+        output = []
+        for batch_index in range(batch):
+            for head in range(heads):
+                base = (batch_index * heads + head) * capacity * features
+                output.extend(values[base : base + logical_offset * features])
+        return output, [batch, heads, logical_offset, features]
+    raise ContractError(f"unsupported synthetic layout transform: {transform}")
+
+
 def _validate_contract_value(repo_root: Path, contract: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     contract = _exact_keys(
         contract,
         {
             "schema",
+            "supersedes",
             "status",
             "source",
             "component",
             "oracles",
+            "producer_contracts",
             "conversation",
             "required_coverage",
             "trace",
@@ -765,6 +2700,11 @@ def _validate_contract_value(repo_root: Path, contract: Any) -> tuple[dict[str, 
     )
     if contract["schema"] != CONTRACT_SCHEMA:
         raise ContractError("oracle contract schema differs")
+    if contract["supersedes"] != {
+        "schema": PREVIOUS_CONTRACT_SCHEMA,
+        "sha256": PREVIOUS_CONTRACT_SHA256,
+    }:
+        raise ContractError("oracle contract does not bind the reviewed v1 predecessor")
     if contract["status"] != STATUS:
         raise ContractError("oracle contract status overclaims or differs")
 
@@ -853,8 +2793,8 @@ def _validate_contract_value(repo_root: Path, contract: Any) -> tuple[dict[str, 
         _sha256(oracle["implementation_sha256"], f"oracle {oracle_id} implementation hash")
         if oracle["state"] != "source_pinned_unexecuted":
             raise ContractError(f"oracle {oracle_id} claims execution")
-        if oracle["execution_mode_status"] != "partial_intent_environment_and_producer_unfrozen":
-            raise ContractError(f"oracle {oracle_id} overclaims a frozen execution mode")
+        if oracle["execution_mode_status"] != "semantic_mode_frozen_environment_unbuilt":
+            raise ContractError(f"oracle {oracle_id} execution-mode state differs")
         if not isinstance(oracle["execution_intent"], dict) or not oracle["execution_intent"]:
             raise ContractError(f"oracle {oracle_id} lacks an execution intent")
         oracle_ids.add(oracle_id)
@@ -866,6 +2806,26 @@ def _validate_contract_value(repo_root: Path, contract: Any) -> tuple[dict[str, 
         raise ContractError("oracle implementations are not independent source pins")
     if oracles != EXPECTED_ORACLES:
         raise ContractError("oracle source pins or execution modes differ")
+
+    producer_reference = _exact_keys(
+        contract["producer_contracts"],
+        {"state", "path", "sha256"},
+        "producer-contract reference",
+    )
+    if producer_reference["state"] != "semantic_modes_frozen_environments_unbuilt":
+        raise ContractError("producer-contract reference overclaims execution")
+    producer_path = _regular_repo_file(
+        repo_root,
+        producer_reference["path"],
+        "Qwen producer contracts",
+    )
+    producer_hash = _sha256(producer_reference["sha256"], "producer-contract hash")
+    if producer_hash != PRODUCER_CONTRACTS_SHA256:
+        raise ContractError("producer-contract hash is not the reviewed pin")
+    if sha256_file(producer_path) != producer_hash:
+        raise ContractError("producer-contract file hash differs")
+    producer_contracts = load_json_no_duplicates(producer_path)
+    validate_producer_contracts_value(repo_root, producer_contracts)
 
     conversation = _exact_keys(
         contract["conversation"],
@@ -928,27 +2888,34 @@ def _validate_contract_value(repo_root: Path, contract: Any) -> tuple[dict[str, 
 
     trace = _exact_keys(
         contract["trace"],
-        {"state", "required_channels", "required_boundaries", "bundle_rules", "tolerances"},
+        {"state", "schema_path", "schema_sha256", "bundle_rules", "tolerances"},
         "trace contract",
     )
-    if trace["state"] != "channel_requirements_preregistered_no_payload":
+    if trace["state"] != "schema_frozen_no_payload":
         raise ContractError("trace contract claims a payload")
-    if _string_list(trace["required_channels"], "trace required channels") != REQUIRED_TRACE_CHANNELS:
-        raise ContractError("trace channels differ from the reviewed contract")
-    if _string_list(trace["required_boundaries"], "trace required boundaries") != REQUIRED_TRACE_BOUNDARIES:
-        raise ContractError("trace boundaries differ from the reviewed contract")
+    trace_path = _regular_repo_file(repo_root, trace["schema_path"], "Qwen trace schema")
+    trace_hash = _sha256(trace["schema_sha256"], "Qwen trace-schema hash")
+    if trace_hash != TRACE_SCHEMA_SHA256:
+        raise ContractError("trace-schema hash is not the reviewed pin")
+    if sha256_file(trace_path) != trace_hash:
+        raise ContractError("trace-schema file hash differs")
+    trace_schema = load_json_no_duplicates(trace_path)
+    validate_trace_schema_value(trace_schema, cases)
     expected_rules = {
         "raw_oracle_outputs_separate": True,
-        "producer_authored_pass_ignored": True,
+        "producer_authored_pass_forbidden": True,
         "third_party_comparison_required": True,
         "exact_inventory_required": True,
         "external_inventory_digest_required": True,
+        "shared_verifier_outputs_sealed": True,
         "atomic_publication_required": True,
         "source_verified_before_and_after": True,
     }
     if trace["bundle_rules"] != expected_rules:
         raise ContractError("trace bundle rules differ")
-    if trace["tolerances"] != {"status": "unfrozen_requires_clean_and_fault_measurement"}:
+    if trace["tolerances"] != {
+        "status": "unfrozen_requires_clean_repeat_and_injected_fault_measurement"
+    }:
         raise ContractError("trace contract invents or changes tolerances")
     if (
         _string_list(contract["required_evidence_identities"], "required evidence identities")
@@ -966,9 +2933,14 @@ def validate_contract_value(repo_root: Path, contract: Any) -> dict[str, Any]:
         "source_revision": validated["source"]["revision"],
         "source_manifest_sha256": validated["source"]["manifest_sha256"],
         "case_corpus_sha256": validated["conversation"]["cases_sha256"],
+        "trace_schema_sha256": validated["trace"]["schema_sha256"],
+        "producer_contracts_sha256": validated["producer_contracts"]["sha256"],
         "case_count": len(cases),
         "oracle_ids": sorted(oracle["id"] for oracle in validated["oracles"]),
         "contract_only_unexecuted": True,
+        "trace_schema_frozen": True,
+        "producer_semantics_frozen": True,
+        "producer_environments_frozen": False,
         "native_executable": False,
         "support_accepted": False,
     }

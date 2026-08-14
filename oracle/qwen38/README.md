@@ -1,13 +1,19 @@
 # Qwen3.8 oracle contract
 
-This directory is the model-free first slice of P2. It freezes the inputs and evidence shape for
-the future Qwen3.8 differential oracle without claiming that either reference has run.
+This directory contains the model-free P2 oracle foundation. It freezes inputs, raw trace
+semantics, verifier-owned state normalization, and the two producer recipes without claiming that
+either reference has run.
 
 Current state: **contract only, unexecuted**.
 
 - No Qwen weights have been acquired or locally verified.
+- No complete Transformers environment or producer entrypoint exists. The existing `oracle`
+  environment is only an unexecuted mlx-lm candidate and must not impersonate both arms.
 - No Transformers or mlx-lm real-weight trace has been produced.
 - No numeric tolerance or cross-reference agreement has been measured.
+- The v1 bundle schema is raw evidence only. It deliberately has no comparison-report artifact;
+  tolerances and a sealed exhaustive comparison report require clean repeats, fault injection, and
+  a reviewed superseding contract.
 - Qwen remains unavailable to the native runtime and is not an accepted artifact or supported
   model.
 
@@ -21,25 +27,67 @@ Current state: **contract only, unexecuted**.
 - `cases.jsonl` contains only first-party prompts, standard Transformers function/tool wrappers,
   transcript inputs, bounded 16-step generation cases, and parser probes. It contains no
   rendered template output, model tokenization, logits, states, or generated text.
-- `contract.json` pins the two implementation sources and preregisters required trace-channel
-  classes, boundaries, evidence identities, and anti-self-attestation rules. Exact tensor
-  selections, layouts, frames, and serialization remain intentionally unfrozen.
+- `trace-schema.json` freezes the bounded run matrix, prediction/cache frame semantics, selected
+  layers and positions, native tensor layouts, top-32 diagnostics, metric formulas, closed event
+  and payload records, and headerless little-endian payload grammar. It also promotes selected
+  render inputs into bounded free-running thinking, tool, and preserved-history probes without
+  inventing expected model output. Parser outcomes remain verifier-owned outside both raw arm
+  roots rather than being self-attested by either model producer.
+- `producer-contracts.json` freezes the direct-forward modes, loader/tokenizer provenance,
+  parameter-closure algorithm, and closed receipt value contracts. Transformers uses the pinned
+  pure-Torch GDN/conv fallbacks with optional kernel packages absent; mlx-lm verifies the full
+  unmodified checkpoint tree, then uses its pinned sanitizer and stock Metal GDN kernel. Their
+  environment and executable identities remain unbuilt.
+- `contract.json` supersedes and hash-binds the reviewed v1 input-only contract, both new files,
+  the two source implementations, and all non-claim statuses.
 - `../qwen38_contract.py` validates the committed contract and can verify a future complete source
   tree. It uses only the Python standard library and fails on missing inputs rather than skipping.
 
-The two pinned implementation candidates have this partial execution intent:
+The two pinned semantic modes are:
 
 - Hugging Face Transformers commit
-  `95940bf8775059a42f047256f076e4f607bc43ec`, with hub kernels disabled, eager full attention,
-  local-only loading, BF16 weights, and fixed-step greedy forward calls.
+  `95940bf8775059a42f047256f076e4f607bc43ec`, with hub kernels disabled before import, FLA,
+  `causal_conv1d`, `kernels`, FlashAttention, and xFormers absent, eager full attention,
+  local-only BF16 loading, and direct fixed-step greedy calls.
 - mlx-lm commit `8239c72de5a0e42c539e30489021db73c7fe258c` on MLX 0.32.0, using its stock Qwen3.5 text
   graph and fixed-step greedy forward calls.
 
-These are source pins, not accepted execution modes or environment identities. Device/runtime,
-cache and chunk policy, optional kernel availability, deterministic controls, producer call
-shape, and executable/package-tree receipts still need to be frozen independently. Both arms use
-the checkpoint tokenizer and template, so matching rendered prompts are a shared-dependency
-check—not an independent vote on model math.
+Stock calls cannot expose every selected intermediate site. Instrumented Transformers runs use
+temporary read-only hooks that are removed on every exit; instrumented mlx-lm runs use an explicit
+pinned text-graph orchestration adapter because its public model call returns only logits. A fresh
+stock-versus-instrumented control binds generation frames and termination before either route may
+contribute evidence. Neither adapter has been implemented or executed yet.
+
+These are frozen recipes, not executed or accepted environment identities. The strict parameter
+closure, bundle verifier, and atomic publisher are specified but not implemented, so execution is
+forbidden until those controls exist. The Transformers arm
+still needs an independently hashed Python/Torch/CUDA lock and an 80 GB-class device; the mlx-lm
+candidate still needs its selected MLX/Metal wheel, high-memory Apple host, package-tree receipt,
+and producer entrypoint. The local 16 GB M5 cannot host the resident BF16 oracle. Both arms use the
+checkpoint tokenizer and template, so matching rendered prompts are a shared-dependency check—not
+an independent vote on model math.
+
+Each arm is an orchestrator receipt plus one input-preparation child and twelve fresh model-run
+children. The receipt inventories a static 128-leaf cache topology; call-specific offsets,
+capacities, shapes, and bytes belong only to the joined event and payload records. Environment
+receipts close the canonical site-packages and standard-library trees, import origins, static
+forward signature, per-call/per-layer kernel routes, and source-to-runtime parameter mapping.
+This is provenance on a trusted isolated runner, not remote hardware attestation: the source and
+environment must be immutable while each child runs, and the external verifier recomputes every
+identity it can observe.
+
+The three stop-related case coverage labels describe configured stop-policy inputs, not observed
+termination. Actual stop-token versus 16-step-bound behavior is recorded per call and run. Memory
+and swap receipts are likewise diagnostic and arm-local: they use each accelerator allocator plus
+host-global swap sampling and are never treated as cross-arm acceptance metrics.
+
+Raw state stays runtime-native. The independent verifier must transpose mlx-lm recurrent state,
+reduce Transformers' four-token convolution cache to the comparable three-token history, and
+slice mlx-lm's allocated KV backing to its receipted logical offset. The backing capacity is not
+assumed to be a multiple of 256 after nonaligned chunk appends; it is recomputed from the exact
+call schedule using mlx-lm's step-256 growth/truncation recurrence. Qwen's equal 128-wide key and
+value features make the recurrent transpose invisible to shape checks; asymmetric synthetic
+controls make that mapping testable.
 
 ## Model-free verification
 
@@ -59,11 +107,10 @@ hash drift. A Hugging Face transport cache must stay outside the verified payloa
 
 ## Next protected slice
 
-First freeze the exact producer modes and comparable trace schema: selected layers/positions,
-tensor axes/dtypes/shapes, full-logit frames, top-k width, prefill chunk boundaries, and
-serialization. Then build separate Transformers and mlx-lm environments and producers. Each must
-verify the source before and after execution, load locally with no mutable network fallback,
-write its own raw outputs and receipt, and never consume the other producer's normalization. A
-third project-owned verifier will compare the raw arms and derive clean-versus-fault tolerances.
-The bundle is valid only after an exact external inventory digest and atomic publication; a
-producer-authored `pass` field has no authority.
+Build the separate Transformers environment and both producer entrypoints, plus the independent
+raw-bundle verifier and atomic publisher. Each producer must verify the source before and after
+execution, load locally with no mutable network fallback, write its own raw outputs and receipt,
+and never consume the other producer's output or normalization. The verifier will derive
+clean-versus-fault tolerances after repeat runs. The bundle is valid only after an exact detached
+inventory digest covers both raw arms and shared verifier-owned parser results, followed by tested
+atomic publication; producer-authored pass or agreement fields are forbidden.
