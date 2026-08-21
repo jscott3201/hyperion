@@ -547,6 +547,19 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
             self.publish(hooks={"at_rename": raise_at_rename})
         self.assertFalse(self.target.exists())
 
+    def test_at_rename_hook_raising_after_the_rename_is_uncertain(self) -> None:
+        self.prepare_tree()
+
+        def rename_then_raise(rename: Callable[[], str]) -> str:
+            operation = rename()
+            raise FailingHook("after successful rename")
+
+        with self.assertRaises(evidence_io.DurablePublicationUncertainError) as caught:
+            self.publish(hooks={"at_rename": rename_then_raise})
+        self.assertIsInstance(caught.exception.__cause__, FailingHook)
+        self.assertTrue(self.target.is_dir())
+        self.assertEqual((self.target / MARKER_PATH).read_bytes(), MARKER_BYTES)
+
     def test_post_rename_parent_sync_failure_is_not_durable_success(self) -> None:
         self.prepare_tree()
 
@@ -616,15 +629,14 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
             if not seen:
                 seen.add(None)
                 os.rename(self.staging, self.workspace / "staging-superseded")
-                self.staging.mkdir()
-                (self.staging / "imposter.txt").write_bytes(b"imposter")
+                shutil.copytree(self.workspace / "staging-superseded", self.staging)
 
         with self.assertRaisesRegex(
             evidence_io.TreeMutationError, "replaced before the atomic transition"
         ):
             self.publish(hooks={"before_rename": swap})
         self.assertFalse(self.target.exists())
-        self.assertTrue((self.staging / "imposter.txt").exists())
+        self.assertTrue((self.staging / "alpha.json").exists())
 
     def test_file_added_after_the_final_inventory_is_refused(self) -> None:
         self.prepare_tree()
@@ -669,6 +681,27 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
             evidence_io.TreeMutationError, "differs from the accepted inventory"
         ):
             self.publish(hooks={"after_final_inventory": rewrite})
+        self.assertFalse(self.target.exists())
+
+    def test_forged_mtime_same_size_rewrite_is_refused(self) -> None:
+        self.prepare_tree({"alpha.json": b'{"first":1}\n'})
+        original_stat = (self.staging / "alpha.json").stat()
+        seen: set[None] = set()
+
+        def forge() -> None:
+            if not seen:
+                seen.add(None)
+                victim = self.staging / "alpha.json"
+                victim.write_bytes(b'{"first":2}\n')
+                os.utime(
+                    victim,
+                    ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+                )
+
+        with self.assertRaisesRegex(
+            evidence_io.TreeMutationError, "differs from the accepted inventory"
+        ):
+            self.publish(hooks={"after_final_inventory": forge})
         self.assertFalse(self.target.exists())
 
     def test_file_added_during_the_directory_sync_is_refused(self) -> None:

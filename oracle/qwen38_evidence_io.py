@@ -166,7 +166,10 @@ def _open_root_directory(root: Path, context: str) -> int:
     except OSError as error:
         raise UnsafeTreeError(f"{context} could not be opened: {root}") from error
     try:
-        opened = os.fstat(descriptor)
+        try:
+            opened = os.fstat(descriptor)
+        except OSError as error:
+            raise TreeMutationError(f"{context} could not be inspected") from error
         if not stat.S_ISDIR(opened.st_mode) or (
             opened.st_dev,
             opened.st_ino,
@@ -209,7 +212,13 @@ def _open_resolved_directory(path: Path, context: str) -> int:
                 raise UnsafePathError(
                     f"{context} could not be opened: {part!r} in {resolved}"
                 ) from error
-            opened = os.fstat(child)
+            try:
+                opened = os.fstat(child)
+            except OSError as error:
+                os.close(child)
+                raise TreeMutationError(
+                    f"{context} component could not be inspected: {part!r}"
+                ) from error
             if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
                 os.close(child)
                 raise TreeMutationError(
@@ -230,7 +239,11 @@ def _assert_same_identity(
 ) -> None:
     if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
         raise TreeMutationError(f"entry changed identity while being read: {relative}")
-    if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+    if (
+        before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or before.st_ctime_ns != after.st_ctime_ns
+    ):
         raise TreeMutationError(f"entry changed content while being read: {relative}")
 
 
@@ -255,7 +268,10 @@ def _inventory_file(
     except OSError as error:
         raise UnsafeTreeError(f"entry could not be opened: {relative}") from error
     try:
-        before = os.fstat(descriptor)
+        try:
+            before = os.fstat(descriptor)
+        except OSError as error:
+            raise TreeMutationError(f"entry could not be inspected: {relative}") from error
         if not stat.S_ISREG(before.st_mode):
             raise UnsafeTreeError(f"entry is not a regular file: {relative}")
         if before.st_nlink != 1:
@@ -276,7 +292,10 @@ def _inventory_file(
             if not chunk:
                 break
             digest.update(chunk)
-        after = os.fstat(descriptor)
+        try:
+            after = os.fstat(descriptor)
+        except OSError as error:
+            raise TreeMutationError(f"entry could not be inspected: {relative}") from error
         _assert_same_identity(before, after, relative)
     finally:
         os.close(descriptor)
@@ -534,11 +553,13 @@ def _sync_files_walk(
                         before.st_ino,
                         before.st_size,
                         before.st_mtime_ns,
+                        before.st_ctime_ns,
                     ) != (
                         accepted.st_dev,
                         accepted.st_ino,
                         accepted.st_size,
                         accepted.st_mtime_ns,
+                        accepted.st_ctime_ns,
                     ):
                         raise TreeMutationError(
                             f"staging entry differs from the accepted inventory: {relative}"
@@ -549,7 +570,13 @@ def _sync_files_walk(
                         raise PublicationFailedError(
                             f"staging file could not be synced: {relative}"
                         ) from error
-                    _assert_same_identity(before, os.fstat(descriptor), relative)
+                    try:
+                        after_sync = os.fstat(descriptor)
+                    except OSError as error:
+                        raise PublicationFailedError(
+                            f"staging file could not be inspected: {relative}"
+                        ) from error
+                    _assert_same_identity(before, after_sync, relative)
                 finally:
                     os.close(descriptor)
             else:
@@ -787,22 +814,27 @@ def publish_tree(
     The staging tree is caller-owned. Nothing is deleted on failure unless
     ``remove_staging_on_failure`` is set, and even then only after the
     staging root is proven to still hold the identity observed at the start.
-    The rename is sourced from an identity-checked parent descriptor, and
-    the sync passes reconcile the tree against the accepted inventory, so a
-    staging-root swap or content mutation before the transition is refused
-    instead of published. A swap landing in the irreducible window between
-    that final identity check and the rename syscall itself cannot be
-    detected in userspace and is a documented residual. If anything fails
-    after the rename took effect, the target may be visible but durability
-    is not claimed; the error is surfaced and no rollback is attempted.
+    The rename is sourced from an identity-checked parent descriptor, the
+    sync pass compares every file's full identity (device, inode, size,
+    mtime, ctime) against snapshots from the accepted inventory, and a
+    stat-only structural reconciliation runs immediately before the
+    transition. A staging-root swap or content mutation landing in the
+    irreducible window between that final reconciliation and the rename
+    syscall itself cannot be detected in userspace and is a documented
+    residual, as is a mutation that fits inside one timestamp-granularity
+    tick. If anything fails after the rename took effect, the target may be
+    visible but durability is not claimed; the error is surfaced and no
+    rollback is attempted.
 
     Deterministic fault-injection hooks, invoked when present in ``hooks``:
     ``after_initial_inventory``, ``after_final_marker``,
     ``after_final_inventory``, ``during_file_sync(relative)``,
     ``during_directory_sync(prefix)``, ``before_rename``,
     ``at_rename(rename)``, ``after_rename``, and ``during_parent_sync``.
-    An ``at_rename`` hook that raises after invoking the rename is
-    conservatively classified as a durable-publication-uncertain outcome.
+    ``before_rename`` runs before the final reconciliation, so hook-driven
+    staging changes are still refused. An ``at_rename`` hook that raises
+    after invoking the rename is conservatively classified as a
+    durable-publication-uncertain outcome.
     """
 
     staging_root = Path(staging_root)
@@ -852,6 +884,7 @@ def publish_tree(
                 raise CrossDeviceError(
                     "staging and the target parent are on different filesystems"
                 )
+            _run_hook(hooks, "before_rename")
             staging_root_fd = _open_root_directory(staging_root, "staging root")
             try:
                 reconciled = _stat_tree_walk(staging_root_fd, "")
@@ -861,7 +894,6 @@ def publish_tree(
                 raise TreeMutationError(
                     "staging no longer matches the accepted inventory before the transition"
                 )
-            _run_hook(hooks, "before_rename")
             try:
                 source_metadata = os.stat(
                     resolved_staging.name,
