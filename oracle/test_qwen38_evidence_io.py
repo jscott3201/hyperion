@@ -772,6 +772,33 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
         self.assertTrue((self.target / "victim.txt").exists())
         self.assertTrue(self.staging.is_dir())
 
+    def test_at_rename_hook_fabricating_target_exists_is_uncertain(self) -> None:
+        self.prepare_tree()
+        operation = evidence_io._no_replace_primitive()[2]
+
+        def rename_out_of_band(rename: Callable[[], str]) -> str:
+            os.rename(self.staging, self.target)
+            raise evidence_io.TargetExistsError("hook-fabricated refusal")
+
+        with self.assertRaises(evidence_io.DurablePublicationUncertainError) as caught:
+            self.publish(hooks={"at_rename": rename_out_of_band})
+        self.assertEqual(caught.exception.kind, "at_rename_outcome_unverified")
+        self.assertTrue(self.target.is_dir())
+        del operation
+
+    def test_hook_raising_oserror_is_typed_as_publication_failed(self) -> None:
+        self.prepare_tree()
+
+        def injected(prefix: str) -> None:
+            raise OSError(5, "injected hook failure")
+
+        with self.assertRaisesRegex(
+            evidence_io.PublicationFailedError, "during_directory_sync hook failed"
+        ):
+            self.publish(hooks={"during_directory_sync": injected})
+        self.assertFalse(self.target.exists())
+        self.assertTrue(self.staging.is_dir())
+
     def test_post_rename_parent_sync_failure_is_not_durable_success(self) -> None:
         self.prepare_tree()
 

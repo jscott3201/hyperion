@@ -100,6 +100,10 @@ class UnsupportedPlatformError(EvidenceIOError):
     kind = "unsupported_platform"
 
 
+class _RenameTargetExists(TargetExistsError):
+    """A no-replace rename through the platform primitive hit an existing target."""
+
+
 @dataclass(frozen=True)
 class PublicationReceipt:
     """Implementation-owned publication facts, not an evidence receipt."""
@@ -119,7 +123,10 @@ Hooks = dict[str, Callable[..., object]]
 def _run_hook(hooks: Hooks | None, name: str, *arguments: Any) -> None:
     hook = (hooks or {}).get(name)
     if hook is not None:
-        hook(*arguments)
+        try:
+            hook(*arguments)
+        except OSError as error:
+            raise PublicationFailedError(f"the {name} hook failed: {error}") from error
 
 
 def _canonical_relative(value: Any, context: str) -> PurePosixPath:
@@ -1095,12 +1102,15 @@ def publish_tree(
             performed = {"renamed": False}
 
             def rename_callable() -> str:
-                operation = _rename_no_replace(
-                    staging_parent_fd,
-                    resolved_staging.name,
-                    target_parent_fd,
-                    target.name,
-                )
+                try:
+                    operation = _rename_no_replace(
+                        staging_parent_fd,
+                        resolved_staging.name,
+                        target_parent_fd,
+                        target.name,
+                    )
+                except TargetExistsError as error:
+                    raise _RenameTargetExists(str(error)) from error
                 performed["renamed"] = True
                 return operation
 
@@ -1109,7 +1119,7 @@ def publish_tree(
                 _, _, expected_operation = _no_replace_primitive()
                 try:
                     operation = rename_hook(rename_callable)
-                except TargetExistsError as error:
+                except _RenameTargetExists as error:
                     if performed["renamed"]:
                         raise DurablePublicationUncertainError(
                             "the at_rename hook failed after possibly renaming; the "
@@ -1117,6 +1127,12 @@ def publish_tree(
                             kind="at_rename_outcome_unverified",
                         ) from error
                     raise
+                except TargetExistsError as error:
+                    raise DurablePublicationUncertainError(
+                        "the at_rename hook failed after possibly renaming; the "
+                        "target state requires operator inspection",
+                        kind="at_rename_outcome_unverified",
+                    ) from error
                 except (KeyboardInterrupt, SystemExit):
                     raise
                 except BaseException as error:
