@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -13,6 +15,7 @@ import unittest
 import uuid
 from pathlib import Path
 from typing import Callable
+from unittest import mock
 
 import qwen38_evidence_io as evidence_io
 from qwen38_contract import canonical_json
@@ -473,15 +476,39 @@ class PublicationHostileTests(EvidenceIOTestBase):
 
     def test_unsupported_platform_fails_closed(self) -> None:
         self.prepare_tree()
-        original_platform = evidence_io.sys.platform
-        evidence_io.sys.platform = "plan9"
-        try:
+        with mock.patch.object(evidence_io.sys, "platform", "plan9"):
             with self.assertRaisesRegex(
                 evidence_io.UnsupportedPlatformError, "no atomic no-replace"
             ):
                 self.publish()
+        self.assertFalse(self.target.exists())
+        self.assertTrue(self.staging.is_dir())
+
+    def test_linux_enosys_rename_is_an_unsupported_platform(self) -> None:
+        self.prepare_tree()
+
+        class FakePrimitive:
+            argtypes: list[object] = []
+            restype: object = None
+
+            def __call__(self, *_arguments: object) -> int:
+                ctypes.set_errno(errno.ENOSYS)
+                return -1
+
+        class FakeLibc:
+            def __init__(self) -> None:
+                self.renameat2 = FakePrimitive()
+
+        original_libc = evidence_io._LIBC
+        evidence_io._LIBC = FakeLibc()
+        try:
+            with mock.patch.object(evidence_io.sys, "platform", "linux"):
+                with self.assertRaisesRegex(
+                    evidence_io.UnsupportedPlatformError, "not supported by this kernel"
+                ):
+                    self.publish()
         finally:
-            evidence_io.sys.platform = original_platform
+            evidence_io._LIBC = original_libc
         self.assertFalse(self.target.exists())
         self.assertTrue(self.staging.is_dir())
 
@@ -525,10 +552,11 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
         self.assertTrue(self.target.is_dir())
         self.assertEqual((self.target / MARKER_PATH).read_bytes(), MARKER_BYTES)
 
-    def test_after_rename_hook_failure_leaves_target_visible_without_a_receipt(self) -> None:
+    def test_after_rename_hook_failure_is_classified_as_uncertain(self) -> None:
         self.prepare_tree()
-        with self.assertRaises(FailingHook):
+        with self.assertRaises(evidence_io.DurablePublicationUncertainError) as caught:
             self.publish(hooks={"after_rename": fail("after_rename")})
+        self.assertIsInstance(caught.exception.__cause__, FailingHook)
         self.assertTrue(self.target.is_dir())
 
     def test_staging_mutation_between_inventories_is_rejected(self) -> None:
@@ -565,12 +593,61 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
                 shutil.rmtree(self.staging)
                 self.staging.mkdir()
 
-        with self.assertRaisesRegex(evidence_io.UnsafeTreeError, "changed identity"):
+        with self.assertRaises(evidence_io.TreeMutationError) as caught:
             self.publish(
                 hooks={"after_initial_inventory": swap, "before_rename": fail("before_rename")},
                 remove_staging_on_failure=True,
             )
+        self.assertIsInstance(caught.exception.__cause__, evidence_io.UnsafeTreeError)
         self.assertTrue(self.staging.is_dir())
+        self.assertFalse(self.target.exists())
+
+    def test_staging_root_replaced_after_sync_is_refused_before_the_rename(self) -> None:
+        self.prepare_tree()
+        seen: set[None] = set()
+
+        def swap(prefix: str) -> None:
+            if prefix == "" and not seen:
+                seen.add(None)
+                os.rename(self.staging, self.workspace / "staging-superseded")
+                self.staging.mkdir()
+                (self.staging / "imposter.txt").write_bytes(b"imposter")
+
+        with self.assertRaisesRegex(
+            evidence_io.TreeMutationError, "replaced before the atomic transition"
+        ):
+            self.publish(hooks={"during_directory_sync": swap})
+        self.assertFalse(self.target.exists())
+        self.assertTrue((self.staging / "imposter.txt").exists())
+
+    def test_file_added_after_the_final_inventory_is_refused(self) -> None:
+        self.prepare_tree()
+        seen: set[None] = set()
+
+        def smuggle() -> None:
+            if not seen:
+                seen.add(None)
+                (self.staging / "smuggled.txt").write_bytes(b"smuggled")
+
+        with self.assertRaisesRegex(
+            evidence_io.TreeMutationError, "no longer matches the accepted inventory"
+        ):
+            self.publish(hooks={"after_final_inventory": smuggle})
+        self.assertFalse(self.target.exists())
+
+    def test_file_deleted_after_the_final_inventory_is_refused(self) -> None:
+        self.prepare_tree()
+        seen: set[None] = set()
+
+        def remove_pending() -> None:
+            if not seen:
+                seen.add(None)
+                (self.staging / "nested" / "deep" / "gamma.txt").unlink()
+
+        with self.assertRaisesRegex(
+            evidence_io.TreeMutationError, "no longer matches the accepted inventory"
+        ):
+            self.publish(hooks={"after_final_inventory": remove_pending})
         self.assertFalse(self.target.exists())
 
 
