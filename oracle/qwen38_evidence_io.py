@@ -75,13 +75,17 @@ class TargetExistsError(EvidenceIOError):
 
 
 class DurablePublicationUncertainError(EvidenceIOError):
-    """The rename completed but the publication could not finish cleanly.
+    """The publication outcome could not be verified as a durable success.
 
     The target may be visible at its final path. No rollback is attempted;
-    an operator must inspect the target before any retry or reuse.
+    an operator must inspect the target before any retry or reuse. The
+    ``kind`` distinguishes a rename that took effect but could not be
+    synced from an at_rename hook outcome that could not be verified.
     """
 
-    kind = "post_rename_parent_sync_failed"
+    def __init__(self, message: str, *, kind: str = "publication_outcome_uncertain"):
+        super().__init__(message)
+        self.kind = kind
 
 
 class PublicationFailedError(EvidenceIOError):
@@ -707,6 +711,10 @@ def _stat_tree_walk(
                     finally:
                         os.close(child_fd)
                 elif stat.S_ISREG(metadata.st_mode):
+                    if metadata.st_nlink != 1:
+                        raise UnsafeTreeError(
+                            f"staging entry has additional hard links: {relative}"
+                        )
                     accepted = identities.get(relative)
                     if accepted is None or (
                         metadata.st_dev,
@@ -725,6 +733,46 @@ def _stat_tree_walk(
                             f"staging entry differs from the accepted inventory: {relative}"
                         )
                     observed.append((relative, metadata.st_size))
+                    try:
+                        descriptor = os.open(
+                            entry.name,
+                            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                            dir_fd=directory_fd,
+                        )
+                    except OSError as error:
+                        raise TreeMutationError(
+                            f"staging file could not be reopened: {relative}"
+                        ) from error
+                    try:
+                        try:
+                            before = os.fstat(descriptor)
+                        except OSError as error:
+                            raise TreeMutationError(
+                                f"staging file could not be inspected: {relative}"
+                            ) from error
+                        _assert_same_identity(metadata, before, relative)
+                        try:
+                            os.fsync(descriptor)
+                        except OSError as error:
+                            raise PublicationFailedError(
+                                f"staging file could not be synced: {relative}"
+                            ) from error
+                        try:
+                            after = os.fstat(descriptor)
+                        except OSError as error:
+                            raise PublicationFailedError(
+                                f"staging file could not be inspected: {relative}"
+                            ) from error
+                        _assert_same_identity(before, after, relative)
+                        if (after.st_mtime_ns, after.st_ctime_ns) != (
+                            accepted.st_mtime_ns,
+                            accepted.st_ctime_ns,
+                        ):
+                            raise TreeMutationError(
+                                f"staging entry differs from the accepted inventory: {relative}"
+                            )
+                    finally:
+                        os.close(descriptor)
                 else:
                     raise UnsafeTreeError(
                         f"staging contains a special or non-regular file: {relative}"
@@ -744,12 +792,7 @@ def _libc() -> ctypes.CDLL:
     return _LIBC
 
 
-def _rename_no_replace(
-    source_dir_fd: int,
-    source_name: str,
-    target_parent_fd: int,
-    target_name: str,
-) -> str:
+def _no_replace_primitive() -> tuple[Any, int, str]:
     if sys.platform == "darwin":
         try:
             primitive = _libc().renameatx_np
@@ -757,21 +800,27 @@ def _rename_no_replace(
             raise UnsupportedPlatformError(
                 "renameatx_np is unavailable on this macOS libc"
             ) from error
-        flags = _MACOS_RENAME_EXCL
-        operation = "renameatx_np(RENAME_EXCL)"
-    elif sys.platform == "linux":
+        return primitive, _MACOS_RENAME_EXCL, "renameatx_np(RENAME_EXCL)"
+    if sys.platform == "linux":
         try:
             primitive = _libc().renameat2
         except AttributeError as error:
             raise UnsupportedPlatformError(
                 "renameat2 is unavailable on this Linux libc"
             ) from error
-        flags = _LINUX_RENAME_NOREPLACE
-        operation = "renameat2(RENAME_NOREPLACE)"
-    else:
-        raise UnsupportedPlatformError(
-            f"no atomic no-replace rename primitive on {sys.platform}"
-        )
+        return primitive, _LINUX_RENAME_NOREPLACE, "renameat2(RENAME_NOREPLACE)"
+    raise UnsupportedPlatformError(
+        f"no atomic no-replace rename primitive on {sys.platform}"
+    )
+
+
+def _rename_no_replace(
+    source_dir_fd: int,
+    source_name: str,
+    target_parent_fd: int,
+    target_name: str,
+) -> str:
+    primitive, flags, operation = _no_replace_primitive()
     primitive.argtypes = [
         ctypes.c_int,
         ctypes.c_char_p,
@@ -865,14 +914,15 @@ def publish_tree(
     The rename is sourced from an identity-checked parent descriptor, the
     sync pass compares every file's full identity (device, inode, size,
     mtime, ctime) against snapshots from the accepted inventory, and the
-    final pre-rename reconciliation re-verifies that same identity for
-    every file after the ``before_rename`` hook. A staging-root swap or
-    content mutation landing in the irreducible window between that final
-    reconciliation and the rename syscall itself cannot be detected in
-    userspace and is a documented residual, as is a mutation that fits
-    inside one timestamp-granularity tick. If anything fails after the
-    rename took effect, the target may be visible but durability is not
-    claimed; the error is surfaced and no rollback is attempted.
+    final pre-rename reconciliation re-opens, flushes, and re-verifies that
+    same identity for every file after the ``before_rename`` hook, so
+    deferred-writeback mutations are exposed before the transition. A
+    staging-root swap or content mutation landing in the irreducible window
+    between that final reconciliation and the rename syscall itself cannot
+    be detected in userspace and is a documented residual, as is a mutation
+    that fits inside one timestamp-granularity tick. If anything fails
+    after the rename took effect, the target may be visible but durability
+    is not claimed; the error is surfaced and no rollback is attempted.
 
     Deterministic fault-injection hooks, invoked when present in ``hooks``:
     ``after_initial_inventory``, ``after_final_marker``,
@@ -969,35 +1019,45 @@ def publish_tree(
 
             rename_hook = (hooks or {}).get("at_rename")
             if rename_hook is not None:
+                _, _, expected_operation = _no_replace_primitive()
                 try:
                     operation = rename_hook(rename_callable)
                 except BaseException as error:
                     raise DurablePublicationUncertainError(
                         "the at_rename hook failed after possibly renaming; the "
-                        "target state requires operator inspection"
+                        "target state requires operator inspection",
+                        kind="at_rename_outcome_unverified",
                     ) from error
-                if not isinstance(operation, str):
+                if not isinstance(operation, str) or operation != expected_operation:
                     raise DurablePublicationUncertainError(
-                        "the at_rename hook returned no operation after possibly "
-                        "renaming; the target state requires operator inspection"
+                        "the at_rename hook did not return the platform rename "
+                        "operation; no verified publication occurred",
+                        kind="at_rename_outcome_unverified",
                     )
                 try:
-                    os.stat(
-                        resolved_staging.name,
-                        dir_fd=staging_parent_fd,
+                    arrival = os.stat(
+                        target.name,
+                        dir_fd=target_parent_fd,
                         follow_symlinks=False,
                     )
-                except FileNotFoundError:
-                    pass
+                except FileNotFoundError as error:
+                    raise DurablePublicationUncertainError(
+                        "the at_rename hook returned without the rename reaching "
+                        "the target; no publication occurred",
+                        kind="at_rename_outcome_unverified",
+                    ) from error
                 except OSError as error:
                     raise DurablePublicationUncertainError(
                         "the at_rename outcome could not be verified; the target "
-                        "state requires operator inspection"
+                        "state requires operator inspection",
+                        kind="at_rename_outcome_unverified",
                     ) from error
-                else:
+                if (arrival.st_dev, arrival.st_ino) != staging_identity:
                     raise DurablePublicationUncertainError(
-                        "the at_rename hook returned without performing the "
-                        "rename; no publication occurred"
+                        "the target does not hold the staged tree after the "
+                        "at_rename hook; the target state requires operator "
+                        "inspection",
+                        kind="at_rename_outcome_unverified",
                     )
             else:
                 operation = rename_callable()
@@ -1008,7 +1068,8 @@ def publish_tree(
             except BaseException as error:
                 raise DurablePublicationUncertainError(
                     "rename completed but the post-rename sync failed; the target "
-                    "may be visible and requires operator inspection"
+                    "may be visible and requires operator inspection",
+                    kind="post_rename_parent_sync_failed",
                 ) from error
         finally:
             os.close(staging_parent_fd)
@@ -1066,7 +1127,12 @@ def _remove_owned_staging(staging_root: Path, staging_identity: tuple[int, int])
     except OSError:
         return
     try:
-        opened = os.fstat(descriptor)
+        try:
+            opened = os.fstat(descriptor)
+        except OSError as error:
+            raise PublicationFailedError(
+                "staging root could not be inspected during cleanup"
+            ) from error
         if (opened.st_dev, opened.st_ino) != staging_identity:
             raise UnsafeTreeError(
                 "staging root changed identity; refusing to remove a caller path"

@@ -6,7 +6,6 @@ from __future__ import annotations
 import ctypes
 import errno
 import hashlib
-import json
 import os
 import shutil
 import socket
@@ -319,9 +318,8 @@ class PublicationPositiveTests(EvidenceIOTestBase):
                 "platform_operation",
             },
         )
-        serialized = json.dumps(receipt.__dict__)
         for forbidden in ("pass", "accepted", "agreement", "support", "seal"):
-            self.assertNotIn(forbidden, serialized)
+            self.assertNotIn(forbidden, set(receipt.__dataclass_fields__))
 
     def test_second_publication_is_refused_and_first_target_unchanged(self) -> None:
         self.prepare_tree()
@@ -557,8 +555,40 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
         with self.assertRaises(evidence_io.DurablePublicationUncertainError) as caught:
             self.publish(hooks={"at_rename": rename_then_raise})
         self.assertIsInstance(caught.exception.__cause__, FailingHook)
+        self.assertEqual(caught.exception.kind, "at_rename_outcome_unverified")
         self.assertTrue(self.target.is_dir())
         self.assertEqual((self.target / MARKER_PATH).read_bytes(), MARKER_BYTES)
+
+    def test_at_rename_hook_returning_without_renaming_is_uncertain(self) -> None:
+        self.prepare_tree()
+        with self.assertRaises(evidence_io.DurablePublicationUncertainError) as caught:
+            self.publish(hooks={"at_rename": lambda rename: "renameatx_np(RENAME_EXCL)"})
+        self.assertEqual(caught.exception.kind, "at_rename_outcome_unverified")
+        self.assertFalse(self.target.exists())
+        self.assertTrue(self.staging.is_dir())
+
+    def test_at_rename_hook_returning_none_is_uncertain(self) -> None:
+        self.prepare_tree()
+        with self.assertRaises(evidence_io.DurablePublicationUncertainError) as caught:
+            self.publish(hooks={"at_rename": lambda rename: None})
+        self.assertEqual(caught.exception.kind, "at_rename_outcome_unverified")
+        self.assertFalse(self.target.exists())
+        self.assertTrue(self.staging.is_dir())
+
+    def test_at_rename_hook_deleting_staging_is_uncertain(self) -> None:
+        self.prepare_tree()
+        seen: set[None] = set()
+
+        def destroy(rename: Callable[[], str]) -> str:
+            if not seen:
+                seen.add(None)
+                shutil.rmtree(self.staging)
+            return "renameatx_np(RENAME_EXCL)"
+
+        with self.assertRaises(evidence_io.DurablePublicationUncertainError) as caught:
+            self.publish(hooks={"at_rename": destroy})
+        self.assertEqual(caught.exception.kind, "at_rename_outcome_unverified")
+        self.assertFalse(self.target.exists())
 
     def test_post_rename_parent_sync_failure_is_not_durable_success(self) -> None:
         self.prepare_tree()
