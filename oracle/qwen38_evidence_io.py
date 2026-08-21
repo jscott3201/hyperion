@@ -543,10 +543,27 @@ def _sync_files_walk(
                             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                             dir_fd=directory_fd,
                         )
+                    except FileNotFoundError as error:
+                        raise TreeMutationError(
+                            f"staging directory vanished while being synced: {relative}"
+                        ) from error
                     except OSError as error:
                         raise PublicationFailedError(
                             f"staging directory could not be opened: {relative}"
                         ) from error
+                    try:
+                        opened = os.fstat(child_fd)
+                    except OSError as error:
+                        raise TreeMutationError(
+                            f"staging directory could not be inspected: {relative}"
+                        ) from error
+                    if not stat.S_ISDIR(opened.st_mode) or (
+                        opened.st_dev,
+                        opened.st_ino,
+                    ) != (metadata.st_dev, metadata.st_ino):
+                        raise TreeMutationError(
+                            f"staging directory changed identity while being synced: {relative}"
+                        )
                     try:
                         observed.extend(
                             _sync_files_walk(child_fd, f"{relative}/", hooks, identities)
@@ -969,14 +986,16 @@ def publish_tree(
     deferred-writeback mutations are exposed before the transition, and the
     staging root is re-synced so directory entries created directly in the
     staging root during the hook are persisted; nested empty directories
-    created by the hook carry no durability guarantee. A
-    staging-root swap or content mutation landing in the irreducible window between that final reconciliation and the rename
-    syscall itself cannot be detected in userspace and is a documented
-    residual, as is a mutation that fits inside one timestamp-granularity
-    tick and a target-parent swap after the parent descriptor is opened.
-    If anything fails after the rename took effect, the target may be
-    visible but durability is not claimed; the error is surfaced and no
-    rollback is attempted.
+    created by the hook carry no durability guarantee. A staging-root swap
+    or content mutation landing in the irreducible window between that
+    final reconciliation and the rename syscall itself cannot be detected
+    in userspace and is a documented residual, as is a mutation that fits
+    inside one timestamp-granularity tick and a target-parent swap after
+    the parent descriptor is opened. If anything fails after the rename
+    took effect, the target may be visible but durability is not claimed;
+    the error is surfaced and no rollback is attempted, though interrupts
+    (KeyboardInterrupt, SystemExit) propagate unchanged rather than being
+    reclassified.
 
     Deterministic fault-injection hooks, invoked when present in ``hooks``:
     ``after_initial_inventory``, ``after_final_marker``,
@@ -1087,6 +1106,8 @@ def publish_tree(
                 _, _, expected_operation = _no_replace_primitive()
                 try:
                     operation = rename_hook(rename_callable)
+                except TargetExistsError:
+                    raise
                 except BaseException as error:
                     raise DurablePublicationUncertainError(
                         "the at_rename hook failed after possibly renaming; the "
@@ -1140,16 +1161,12 @@ def publish_tree(
                     dir_fd=target_parent_fd,
                     follow_symlinks=False,
                 )
-            except OSError as error:
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as error:
                 raise DurablePublicationUncertainError(
                     "rename completed but the post-rename verification failed; "
                     "the target may be visible and requires operator inspection",
-                    kind="post_rename_parent_sync_failed",
-                ) from error
-            except BaseException as error:
-                raise DurablePublicationUncertainError(
-                    "rename completed but the post-rename sync failed; the target "
-                    "may be visible and requires operator inspection",
                     kind="post_rename_parent_sync_failed",
                 ) from error
             if (arrival.st_dev, arrival.st_ino) != staging_identity:

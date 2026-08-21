@@ -667,6 +667,63 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
         self.assertEqual(caught.exception.kind, "at_rename_outcome_unverified")
         self.assertFalse(self.target.exists())
 
+    def test_compliant_at_rename_hook_publishes_normally(self) -> None:
+        self.prepare_tree()
+        operation = evidence_io._no_replace_primitive()[2]
+        calls: list[str] = []
+
+        def compliant(rename: Callable[[], str]) -> str:
+            calls.append("invoked")
+            result = rename()
+            calls.append(result)
+            return result
+
+        receipt = self.publish(hooks={"at_rename": compliant})
+        self.assertEqual(calls, ["invoked", operation])
+        self.assertTrue(self.target.is_dir())
+        self.assertFalse(self.staging.exists())
+        self.assertEqual((self.target / MARKER_PATH).read_bytes(), MARKER_BYTES)
+        self.assertEqual(receipt.file_count, 4)
+
+    def test_cleanup_after_post_rename_uncertain_outcome_spares_the_target(self) -> None:
+        self.prepare_tree()
+
+        def rename_then_raise(rename: Callable[[], str]) -> str:
+            result = rename()
+            raise FailingHook("after the rename")
+
+        with self.assertRaises(evidence_io.DurablePublicationUncertainError) as caught:
+            self.publish(
+                hooks={"at_rename": rename_then_raise},
+                remove_staging_on_failure=True,
+            )
+        self.assertEqual(caught.exception.kind, "at_rename_outcome_unverified")
+        self.assertIsInstance(caught.exception.__cause__, FailingHook)
+        self.assertTrue(self.target.is_dir())
+        self.assertEqual((self.target / MARKER_PATH).read_bytes(), MARKER_BYTES)
+        self.assertFalse(self.staging.exists())
+
+    def test_directory_vanishing_during_the_sync_pass_is_tree_mutation(self) -> None:
+        self.prepare_tree()
+        real_open = os.open
+        armed = {"on": False}
+
+        def vanishing_open(path: object, flags: int, **kwargs: object) -> int:
+            if armed["on"] and flags & os.O_DIRECTORY and path == "nested":
+                raise FileNotFoundError(2, "injected directory vanish")
+            return real_open(path, flags, **kwargs)  # type: ignore[arg-type]
+
+        def arm() -> None:
+            armed["on"] = True
+
+        with mock.patch.object(evidence_io.os, "open", vanishing_open):
+            with self.assertRaisesRegex(
+                evidence_io.TreeMutationError, "vanished while being synced"
+            ):
+                self.publish(hooks={"after_final_inventory": arm})
+        self.assertFalse(self.target.exists())
+        self.assertTrue(self.staging.is_dir())
+
     def test_post_rename_parent_sync_failure_is_not_durable_success(self) -> None:
         self.prepare_tree()
 
