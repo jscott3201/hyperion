@@ -4,7 +4,7 @@ This directory contains the model-free P2 oracle foundation. It freezes inputs, 
 semantics, verifier-owned state normalization, and the two producer recipes without claiming that
 either reference has run.
 
-Current state: **contract only, unexecuted**.
+Current state: **contract frozen, unexecuted; model-free I/O foundation implemented**.
 
 - No Qwen weights have been acquired or locally verified.
 - No complete Transformers environment or producer entrypoint exists. The existing `oracle`
@@ -42,6 +42,13 @@ Current state: **contract only, unexecuted**.
   the two source implementations, and all non-claim statuses.
 - `../qwen38_contract.py` validates the committed contract and can verify a future complete source
   tree. It uses only the Python standard library and fails on missing inputs rather than skipping.
+- `../qwen38_evidence_io.py` implements the frozen publication requirements as model-free
+  infrastructure: canonical content-addressed tree inventory, identity-bound descriptor hashing,
+  exact final-marker creation, file and bottom-up directory fsync, and same-filesystem atomic
+  no-replace publication (`renameatx_np(RENAME_EXCL)` on macOS, `renameat2(RENAME_NOREPLACE)` on
+  Linux, typed failure elsewhere). It is a publication primitive only. It is not the raw-bundle
+  semantic verifier, emits no detached seal, and authors no pass, agreement, acceptance, or
+  support field.
 
 The two pinned semantic modes are:
 
@@ -58,9 +65,10 @@ pinned text-graph orchestration adapter because its public model call returns on
 stock-versus-instrumented control binds generation frames and termination before either route may
 contribute evidence. Neither adapter has been implemented or executed yet.
 
-These are frozen recipes, not executed or accepted environment identities. The strict parameter
-closure, bundle verifier, and atomic publisher are specified but not implemented, so execution is
-forbidden until those controls exist. The Transformers arm
+These are frozen recipes, not executed or accepted environment identities. Strict parameter
+closure and the independent raw-bundle verifier are specified but not implemented, so execution
+remains forbidden until those controls exist. The atomic no-replace publisher they require is now
+implemented and tested as model-free infrastructure. The Transformers arm
 still needs an independently hashed Python/Torch/CUDA lock and an 80 GB-class device; the mlx-lm
 candidate still needs its selected MLX/Metal wheel, high-memory Apple host, package-tree receipt,
 and producer entrypoint. The local 16 GB M5 cannot host the resident BF16 oracle. Both arms use the
@@ -94,6 +102,7 @@ controls make that mapping testable.
 ```sh
 python3 -B oracle/qwen38_contract.py
 python3 -B oracle/test_qwen38_contract.py
+python3 -B oracle/test_qwen38_evidence_io.py
 ```
 
 On a high-memory machine with the complete, cache-free source tree, verify every source byte with:
@@ -107,10 +116,13 @@ hash drift. A Hugging Face transport cache must stay outside the verified payloa
 
 ## Next protected slice
 
-Build the separate Transformers environment and both producer entrypoints, plus the independent
-raw-bundle verifier and atomic publisher. Each producer must verify the source before and after
-execution, load locally with no mutable network fallback, write its own raw outputs and receipt,
-and never consume the other producer's output or normalization. The verifier will derive
-clean-versus-fault tolerances after repeat runs. The bundle is valid only after an exact detached
-inventory digest covers both raw arms and shared verifier-owned parser results, followed by tested
-atomic publication; producer-authored pass or agreement fields are forbidden.
+Build the independent raw-bundle verifier on top of the accepted I/O foundation: it must validate
+arm layout, events, payload manifests, and receipts, publish verifier-owned parser outcomes, and
+create the detached seal outside both arm roots, publishing only fully valid bundles through the
+tested atomic no-replace primitive. The separate Transformers environment and both producer
+entrypoints follow. Each producer must verify the source before and after execution, load locally
+with no mutable network fallback, write its own raw outputs and receipt, and never consume the
+other producer's output or normalization. The verifier will derive clean-versus-fault tolerances
+after repeat runs. The bundle is valid only after an exact detached inventory digest covers both
+raw arms and shared verifier-owned parser results, followed by tested atomic publication;
+producer-authored pass or agreement fields are forbidden.
