@@ -632,7 +632,7 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
                 shutil.copytree(self.workspace / "staging-superseded", self.staging)
 
         with self.assertRaisesRegex(
-            evidence_io.TreeMutationError, "replaced before the atomic transition"
+            evidence_io.TreeMutationError, "differs from the accepted inventory"
         ):
             self.publish(hooks={"before_rename": swap})
         self.assertFalse(self.target.exists())
@@ -714,9 +714,55 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
                 (self.staging / "smuggled.txt").write_bytes(b"smuggled")
 
         with self.assertRaisesRegex(
-            evidence_io.TreeMutationError, "no longer matches the accepted inventory"
+            evidence_io.TreeMutationError, "differs from the accepted inventory"
         ):
             self.publish(hooks={"during_directory_sync": smuggle})
+        self.assertFalse(self.target.exists())
+
+    def test_file_added_via_before_rename_hook_is_reconciled(self) -> None:
+        self.prepare_tree()
+        seen: set[None] = set()
+
+        def smuggle() -> None:
+            if not seen:
+                seen.add(None)
+                (self.staging / "smuggled.txt").write_bytes(b"smuggled")
+
+        with self.assertRaisesRegex(
+            evidence_io.TreeMutationError, "differs from the accepted inventory"
+        ):
+            self.publish(hooks={"before_rename": smuggle})
+        self.assertFalse(self.target.exists())
+
+    def test_file_deleted_via_before_rename_hook_is_reconciled(self) -> None:
+        self.prepare_tree()
+        seen: set[None] = set()
+
+        def remove_pending() -> None:
+            if not seen:
+                seen.add(None)
+                (self.staging / "nested" / "deep" / "gamma.txt").unlink()
+
+        with self.assertRaisesRegex(
+            evidence_io.TreeMutationError,
+            "no longer matches the accepted inventory before the transition",
+        ):
+            self.publish(hooks={"before_rename": remove_pending})
+        self.assertFalse(self.target.exists())
+
+    def test_same_size_rewrite_via_before_rename_hook_is_reconciled(self) -> None:
+        self.prepare_tree({"alpha.json": b'{"first":1}\n'})
+        seen: set[None] = set()
+
+        def rewrite() -> None:
+            if not seen:
+                seen.add(None)
+                (self.staging / "alpha.json").write_bytes(b'{"first":2}\n')
+
+        with self.assertRaisesRegex(
+            evidence_io.TreeMutationError, "differs from the accepted inventory"
+        ):
+            self.publish(hooks={"before_rename": rewrite})
         self.assertFalse(self.target.exists())
 
 
