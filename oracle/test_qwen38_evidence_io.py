@@ -423,21 +423,34 @@ class PublicationHostileTests(EvidenceIOTestBase):
             evidence_io.publish_tree(self.staging, link / "bundle", MARKER_PATH, MARKER_BYTES)
         self.assertFalse((real / "bundle").exists())
 
-    def test_target_inside_or_containing_staging_is_rejected(self) -> None:
+    def test_target_inside_staging_is_rejected(self) -> None:
+        def deep_inside(staging: Path) -> Path:
+            (staging / "sub").mkdir()
+            return staging / "sub" / "inner"
+
         cases = [
-            ("inside staging", lambda staging: staging / "inner", "sibling"),
-            ("contains staging", lambda staging: self.workspace / "outer", "sibling"),
+            ("directly inside staging", lambda staging: staging / "inner"),
+            ("deep inside staging", deep_inside),
         ]
-        for label, make_target, expected in cases:
+        for label, make_target in cases:
             with self.subTest(target=label):
                 staging = self.workspace / f"staging-{uuid.uuid4().hex}"
                 staging.mkdir()
                 write_tree(staging, {"payload.txt": b"payload"})
-                with self.assertRaisesRegex(evidence_io.UnsafePathError, expected):
+                with self.assertRaisesRegex(evidence_io.UnsafePathError, "below the staging"):
                     evidence_io.publish_tree(
                         staging, make_target(staging), MARKER_PATH, MARKER_BYTES
                     )
-        self.assertFalse((self.workspace / "outer").exists())
+
+    def test_direct_sibling_publication_is_allowed(self) -> None:
+        staging = self.workspace / f"staging-{uuid.uuid4().hex}"
+        staging.mkdir()
+        write_tree(staging, {"payload.txt": b"payload"})
+        target = self.workspace / f"bundle-{uuid.uuid4().hex}"
+        receipt = evidence_io.publish_tree(staging, target, MARKER_PATH, MARKER_BYTES)
+        self.assertTrue(target.is_dir())
+        self.assertEqual(receipt.file_count, 2)
+        self.assertFalse(staging.exists())
 
     def test_target_traversal_forms_are_rejected(self) -> None:
         cases = [
@@ -541,9 +554,67 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
 
     def test_at_rename_hook_failure_is_conservatively_uncertain(self) -> None:
         self.prepare_tree()
-        with self.assertRaises(evidence_io.DurablePublicationUncertainError):
+        with self.assertRaises(evidence_io.DurablePublicationUncertainError) as caught:
             self.publish(hooks={"at_rename": raise_at_rename})
+        self.assertIsInstance(caught.exception.__cause__, FailingHook)
+        self.assertEqual(caught.exception.kind, "at_rename_outcome_unverified")
         self.assertFalse(self.target.exists())
+
+    def test_at_rename_hook_returning_without_renaming_is_uncertain(self) -> None:
+        self.prepare_tree()
+        operation = evidence_io._no_replace_primitive()[2]
+        with self.assertRaises(evidence_io.DurablePublicationUncertainError) as caught:
+            self.publish(hooks={"at_rename": lambda rename: operation})
+        self.assertEqual(caught.exception.kind, "at_rename_outcome_unverified")
+        self.assertFalse(self.target.exists())
+        self.assertTrue(self.staging.is_dir())
+
+    def test_at_rename_hook_returning_a_wrong_operation_is_uncertain(self) -> None:
+        self.prepare_tree()
+        with self.assertRaises(evidence_io.DurablePublicationUncertainError) as caught:
+            self.publish(hooks={"at_rename": lambda rename: "not-the-platform-operation"})
+        self.assertEqual(caught.exception.kind, "at_rename_outcome_unverified")
+        self.assertFalse(self.target.exists())
+        self.assertTrue(self.staging.is_dir())
+
+    def test_at_rename_hook_returning_none_is_uncertain(self) -> None:
+        self.prepare_tree()
+        with self.assertRaises(evidence_io.DurablePublicationUncertainError) as caught:
+            self.publish(hooks={"at_rename": lambda rename: None})
+        self.assertEqual(caught.exception.kind, "at_rename_outcome_unverified")
+        self.assertFalse(self.target.exists())
+        self.assertTrue(self.staging.is_dir())
+
+    def test_at_rename_hook_renaming_to_a_third_path_is_uncertain(self) -> None:
+        self.prepare_tree()
+        operation = evidence_io._no_replace_primitive()[2]
+        seen: set[None] = set()
+
+        def rename_elsewhere(rename: Callable[[], str]) -> str:
+            if not seen:
+                seen.add(None)
+                os.rename(self.staging, self.workspace / "staging-elsewhere")
+            return operation
+
+        with self.assertRaises(evidence_io.DurablePublicationUncertainError) as caught:
+            self.publish(hooks={"at_rename": rename_elsewhere})
+        self.assertEqual(caught.exception.kind, "at_rename_outcome_unverified")
+        self.assertFalse(self.target.exists())
+
+    def test_at_rename_hook_renaming_but_returning_wrong_operation_is_uncertain(self) -> None:
+        self.prepare_tree()
+        seen: set[None] = set()
+
+        def rename_but_lying(rename: Callable[[], str]) -> str:
+            if not seen:
+                seen.add(None)
+                rename()
+            return "rename"
+
+        with self.assertRaises(evidence_io.DurablePublicationUncertainError) as caught:
+            self.publish(hooks={"at_rename": rename_but_lying})
+        self.assertEqual(caught.exception.kind, "at_rename_outcome_unverified")
+        self.assertTrue(self.target.is_dir())
 
     def test_at_rename_hook_raising_after_the_rename_is_uncertain(self) -> None:
         self.prepare_tree()
@@ -559,22 +630,6 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
         self.assertTrue(self.target.is_dir())
         self.assertEqual((self.target / MARKER_PATH).read_bytes(), MARKER_BYTES)
 
-    def test_at_rename_hook_returning_without_renaming_is_uncertain(self) -> None:
-        self.prepare_tree()
-        with self.assertRaises(evidence_io.DurablePublicationUncertainError) as caught:
-            self.publish(hooks={"at_rename": lambda rename: "renameatx_np(RENAME_EXCL)"})
-        self.assertEqual(caught.exception.kind, "at_rename_outcome_unverified")
-        self.assertFalse(self.target.exists())
-        self.assertTrue(self.staging.is_dir())
-
-    def test_at_rename_hook_returning_none_is_uncertain(self) -> None:
-        self.prepare_tree()
-        with self.assertRaises(evidence_io.DurablePublicationUncertainError) as caught:
-            self.publish(hooks={"at_rename": lambda rename: None})
-        self.assertEqual(caught.exception.kind, "at_rename_outcome_unverified")
-        self.assertFalse(self.target.exists())
-        self.assertTrue(self.staging.is_dir())
-
     def test_at_rename_hook_deleting_staging_is_uncertain(self) -> None:
         self.prepare_tree()
         seen: set[None] = set()
@@ -583,7 +638,7 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
             if not seen:
                 seen.add(None)
                 shutil.rmtree(self.staging)
-            return "renameatx_np(RENAME_EXCL)"
+            return evidence_io._no_replace_primitive()[2]
 
         with self.assertRaises(evidence_io.DurablePublicationUncertainError) as caught:
             self.publish(hooks={"at_rename": destroy})

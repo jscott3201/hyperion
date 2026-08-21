@@ -750,6 +750,10 @@ def _stat_tree_walk(
                             raise TreeMutationError(
                                 f"staging file could not be inspected: {relative}"
                             ) from error
+                        if before.st_nlink != 1:
+                            raise UnsafeTreeError(
+                                f"staging entry has additional hard links: {relative}"
+                            )
                         _assert_same_identity(metadata, before, relative)
                         try:
                             os.fsync(descriptor)
@@ -888,11 +892,8 @@ def _open_target_parent(target: Path, staging: Path) -> int:
     parent_components = parent.parts
     if parent_components[: len(staging_components)] == staging_components:
         raise UnsafePathError(
-            "the target parent is staging or lives inside it; staging must be a sibling"
-        )
-    if staging_components[: len(parent_components)] == parent_components:
-        raise UnsafePathError(
-            "staging lives below the target parent; staging must be a sibling"
+            "the target parent is staging or lives inside it; the target must "
+            "not be published below the staging root"
         )
     return _open_resolved_directory(parent, "target parent")
 
@@ -930,11 +931,12 @@ def publish_tree(
     ``during_directory_sync(prefix)``, ``before_rename``,
     ``at_rename(rename)``, ``after_rename``, and ``during_parent_sync``.
     ``before_rename`` runs before the final identity-bound reconciliation,
-    so hook-driven staging changes are still refused. An ``at_rename`` hook
-    must actually perform the rename: its exceptions and non-rename returns
-    are conservatively classified as durable-publication-uncertain
-    outcomes, and a hook that returns without renaming never yields a
-    receipt.
+    so hook-driven regular-file changes are still refused; empty-directory
+    structure is not part of the regular-file inventory. An ``at_rename``
+    hook must actually perform the platform rename and return its operation
+    name: hook failures, non-rename returns, and arrivals that do not hold
+    the staged tree are conservatively classified as
+    durable-publication-uncertain outcomes and never yield a receipt.
     """
 
     staging_root = Path(staging_root)
@@ -1042,8 +1044,9 @@ def publish_tree(
                     )
                 except FileNotFoundError as error:
                     raise DurablePublicationUncertainError(
-                        "the at_rename hook returned without the rename reaching "
-                        "the target; no publication occurred",
+                        "the target does not currently hold the staged tree "
+                        "after the at_rename hook; the target state requires "
+                        "operator inspection",
                         kind="at_rename_outcome_unverified",
                     ) from error
                 except OSError as error:
@@ -1065,12 +1068,29 @@ def publish_tree(
                 _run_hook(hooks, "after_rename")
                 _run_hook(hooks, "during_parent_sync")
                 os.fsync(target_parent_fd)
+                arrival = os.stat(
+                    target.name,
+                    dir_fd=target_parent_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise DurablePublicationUncertainError(
+                    "rename completed but the post-rename verification failed; "
+                    "the target may be visible and requires operator inspection",
+                    kind="post_rename_parent_sync_failed",
+                ) from error
             except BaseException as error:
                 raise DurablePublicationUncertainError(
                     "rename completed but the post-rename sync failed; the target "
                     "may be visible and requires operator inspection",
                     kind="post_rename_parent_sync_failed",
                 ) from error
+            if (arrival.st_dev, arrival.st_ino) != staging_identity:
+                raise DurablePublicationUncertainError(
+                    "the target changed after the rename; the target state "
+                    "requires operator inspection",
+                    kind="post_rename_parent_sync_failed",
+                )
         finally:
             os.close(staging_parent_fd)
             os.close(target_parent_fd)
