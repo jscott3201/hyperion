@@ -193,7 +193,6 @@ def _open_resolved_directory(path: Path, context: str) -> int:
         descriptor = os.open(resolved.anchor, os.O_RDONLY | os.O_DIRECTORY)
     except OSError as error:
         raise UnsafePathError(f"{context} anchor could not be opened: {resolved}") from error
-    metadata: os.stat_result | None = None
     try:
         for part in resolved.parts[1:]:
             try:
@@ -355,30 +354,31 @@ def _inventory_directory(
                         raise UnsafeTreeError(
                             f"directory could not be opened: {relative}"
                         ) from error
-                    try:
-                        opened = os.fstat(child_fd)
-                    except OSError as error:
-                        raise TreeMutationError(
-                            f"directory could not be inspected: {relative}"
-                        ) from error
-                    if not stat.S_ISDIR(opened.st_mode) or (
-                        opened.st_dev,
-                        opened.st_ino,
-                    ) != (metadata.st_dev, metadata.st_ino):
-                        raise TreeMutationError(
-                            f"directory changed identity while being read: {relative}"
-                        )
-                    try:
-                        _inventory_directory(
-                            child_fd,
-                            f"{relative}/",
-                            entries,
-                            seen_inodes,
-                            hooks,
-                            identities,
-                        )
-                    finally:
-                        os.close(child_fd)
+                    else:
+                        try:
+                            try:
+                                opened = os.fstat(child_fd)
+                            except OSError as error:
+                                raise TreeMutationError(
+                                    f"directory could not be inspected: {relative}"
+                                ) from error
+                            if not stat.S_ISDIR(opened.st_mode) or (
+                                opened.st_dev,
+                                opened.st_ino,
+                            ) != (metadata.st_dev, metadata.st_ino):
+                                raise TreeMutationError(
+                                    f"directory changed identity while being read: {relative}"
+                                )
+                            _inventory_directory(
+                                child_fd,
+                                f"{relative}/",
+                                entries,
+                                seen_inodes,
+                                hooks,
+                                identities,
+                            )
+                        finally:
+                            os.close(child_fd)
                 elif stat.S_ISREG(metadata.st_mode):
                     entries.append(
                         _inventory_file(
@@ -551,25 +551,28 @@ def _sync_files_walk(
                         raise PublicationFailedError(
                             f"staging directory could not be opened: {relative}"
                         ) from error
-                    try:
-                        opened = os.fstat(child_fd)
-                    except OSError as error:
-                        raise TreeMutationError(
-                            f"staging directory could not be inspected: {relative}"
-                        ) from error
-                    if not stat.S_ISDIR(opened.st_mode) or (
-                        opened.st_dev,
-                        opened.st_ino,
-                    ) != (metadata.st_dev, metadata.st_ino):
-                        raise TreeMutationError(
-                            f"staging directory changed identity while being synced: {relative}"
-                        )
-                    try:
-                        observed.extend(
-                            _sync_files_walk(child_fd, f"{relative}/", hooks, identities)
-                        )
-                    finally:
-                        os.close(child_fd)
+                    else:
+                        try:
+                            try:
+                                opened = os.fstat(child_fd)
+                            except OSError as error:
+                                raise TreeMutationError(
+                                    f"staging directory could not be inspected: {relative}"
+                                ) from error
+                            if not stat.S_ISDIR(opened.st_mode) or (
+                                opened.st_dev,
+                                opened.st_ino,
+                            ) != (metadata.st_dev, metadata.st_ino):
+                                raise TreeMutationError(
+                                    f"staging directory changed identity while being synced: {relative}"
+                                )
+                            observed.extend(
+                                _sync_files_walk(
+                                    child_fd, f"{relative}/", hooks, identities
+                                )
+                            )
+                        finally:
+                            os.close(child_fd)
                 elif stat.S_ISREG(metadata.st_mode):
                     observed.append((relative, metadata.st_size))
                     _run_hook(hooks, "during_file_sync", relative)
@@ -1106,7 +1109,15 @@ def publish_tree(
                 _, _, expected_operation = _no_replace_primitive()
                 try:
                     operation = rename_hook(rename_callable)
-                except TargetExistsError:
+                except TargetExistsError as error:
+                    if performed["renamed"]:
+                        raise DurablePublicationUncertainError(
+                            "the at_rename hook failed after possibly renaming; the "
+                            "target state requires operator inspection",
+                            kind="at_rename_outcome_unverified",
+                        ) from error
+                    raise
+                except (KeyboardInterrupt, SystemExit):
                     raise
                 except BaseException as error:
                     raise DurablePublicationUncertainError(

@@ -724,6 +724,54 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
         self.assertFalse(self.target.exists())
         self.assertTrue(self.staging.is_dir())
 
+    def test_directory_swapped_during_the_sync_pass_is_tree_mutation(self) -> None:
+        self.prepare_tree()
+        decoy = self.workspace / "decoy"
+        decoy.mkdir()
+        real_open = os.open
+        armed = {"on": False}
+
+        def swapped_open(path: object, flags: int, **kwargs: object) -> int:
+            if armed["on"] and flags & os.O_DIRECTORY and path == "nested":
+                return real_open(decoy, os.O_RDONLY | os.O_DIRECTORY)
+            return real_open(path, flags, **kwargs)  # type: ignore[arg-type]
+
+        def arm() -> None:
+            armed["on"] = True
+
+        with mock.patch.object(evidence_io.os, "open", swapped_open):
+            with self.assertRaisesRegex(
+                evidence_io.TreeMutationError, "changed identity while being synced"
+            ):
+                self.publish(hooks={"after_final_inventory": arm})
+        self.assertFalse(self.target.exists())
+        self.assertTrue(self.staging.is_dir())
+
+    def test_at_rename_hook_double_rename_after_success_is_uncertain(self) -> None:
+        self.prepare_tree()
+        calls = {"count": 0}
+
+        def rename_twice(rename: Callable[[], str]) -> str:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                rename()
+                self.staging.mkdir()
+            return rename()
+
+        with self.assertRaises(evidence_io.DurablePublicationUncertainError) as caught:
+            self.publish(hooks={"at_rename": rename_twice})
+        self.assertEqual(caught.exception.kind, "at_rename_outcome_unverified")
+        self.assertTrue(self.target.is_dir())
+
+    def test_at_rename_target_exists_before_the_rename_passes_through(self) -> None:
+        self.prepare_tree()
+        self.target.mkdir()
+        (self.target / "victim.txt").write_bytes(b"victim")
+        with self.assertRaises(evidence_io.TargetExistsError):
+            self.publish(hooks={"at_rename": lambda rename: rename()})
+        self.assertTrue((self.target / "victim.txt").exists())
+        self.assertTrue(self.staging.is_dir())
+
     def test_post_rename_parent_sync_failure_is_not_durable_success(self) -> None:
         self.prepare_tree()
 
