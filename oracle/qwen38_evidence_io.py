@@ -781,6 +781,8 @@ def _stat_tree_walk(
                     raise UnsafeTreeError(
                         f"staging contains a special or non-regular file: {relative}"
                     )
+    except EvidenceIOError:
+        raise
     except OSError as error:
         raise TreeMutationError(f"staging reconciliation walk failed closed: {error}") from error
     return observed
@@ -876,6 +878,12 @@ def _open_target_parent(target: Path, staging: Path) -> int:
         ) from error
     if ".." in target.parts:
         raise UnsafePathError(f"publication target escapes upward: {target!r}")
+    if PurePosixPath(os.path.realpath(target)).parts == PurePosixPath(
+        os.path.realpath(staging)
+    ).parts:
+        raise UnsafePathError(
+            "the publication target must not be the staging root itself"
+        )
     original_parent = Path(os.path.abspath(target.parent))
     try:
         final_parent_metadata = os.lstat(original_parent)
@@ -917,13 +925,16 @@ def publish_tree(
     mtime, ctime) against snapshots from the accepted inventory, and the
     final pre-rename reconciliation re-opens, flushes, and re-verifies that
     same identity for every file after the ``before_rename`` hook, so
-    deferred-writeback mutations are exposed before the transition. A
-    staging-root swap or content mutation landing in the irreducible window
-    between that final reconciliation and the rename syscall itself cannot
-    be detected in userspace and is a documented residual, as is a mutation
-    that fits inside one timestamp-granularity tick. If anything fails
-    after the rename took effect, the target may be visible but durability
-    is not claimed; the error is surfaced and no rollback is attempted.
+    deferred-writeback mutations are exposed before the transition, and the
+    staging root is re-synced so directory entries created during the hook
+    are persisted. A staging-root swap or content mutation landing in the
+    irreducible window between that final reconciliation and the rename
+    syscall itself cannot be detected in userspace and is a documented
+    residual, as is a mutation that fits inside one timestamp-granularity
+    tick and a target-parent swap after the parent descriptor is opened.
+    If anything fails after the rename took effect, the target may be
+    visible but durability is not claimed; the error is surfaced and no
+    rollback is attempted.
 
     Deterministic fault-injection hooks, invoked when present in ``hooks``:
     ``after_initial_inventory``, ``after_final_marker``,
@@ -990,6 +1001,12 @@ def publish_tree(
             staging_root_fd = _open_root_directory(staging_root, "staging root")
             try:
                 reconciled = _stat_tree_walk(staging_root_fd, "", accepted_identities)
+                try:
+                    os.fsync(staging_root_fd)
+                except OSError as error:
+                    raise PublicationFailedError(
+                        "staging root could not be synced after reconciliation"
+                    ) from error
             finally:
                 os.close(staging_root_fd)
             if sorted(reconciled) != sorted(expected_items):

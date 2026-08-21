@@ -651,8 +651,9 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
         def parent_sync_failure() -> None:
             raise OSError(5, "injected parent fsync failure")
 
-        with self.assertRaises(evidence_io.DurablePublicationUncertainError):
+        with self.assertRaises(evidence_io.DurablePublicationUncertainError) as caught:
             self.publish(hooks={"during_parent_sync": parent_sync_failure})
+        self.assertEqual(caught.exception.kind, "post_rename_parent_sync_failed")
         self.assertTrue(self.target.is_dir())
         self.assertEqual((self.target / MARKER_PATH).read_bytes(), MARKER_BYTES)
 
@@ -660,6 +661,7 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
         self.prepare_tree()
         with self.assertRaises(evidence_io.DurablePublicationUncertainError) as caught:
             self.publish(hooks={"after_rename": fail("after_rename")})
+        self.assertEqual(caught.exception.kind, "post_rename_parent_sync_failed")
         self.assertIsInstance(caught.exception.__cause__, FailingHook)
         self.assertTrue(self.target.is_dir())
 
