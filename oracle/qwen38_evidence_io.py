@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+"""Model-free evidence-tree inventory and atomic no-replace publication.
+
+This module is the P2-NEXT-01 publication foundation. It implements the
+content-addressed regular-file inventory and the durable same-filesystem
+atomic no-replace transition frozen in the Qwen producer publication
+requirements. It is not the raw-bundle semantic verifier, does not emit a
+detached seal, and never authors pass, agreement, acceptance, or support
+fields.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import errno
+import hashlib
+import os
+import shutil
+import stat
+import sys
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable
+
+from qwen38_contract import canonical_json
+
+
+HASH_CHUNK_BYTES = 1024 * 1024
+INVENTORY_RECORD_FIELDS = frozenset({"byte_length", "path", "sha256"})
+
+_AT_FDCWD = -100
+_MACOS_RENAME_EXCL = 0x4
+_LINUX_RENAME_NOREPLACE = 0x1
+
+
+class EvidenceIOError(RuntimeError):
+    """A fail-closed evidence I/O operation refused or lost a race."""
+
+    kind = "evidence_io_error"
+
+
+class UnsafePathError(EvidenceIOError):
+    """A path is not a canonical relative POSIX path."""
+
+    kind = "unsafe_path"
+
+
+class UnsafeTreeError(EvidenceIOError):
+    """A tree contains a symlink, special file, hard link, or unsafe name."""
+
+    kind = "unsafe_tree"
+
+
+class TreeMutationError(EvidenceIOError):
+    """A tree entry changed identity or content during the operation."""
+
+    kind = "tree_mutation"
+
+
+class MarkerError(EvidenceIOError):
+    """The final marker could not be created exactly as specified."""
+
+    kind = "marker_error"
+
+
+class CrossDeviceError(EvidenceIOError):
+    """Staging and the target parent are on different filesystems."""
+
+    kind = "cross_device"
+
+
+class TargetExistsError(EvidenceIOError):
+    """The publication target already existed at the instant of rename."""
+
+    kind = "target_exists"
+
+
+class DurablePublicationUncertainError(EvidenceIOError):
+    """The rename completed but the target parent could not be synced.
+
+    The target may be visible at its final path. No rollback is attempted;
+    an operator must inspect the target before any retry or reuse.
+    """
+
+    kind = "post_rename_parent_sync_failed"
+
+
+class PublicationFailedError(EvidenceIOError):
+    """The publication failed before the rename took effect."""
+
+    kind = "publication_failed"
+
+
+class UnsupportedPlatformError(EvidenceIOError):
+    """No atomic no-replace rename primitive is available on this platform."""
+
+    kind = "unsupported_platform"
+
+
+@dataclass(frozen=True)
+class PublicationReceipt:
+    """Implementation-owned publication facts, not an evidence receipt."""
+
+    target_path: str
+    tree_inventory_sha256: str
+    file_count: int
+    tree_bytes: int
+    marker_path: str
+    marker_sha256: str
+    platform_operation: str
+
+
+Hooks = dict[str, Callable[..., object]]
+
+
+def _run_hook(hooks: Hooks | None, name: str, *arguments: Any) -> None:
+    hook = (hooks or {}).get(name)
+    if hook is not None:
+        hook(*arguments)
+
+
+def _canonical_relative(value: Any, context: str) -> PurePosixPath:
+    if not isinstance(value, str) or not value:
+        raise UnsafePathError(f"{context} must be a non-empty string")
+    if "\\" in value or "\x00" in value:
+        raise UnsafePathError(f"{context} contains a backslash or NUL: {value!r}")
+    relative = PurePosixPath(value)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+        or relative.as_posix() != value
+    ):
+        raise UnsafePathError(f"{context} is not a canonical relative path: {value!r}")
+    for part in relative.parts:
+        try:
+            part.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise UnsafePathError(
+                f"{context} is not representable as canonical UTF-8: {value!r}"
+            ) from error
+    return relative
+
+
+def _safe_entry_name(name: str, context: str) -> None:
+    if name in {"", ".", ".."} or "\\" in name or "\x00" in name:
+        raise UnsafeTreeError(f"{context} is not a safe entry name: {name!r}")
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise UnsafeTreeError(
+            f"{context} is not representable as canonical UTF-8: {name!r}"
+        ) from error
+
+
+def _open_root_directory(root: Path, context: str) -> int:
+    try:
+        metadata = root.lstat()
+    except OSError as error:
+        raise UnsafeTreeError(f"{context} is unavailable: {root}") from error
+    if stat.S_ISLNK(metadata.st_mode):
+        raise UnsafeTreeError(f"{context} must not be a symlink: {root}")
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise UnsafeTreeError(f"{context} must be a real directory: {root}")
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    opened = os.fstat(descriptor)
+    if not stat.S_ISDIR(opened.st_mode) or (
+        opened.st_dev,
+        opened.st_ino,
+    ) != (metadata.st_dev, metadata.st_ino):
+        os.close(descriptor)
+        raise TreeMutationError(f"{context} changed identity while being opened")
+    return descriptor
+
+
+def _assert_same_identity(
+    before: os.stat_result,
+    after: os.stat_result,
+    relative: str,
+) -> None:
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        raise TreeMutationError(f"entry changed identity while being read: {relative}")
+    if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+        raise TreeMutationError(f"entry changed content while being read: {relative}")
+
+
+def _inventory_file(
+    directory_fd: int,
+    name: str,
+    relative: str,
+    metadata: os.stat_result,
+    seen_inodes: set[tuple[int, int]],
+    hooks: Hooks | None,
+) -> dict[str, Any]:
+    _run_hook(hooks, "before_entry_open", relative)
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        dir_fd=directory_fd,
+    )
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise UnsafeTreeError(f"entry is not a regular file: {relative}")
+        if before.st_nlink != 1:
+            raise UnsafeTreeError(f"entry has additional hard links: {relative}")
+        if (before.st_dev, before.st_ino) in seen_inodes:
+            raise UnsafeTreeError(f"entry repeats a device/inode identity: {relative}")
+        _assert_same_identity(metadata, before, relative)
+        digest = hashlib.sha256()
+        first_chunk = True
+        while True:
+            chunk = os.read(descriptor, HASH_CHUNK_BYTES)
+            if first_chunk:
+                _run_hook(hooks, "during_file_read", relative)
+                first_chunk = False
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        _assert_same_identity(before, after, relative)
+    finally:
+        os.close(descriptor)
+    seen_inodes.add((before.st_dev, before.st_ino))
+    return {
+        "path": relative,
+        "byte_length": before.st_size,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _inventory_directory(
+    directory_fd: int,
+    prefix: str,
+    entries: list[dict[str, Any]],
+    seen_inodes: set[tuple[int, int]],
+    hooks: Hooks | None,
+) -> None:
+    try:
+        scanner = os.scandir(directory_fd)
+    except OSError as error:
+        raise UnsafeTreeError(f"tree enumeration failed closed: {error}") from error
+    with scanner:
+        for entry in scanner:
+            _safe_entry_name(entry.name, "tree entry")
+            metadata = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(metadata.st_mode):
+                raise UnsafeTreeError(f"tree contains a symlink: {prefix}{entry.name}")
+            relative = f"{prefix}{entry.name}"
+            if stat.S_ISDIR(metadata.st_mode):
+                child_fd = os.open(
+                    entry.name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory_fd,
+                )
+                try:
+                    opened = os.fstat(child_fd)
+                    if not stat.S_ISDIR(opened.st_mode) or (
+                        opened.st_dev,
+                        opened.st_ino,
+                    ) != (metadata.st_dev, metadata.st_ino):
+                        raise TreeMutationError(
+                            f"directory changed identity while being read: {relative}"
+                        )
+                    _inventory_directory(child_fd, f"{relative}/", entries, seen_inodes, hooks)
+                finally:
+                    os.close(child_fd)
+            elif stat.S_ISREG(metadata.st_mode):
+                entries.append(
+                    _inventory_file(directory_fd, entry.name, relative, metadata, seen_inodes, hooks)
+                )
+            else:
+                raise UnsafeTreeError(
+                    f"tree contains a special or non-regular file: {relative}"
+                )
+
+
+def inventory_tree(root: Path, *, hooks: Hooks | None = None) -> list[dict[str, Any]]:
+    """Return a deterministic content-addressed inventory of every regular file."""
+
+    entries: list[dict[str, Any]] = []
+    seen_inodes: set[tuple[int, int]] = set()
+    root_fd = _open_root_directory(root, "inventory root")
+    try:
+        _inventory_directory(root_fd, "", entries, seen_inodes, hooks)
+    finally:
+        os.close(root_fd)
+    entries.sort(key=lambda record: record["path"])
+    return entries
+
+
+def tree_inventory_sha256(entries: list[dict[str, Any]]) -> str:
+    """Digest the canonical JSON of a sorted closed inventory collection."""
+
+    if entries != sorted(entries, key=lambda record: record["path"]):
+        raise EvidenceIOError("tree inventory must be sorted by canonical path")
+    for record in entries:
+        if not isinstance(record, dict) or set(record) != INVENTORY_RECORD_FIELDS:
+            raise EvidenceIOError(f"tree inventory record is not closed: {record!r}")
+        if not isinstance(record["path"], str) or not isinstance(record["byte_length"], int):
+            raise EvidenceIOError(f"tree inventory record is malformed: {record!r}")
+    return hashlib.sha256(canonical_json(entries)).hexdigest()
+
+
+def create_final_marker(
+    staging_root: Path,
+    marker_relative_path: str,
+    marker_bytes: bytes,
+) -> dict[str, Any]:
+    """Create the exact marker file inside staging with exclusive no-follow semantics."""
+
+    relative = _canonical_relative(marker_relative_path, "final marker")
+    root_fd = _open_root_directory(staging_root, "staging root")
+    parent_fd = root_fd
+    try:
+        for part in relative.parts[:-1]:
+            try:
+                os.mkdir(part, dir_fd=parent_fd, mode=0o755)
+            except FileExistsError:
+                pass
+            try:
+                child_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent_fd,
+                )
+            except OSError as error:
+                raise UnsafeTreeError(
+                    f"final marker parent is not a real directory: {relative}"
+                ) from error
+            if parent_fd != root_fd:
+                os.close(parent_fd)
+            parent_fd = child_fd
+        try:
+            marker_fd = os.open(
+                relative.parts[-1],
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+                mode=0o644,
+            )
+        except FileExistsError as error:
+            raise MarkerError(
+                f"final marker or an alias already exists: {relative}"
+            ) from error
+        except OSError as error:
+            raise MarkerError(f"final marker creation failed: {relative}") from error
+        try:
+            written = 0
+            while written < len(marker_bytes):
+                written += os.write(marker_fd, marker_bytes[written:])
+            os.fsync(marker_fd)
+            final = os.fstat(marker_fd)
+            if final.st_size != len(marker_bytes):
+                raise MarkerError(f"final marker byte length drifted: {relative}")
+        finally:
+            os.close(marker_fd)
+    finally:
+        if parent_fd != root_fd:
+            os.close(parent_fd)
+        os.close(root_fd)
+    return {
+        "path": relative.as_posix(),
+        "byte_length": len(marker_bytes),
+        "sha256": hashlib.sha256(marker_bytes).hexdigest(),
+    }
+
+
+def _fsync_files(
+    directory_fd: int,
+    prefix: str,
+    hooks: Hooks | None,
+) -> None:
+    try:
+        scanner = os.scandir(directory_fd)
+    except OSError as error:
+        raise PublicationFailedError(f"staging enumeration failed closed: {error}") from error
+    with scanner:
+        for entry in scanner:
+            _safe_entry_name(entry.name, "staging entry")
+            metadata = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(metadata.st_mode):
+                raise UnsafeTreeError(f"staging contains a symlink: {prefix}{entry.name}")
+            relative = f"{prefix}{entry.name}"
+            if stat.S_ISDIR(metadata.st_mode):
+                child_fd = os.open(
+                    entry.name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory_fd,
+                )
+                try:
+                    _fsync_files(child_fd, f"{relative}/", hooks)
+                finally:
+                    os.close(child_fd)
+            elif stat.S_ISREG(metadata.st_mode):
+                _run_hook(hooks, "during_file_sync", relative)
+                descriptor = os.open(
+                    entry.name,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=directory_fd,
+                )
+                try:
+                    opened = os.fstat(descriptor)
+                    if not stat.S_ISREG(opened.st_mode) or (
+                        opened.st_dev,
+                        opened.st_ino,
+                    ) != (metadata.st_dev, metadata.st_ino):
+                        raise TreeMutationError(
+                            f"staging entry changed identity while syncing: {relative}"
+                        )
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            else:
+                raise UnsafeTreeError(
+                    f"staging contains a special or non-regular file: {relative}"
+                )
+
+
+def _fsync_directories_bottom_up(
+    directory_fd: int,
+    hooks: Hooks | None,
+) -> None:
+    child_fds: list[int] = []
+    try:
+        scanner = os.scandir(directory_fd)
+        with scanner:
+            for entry in scanner:
+                metadata = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise UnsafeTreeError(
+                        f"staging contains a symlink: {entry.name!r}"
+                    )
+                if stat.S_ISDIR(metadata.st_mode):
+                    child_fd = os.open(
+                        entry.name,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=directory_fd,
+                    )
+                    child_fds.append(child_fd)
+        for child_fd in child_fds:
+            _fsync_directories_bottom_up(child_fd, hooks)
+    except OSError as error:
+        raise PublicationFailedError(f"staging directory sync failed closed: {error}") from error
+    finally:
+        for child_fd in child_fds:
+            os.close(child_fd)
+    _run_hook(hooks, "during_directory_sync")
+    os.fsync(directory_fd)
+
+
+_LIBC: ctypes.CDLL | None = None
+
+
+def _libc() -> ctypes.CDLL:
+    global _LIBC
+    if _LIBC is None:
+        _LIBC = ctypes.CDLL(None, use_errno=True)
+    return _LIBC
+
+
+def _rename_no_replace(
+    source: Path,
+    target_parent_fd: int,
+    target_name: str,
+) -> str:
+    if sys.platform == "darwin":
+        primitive = _libc().renameatx_np
+        flags = _MACOS_RENAME_EXCL
+        operation = "renameatx_np(RENAME_EXCL)"
+    elif sys.platform == "linux":
+        try:
+            primitive = _libc().renameat2
+        except AttributeError as error:
+            raise UnsupportedPlatformError(
+                "renameat2 is unavailable on this Linux libc"
+            ) from error
+        flags = _LINUX_RENAME_NOREPLACE
+        operation = "renameat2(RENAME_NOREPLACE)"
+    else:
+        raise UnsupportedPlatformError(
+            f"no atomic no-replace rename primitive on {sys.platform}"
+        )
+    primitive.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    primitive.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    status = primitive(
+        _AT_FDCWD,
+        os.fsencode(source),
+        target_parent_fd,
+        os.fsencode(target_name),
+        flags,
+    )
+    if status == 0:
+        return operation
+    failure = ctypes.get_errno()
+    if failure in (errno.EEXIST, errno.ENOTEMPTY):
+        raise TargetExistsError(
+            f"publication target already exists at the instant of rename: {target_name!r}"
+        )
+    raise PublicationFailedError(
+        f"{operation} failed: {os.strerror(failure)}"
+    )
+
+
+def _descriptor_device(descriptor: int) -> int:
+    return os.fstat(descriptor).st_dev
+
+
+def _open_target_parent(target: Path, staging: Path) -> int:
+    if target.name in {"", ".", ".."} or "\\" in target.name or "\x00" in target.name:
+        raise UnsafePathError(f"publication target has an unsafe final component: {target!r}")
+    try:
+        target.name.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise UnsafePathError(
+            f"publication target is not representable as canonical UTF-8: {target!r}"
+        ) from error
+    if ".." in target.parts:
+        raise UnsafePathError(f"publication target escapes upward: {target!r}")
+    original_parent = Path(os.path.abspath(target.parent))
+    try:
+        final_parent_metadata = os.lstat(original_parent)
+    except OSError as error:
+        raise UnsafePathError(
+            f"target parent is unavailable: {original_parent}"
+        ) from error
+    if stat.S_ISLNK(final_parent_metadata.st_mode):
+        raise UnsafePathError(
+            f"target parent must not be a symlink alias: {original_parent}"
+        )
+    staging_components = PurePosixPath(os.path.realpath(staging)).parts
+    parent = Path(os.path.realpath(target.parent))
+    parent_components = parent.parts
+    if parent_components[: len(staging_components)] == staging_components:
+        raise UnsafePathError(
+            "the target parent is staging or lives inside it; staging must be a sibling"
+        )
+    if staging_components[: len(parent_components)] == parent_components:
+        raise UnsafePathError(
+            "staging lives below the target parent; staging must be a sibling"
+        )
+    descriptor = os.open(parent.anchor, os.O_RDONLY | os.O_DIRECTORY)
+    metadata: os.stat_result | None = None
+    try:
+        for part in parent.parts[1:]:
+            try:
+                metadata = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+            except OSError as error:
+                raise UnsafePathError(
+                    f"target parent is unavailable: {part!r} in {parent}"
+                ) from error
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise UnsafePathError(
+                    f"target parent must be a chain of real directories: {parent}"
+                )
+            child = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+        opened = os.fstat(descriptor)
+        if metadata is None or (
+            opened.st_dev,
+            opened.st_ino,
+        ) != (metadata.st_dev, metadata.st_ino):
+            raise TreeMutationError("target parent changed identity while being opened")
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def publish_tree(
+    staging_root: Path,
+    target: Path,
+    marker_relative_path: str,
+    marker_bytes: bytes,
+    *,
+    hooks: Hooks | None = None,
+    remove_staging_on_failure: bool = False,
+) -> PublicationReceipt:
+    """Publish a prepared staging tree through one atomic no-replace transition.
+
+    The staging tree is caller-owned. Nothing is deleted on failure unless
+    ``remove_staging_on_failure`` is set, and even then only after the
+    staging root is proven to still hold the identity observed at the start.
+    If the parent-directory sync fails after a successful rename, the target
+    may be visible but durability is not claimed; the error is surfaced and
+    no rollback is attempted.
+
+    Deterministic fault-injection hooks, invoked when present in ``hooks``:
+    ``after_initial_inventory``, ``after_final_marker``,
+    ``after_final_inventory``, ``during_file_sync(relative)``,
+    ``during_directory_sync``, ``before_rename``, ``at_rename(rename)``,
+    ``after_rename``, and ``during_parent_sync``.
+    """
+
+    staging_root = Path(staging_root)
+    target = Path(target)
+    try:
+        root_metadata = staging_root.lstat()
+    except OSError as error:
+        raise UnsafeTreeError(f"staging root is unavailable: {staging_root}") from error
+    staging_identity = (root_metadata.st_dev, root_metadata.st_ino)
+    try:
+        entries_before = inventory_tree(staging_root)
+        _run_hook(hooks, "after_initial_inventory")
+        marker = create_final_marker(staging_root, marker_relative_path, marker_bytes)
+        _run_hook(hooks, "after_final_marker")
+        entries_after = inventory_tree(staging_root)
+        expected = sorted(entries_before + [marker], key=lambda record: record["path"])
+        if entries_after != expected:
+            raise TreeMutationError(
+                "staging changed between inventories by more than the final marker"
+            )
+        _run_hook(hooks, "after_final_inventory")
+        staging_root_fd = _open_root_directory(staging_root, "staging root")
+        try:
+            _fsync_files(staging_root_fd, "", hooks)
+            _fsync_directories_bottom_up(staging_root_fd, hooks)
+        finally:
+            os.close(staging_root_fd)
+        target_parent_fd = _open_target_parent(target, staging_root)
+        try:
+            if _descriptor_device(target_parent_fd) != root_metadata.st_dev:
+                raise CrossDeviceError(
+                    "staging and the target parent are on different filesystems"
+                )
+            _run_hook(hooks, "before_rename")
+
+            def rename_callable() -> str:
+                return _rename_no_replace(
+                    Path(os.path.realpath(staging_root)),
+                    target_parent_fd,
+                    target.name,
+                )
+
+            rename_hook = (hooks or {}).get("at_rename")
+            if rename_hook is not None:
+                operation = rename_hook(rename_callable)
+                if not isinstance(operation, str):
+                    raise PublicationFailedError(
+                        "the at_rename hook did not perform the no-replace rename"
+                    )
+            else:
+                operation = rename_callable()
+            _run_hook(hooks, "after_rename")
+            try:
+                _run_hook(hooks, "during_parent_sync")
+                os.fsync(target_parent_fd)
+            except OSError as error:
+                raise DurablePublicationUncertainError(
+                    "rename completed but the target parent sync failed; the target "
+                    "may be visible and requires operator inspection"
+                ) from error
+        finally:
+            os.close(target_parent_fd)
+    except Exception:
+        if remove_staging_on_failure:
+            _remove_owned_staging(staging_root, staging_identity)
+        raise
+    return PublicationReceipt(
+        target_path=str(target.absolute()),
+        tree_inventory_sha256=tree_inventory_sha256(entries_after),
+        file_count=len(entries_after),
+        tree_bytes=sum(record["byte_length"] for record in entries_after),
+        marker_path=marker["path"],
+        marker_sha256=marker["sha256"],
+        platform_operation=operation,
+    )
+
+
+def _remove_owned_staging(staging_root: Path, staging_identity: tuple[int, int]) -> None:
+    try:
+        current = staging_root.lstat()
+    except OSError:
+        return
+    if (current.st_dev, current.st_ino) != staging_identity:
+        raise UnsafeTreeError(
+            "staging root changed identity; refusing to remove a caller path"
+        )
+    if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode):
+        raise UnsafeTreeError("staging root is no longer a real directory")
+    shutil.rmtree(staging_root)
