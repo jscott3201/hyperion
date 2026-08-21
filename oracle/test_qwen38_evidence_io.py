@@ -442,6 +442,15 @@ class PublicationHostileTests(EvidenceIOTestBase):
                         staging, make_target(staging), MARKER_PATH, MARKER_BYTES
                     )
 
+    def test_target_equal_to_staging_is_rejected(self) -> None:
+        staging = self.workspace / f"staging-{uuid.uuid4().hex}"
+        staging.mkdir()
+        write_tree(staging, {"payload.txt": b"payload"})
+        with self.assertRaisesRegex(evidence_io.UnsafePathError, "staging root itself"):
+            evidence_io.publish_tree(staging, staging, MARKER_PATH, MARKER_BYTES)
+        self.assertTrue(staging.is_dir())
+        self.assertEqual((staging / "payload.txt").read_bytes(), b"payload")
+
     def test_direct_sibling_publication_is_allowed(self) -> None:
         staging = self.workspace / f"staging-{uuid.uuid4().hex}"
         staging.mkdir()
@@ -616,6 +625,19 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
         self.assertEqual(caught.exception.kind, "at_rename_outcome_unverified")
         self.assertTrue(self.target.is_dir())
 
+    def test_at_rename_hook_using_a_replace_capable_rename_is_uncertain(self) -> None:
+        self.prepare_tree()
+        operation = evidence_io._no_replace_primitive()[2]
+
+        def plain_rename(rename: Callable[[], str]) -> str:
+            os.rename(self.staging, self.target)
+            return operation
+
+        with self.assertRaises(evidence_io.DurablePublicationUncertainError) as caught:
+            self.publish(hooks={"at_rename": plain_rename})
+        self.assertEqual(caught.exception.kind, "at_rename_outcome_unverified")
+        self.assertTrue(self.target.is_dir())
+
     def test_at_rename_hook_raising_after_the_rename_is_uncertain(self) -> None:
         self.prepare_tree()
 
@@ -664,6 +686,53 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
         self.assertEqual(caught.exception.kind, "post_rename_parent_sync_failed")
         self.assertIsInstance(caught.exception.__cause__, FailingHook)
         self.assertTrue(self.target.is_dir())
+
+    def test_staging_root_resync_failure_is_refused_before_the_rename(self) -> None:
+        self.prepare_tree({"alpha.json": b"1\n"})
+        armed = {"on": False}
+        real_fsync = os.fsync
+        calls = {"count": 0}
+
+        def counting_fsync(fd: int) -> None:
+            if not armed["on"]:
+                real_fsync(fd)
+                return
+            calls["count"] += 1
+            if calls["count"] == 3:
+                raise OSError(5, "injected resync failure")
+            real_fsync(fd)
+
+        def arm() -> None:
+            armed["on"] = True
+
+        with mock.patch.object(evidence_io.os, "fsync", counting_fsync):
+            with self.assertRaisesRegex(
+                evidence_io.PublicationFailedError, "after reconciliation"
+            ):
+                self.publish(hooks={"before_rename": arm})
+        self.assertFalse(self.target.exists())
+        self.assertTrue(self.staging.is_dir())
+
+    def test_final_walk_fsync_failure_keeps_its_classification(self) -> None:
+        self.prepare_tree()
+        armed = {"on": False}
+        real_fsync = os.fsync
+
+        def failing_fsync(fd: int) -> None:
+            if armed["on"]:
+                raise OSError(5, "injected final-walk fsync failure")
+            real_fsync(fd)
+
+        def arm() -> None:
+            armed["on"] = True
+
+        with mock.patch.object(evidence_io.os, "fsync", failing_fsync):
+            with self.assertRaisesRegex(
+                evidence_io.PublicationFailedError, "staging file could not be synced"
+            ):
+                self.publish(hooks={"before_rename": arm})
+        self.assertFalse(self.target.exists())
+        self.assertTrue(self.staging.is_dir())
 
     def test_staging_mutation_between_inventories_is_rejected(self) -> None:
         self.prepare_tree()

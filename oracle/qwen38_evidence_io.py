@@ -326,68 +326,81 @@ def _inventory_directory(
     except OSError as error:
         raise UnsafeTreeError(f"tree enumeration failed closed: {error}") from error
     with scanner:
-        for entry in scanner:
-            _safe_entry_name(entry.name, "tree entry")
-            try:
-                metadata = entry.stat(follow_symlinks=False)
-            except OSError as error:
-                raise TreeMutationError(
-                    f"tree entry changed while being enumerated: {prefix}{entry.name}"
-                ) from error
-            if stat.S_ISLNK(metadata.st_mode):
-                raise UnsafeTreeError(f"tree contains a symlink: {prefix}{entry.name}")
-            relative = f"{prefix}{entry.name}"
-            if stat.S_ISDIR(metadata.st_mode):
+        try:
+            for entry in scanner:
+                _safe_entry_name(entry.name, "tree entry")
                 try:
-                    child_fd = os.open(
-                        entry.name,
-                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                        dir_fd=directory_fd,
-                    )
-                except FileNotFoundError as error:
-                    raise TreeMutationError(
-                        f"directory vanished while being inventoried: {relative}"
-                    ) from error
+                    metadata = entry.stat(follow_symlinks=False)
                 except OSError as error:
+                    raise TreeMutationError(
+                        f"tree entry changed while being enumerated: {prefix}{entry.name}"
+                    ) from error
+                if stat.S_ISLNK(metadata.st_mode):
                     raise UnsafeTreeError(
-                        f"directory could not be opened: {relative}"
-                    ) from error
-                try:
-                    opened = os.fstat(child_fd)
-                except OSError as error:
-                    raise TreeMutationError(
-                        f"directory could not be inspected: {relative}"
-                    ) from error
-                if not stat.S_ISDIR(opened.st_mode) or (
-                    opened.st_dev,
-                    opened.st_ino,
-                ) != (metadata.st_dev, metadata.st_ino):
-                    raise TreeMutationError(
-                        f"directory changed identity while being read: {relative}"
+                        f"tree contains a symlink: {prefix}{entry.name}"
                     )
-                try:
-                    _inventory_directory(
-                        child_fd, f"{relative}/", entries, seen_inodes, hooks, identities
+                relative = f"{prefix}{entry.name}"
+                if stat.S_ISDIR(metadata.st_mode):
+                    try:
+                        child_fd = os.open(
+                            entry.name,
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=directory_fd,
+                        )
+                    except FileNotFoundError as error:
+                        raise TreeMutationError(
+                            f"directory vanished while being inventoried: {relative}"
+                        ) from error
+                    except OSError as error:
+                        raise UnsafeTreeError(
+                            f"directory could not be opened: {relative}"
+                        ) from error
+                    try:
+                        opened = os.fstat(child_fd)
+                    except OSError as error:
+                        raise TreeMutationError(
+                            f"directory could not be inspected: {relative}"
+                        ) from error
+                    if not stat.S_ISDIR(opened.st_mode) or (
+                        opened.st_dev,
+                        opened.st_ino,
+                    ) != (metadata.st_dev, metadata.st_ino):
+                        raise TreeMutationError(
+                            f"directory changed identity while being read: {relative}"
+                        )
+                    try:
+                        _inventory_directory(
+                            child_fd,
+                            f"{relative}/",
+                            entries,
+                            seen_inodes,
+                            hooks,
+                            identities,
+                        )
+                    finally:
+                        os.close(child_fd)
+                elif stat.S_ISREG(metadata.st_mode):
+                    entries.append(
+                        _inventory_file(
+                            directory_fd,
+                            entry.name,
+                            relative,
+                            metadata,
+                            seen_inodes,
+                            hooks,
+                            identities,
+                        )
                     )
-                finally:
-                    os.close(child_fd)
-            elif stat.S_ISREG(metadata.st_mode):
-                entries.append(
-                    _inventory_file(
-                        directory_fd,
-                        entry.name,
-                        relative,
-                        metadata,
-                        seen_inodes,
-                        hooks,
-                        identities,
+                else:
+                    raise UnsafeTreeError(
+                        f"tree contains a special or non-regular file: {relative}"
                     )
-                )
-            else:
-                raise UnsafeTreeError(
-                    f"tree contains a special or non-regular file: {relative}"
-                )
-
+        except EvidenceIOError:
+            raise
+        except OSError as error:
+            raise TreeMutationError(
+                f"tree enumeration failed closed mid-iteration: {error}"
+            ) from error
 
 def inventory_tree(
     root: Path,
@@ -509,99 +522,112 @@ def _sync_files_walk(
     except OSError as error:
         raise PublicationFailedError(f"staging enumeration failed closed: {error}") from error
     with scanner:
-        for entry in scanner:
-            _safe_entry_name(entry.name, "staging entry")
-            try:
-                metadata = entry.stat(follow_symlinks=False)
-            except OSError as error:
-                raise TreeMutationError(
-                    f"staging entry changed while being enumerated: {prefix}{entry.name}"
-                ) from error
-            if stat.S_ISLNK(metadata.st_mode):
-                raise UnsafeTreeError(f"staging contains a symlink: {prefix}{entry.name}")
-            relative = f"{prefix}{entry.name}"
-            if stat.S_ISDIR(metadata.st_mode):
+        try:
+            for entry in scanner:
+                _safe_entry_name(entry.name, "staging entry")
                 try:
-                    child_fd = os.open(
-                        entry.name,
-                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                        dir_fd=directory_fd,
-                    )
+                    metadata = entry.stat(follow_symlinks=False)
                 except OSError as error:
-                    raise PublicationFailedError(
-                        f"staging directory could not be opened: {relative}"
+                    raise TreeMutationError(
+                        f"staging entry changed while being enumerated: {prefix}{entry.name}"
                     ) from error
-                try:
-                    observed.extend(
-                        _sync_files_walk(child_fd, f"{relative}/", hooks, identities)
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise UnsafeTreeError(
+                        f"staging contains a symlink: {prefix}{entry.name}"
                     )
-                finally:
-                    os.close(child_fd)
-            elif stat.S_ISREG(metadata.st_mode):
-                observed.append((relative, metadata.st_size))
-                _run_hook(hooks, "during_file_sync", relative)
-                try:
-                    descriptor = os.open(
-                        entry.name,
-                        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                        dir_fd=directory_fd,
-                    )
-                except OSError as error:
-                    raise PublicationFailedError(
-                        f"staging file could not be opened for sync: {relative}"
-                    ) from error
-                try:
+                relative = f"{prefix}{entry.name}"
+                if stat.S_ISDIR(metadata.st_mode):
                     try:
-                        before = os.fstat(descriptor)
+                        child_fd = os.open(
+                            entry.name,
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=directory_fd,
+                        )
                     except OSError as error:
                         raise PublicationFailedError(
-                            f"staging file could not be inspected: {relative}"
+                            f"staging directory could not be opened: {relative}"
                         ) from error
-                    if not stat.S_ISREG(before.st_mode):
-                        raise UnsafeTreeError(
-                            f"staging entry is not a regular file: {relative}"
+                    try:
+                        observed.extend(
+                            _sync_files_walk(child_fd, f"{relative}/", hooks, identities)
                         )
-                    if before.st_nlink != 1:
-                        raise UnsafeTreeError(
-                            f"staging entry has additional hard links: {relative}"
+                    finally:
+                        os.close(child_fd)
+                elif stat.S_ISREG(metadata.st_mode):
+                    observed.append((relative, metadata.st_size))
+                    _run_hook(hooks, "during_file_sync", relative)
+                    try:
+                        descriptor = os.open(
+                            entry.name,
+                            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                            dir_fd=directory_fd,
                         )
-                    _assert_same_identity(metadata, before, relative)
-                    accepted = identities.get(relative)
-                    if accepted is None or (
-                        before.st_dev,
-                        before.st_ino,
-                        before.st_size,
-                        before.st_mtime_ns,
-                        before.st_ctime_ns,
-                    ) != (
-                        accepted.st_dev,
-                        accepted.st_ino,
-                        accepted.st_size,
-                        accepted.st_mtime_ns,
-                        accepted.st_ctime_ns,
-                    ):
+                    except FileNotFoundError as error:
                         raise TreeMutationError(
-                            f"staging entry differs from the accepted inventory: {relative}"
-                        )
-                    try:
-                        os.fsync(descriptor)
+                            f"staging file vanished before being synced: {relative}"
+                        ) from error
                     except OSError as error:
                         raise PublicationFailedError(
-                            f"staging file could not be synced: {relative}"
+                            f"staging file could not be opened for sync: {relative}"
                         ) from error
                     try:
-                        after_sync = os.fstat(descriptor)
-                    except OSError as error:
-                        raise PublicationFailedError(
-                            f"staging file could not be inspected: {relative}"
-                        ) from error
-                    _assert_same_identity(before, after_sync, relative)
-                finally:
-                    os.close(descriptor)
-            else:
-                raise UnsafeTreeError(
-                    f"staging contains a special or non-regular file: {relative}"
-                )
+                        try:
+                            before = os.fstat(descriptor)
+                        except OSError as error:
+                            raise PublicationFailedError(
+                                f"staging file could not be inspected: {relative}"
+                            ) from error
+                        if not stat.S_ISREG(before.st_mode):
+                            raise UnsafeTreeError(
+                                f"staging entry is not a regular file: {relative}"
+                            )
+                        if before.st_nlink != 1:
+                            raise UnsafeTreeError(
+                                f"staging entry has additional hard links: {relative}"
+                            )
+                        _assert_same_identity(metadata, before, relative)
+                        accepted = identities.get(relative)
+                        if accepted is None or (
+                            before.st_dev,
+                            before.st_ino,
+                            before.st_size,
+                            before.st_mtime_ns,
+                            before.st_ctime_ns,
+                        ) != (
+                            accepted.st_dev,
+                            accepted.st_ino,
+                            accepted.st_size,
+                            accepted.st_mtime_ns,
+                            accepted.st_ctime_ns,
+                        ):
+                            raise TreeMutationError(
+                                f"staging entry differs from the accepted inventory: {relative}"
+                            )
+                        try:
+                            os.fsync(descriptor)
+                        except OSError as error:
+                            raise PublicationFailedError(
+                                f"staging file could not be synced: {relative}"
+                            ) from error
+                        try:
+                            after_sync = os.fstat(descriptor)
+                        except OSError as error:
+                            raise PublicationFailedError(
+                                f"staging file could not be inspected: {relative}"
+                            ) from error
+                        _assert_same_identity(before, after_sync, relative)
+                    finally:
+                        os.close(descriptor)
+                else:
+                    raise UnsafeTreeError(
+                        f"staging contains a special or non-regular file: {relative}"
+                    )
+        except EvidenceIOError:
+            raise
+        except OSError as error:
+            raise PublicationFailedError(
+                f"staging enumeration failed closed mid-iteration: {error}"
+            ) from error
     return observed
 
 
@@ -941,9 +967,10 @@ def publish_tree(
     final pre-rename reconciliation re-opens, flushes, and re-verifies that
     same identity for every file after the ``before_rename`` hook, so
     deferred-writeback mutations are exposed before the transition, and the
-    staging root is re-synced so directory entries created during the hook
-    are persisted. A staging-root swap or content mutation landing in the
-    irreducible window between that final reconciliation and the rename
+    staging root is re-synced so directory entries created directly in the
+    staging root during the hook are persisted; nested empty directories
+    created by the hook carry no durability guarantee. A
+    staging-root swap or content mutation landing in the irreducible window between that final reconciliation and the rename
     syscall itself cannot be detected in userspace and is a documented
     residual, as is a mutation that fits inside one timestamp-granularity
     tick and a target-parent swap after the parent descriptor is opened.
@@ -1043,13 +1070,17 @@ def publish_tree(
                     "staging root was replaced before the atomic transition"
                 )
 
+            performed = {"renamed": False}
+
             def rename_callable() -> str:
-                return _rename_no_replace(
+                operation = _rename_no_replace(
                     staging_parent_fd,
                     resolved_staging.name,
                     target_parent_fd,
                     target.name,
                 )
+                performed["renamed"] = True
+                return operation
 
             rename_hook = (hooks or {}).get("at_rename")
             if rename_hook is not None:
@@ -1062,10 +1093,14 @@ def publish_tree(
                         "target state requires operator inspection",
                         kind="at_rename_outcome_unverified",
                     ) from error
-                if not isinstance(operation, str) or operation != expected_operation:
+                if (
+                    not performed["renamed"]
+                    or not isinstance(operation, str)
+                    or operation != expected_operation
+                ):
                     raise DurablePublicationUncertainError(
-                        "the at_rename hook did not return the platform rename "
-                        "operation; no verified publication occurred",
+                        "the at_rename hook did not perform the platform no-replace "
+                        "rename; no verified publication occurred",
                         kind="at_rename_outcome_unverified",
                     )
                 try:
