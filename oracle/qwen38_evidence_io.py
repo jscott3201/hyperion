@@ -731,7 +731,7 @@ def _fsync_directories_bottom_up(
                             ) != (metadata.st_dev, metadata.st_ino):
                                 raise TreeMutationError(
                                     f"staging directory changed identity while being "
-                                    f"synced: {relative}"
+                                    f"directory-synced: {relative}"
                                 )
                             _fsync_directories_bottom_up(child_fd, f"{relative}/", hooks)
                         finally:

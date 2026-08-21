@@ -760,11 +760,13 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
             return real_open(path, flags, **kwargs)  # type: ignore[arg-type]
 
         def arm(relative: str) -> None:
-            armed["on"] = True
+            if relative == "nested/alpha.txt":
+                armed["on"] = True
 
         with mock.patch.object(evidence_io.os, "open", swapped_open):
             with self.assertRaisesRegex(
-                evidence_io.TreeMutationError, "changed identity while being synced"
+                evidence_io.TreeMutationError,
+                "changed identity while being directory-synced",
             ):
                 self.publish(hooks={"during_file_sync": arm})
         self.assertFalse(self.target.exists())
