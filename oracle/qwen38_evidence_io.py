@@ -631,18 +631,33 @@ def _fsync_directories_bottom_up(
         scanner = os.scandir(directory_fd)
         with scanner:
             for entry in scanner:
-                metadata = entry.stat(follow_symlinks=False)
+                _safe_entry_name(entry.name, "staging entry")
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except OSError as error:
+                    raise TreeMutationError(
+                        f"staging entry changed while being synced: {prefix}{entry.name}"
+                    ) from error
                 if stat.S_ISLNK(metadata.st_mode):
                     raise UnsafeTreeError(
                         f"staging contains a symlink: {prefix}{entry.name}"
                     )
                 relative = f"{prefix}{entry.name}"
                 if stat.S_ISDIR(metadata.st_mode):
-                    child_fd = os.open(
-                        entry.name,
-                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                        dir_fd=directory_fd,
-                    )
+                    try:
+                        child_fd = os.open(
+                            entry.name,
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=directory_fd,
+                        )
+                    except FileNotFoundError as error:
+                        raise TreeMutationError(
+                            f"staging directory vanished while being synced: {relative}"
+                        ) from error
+                    except OSError as error:
+                        raise PublicationFailedError(
+                            f"staging directory could not be opened: {relative}"
+                        ) from error
                     try:
                         _fsync_directories_bottom_up(child_fd, f"{relative}/", hooks)
                     finally:
