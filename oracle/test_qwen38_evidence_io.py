@@ -747,6 +747,29 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
         self.assertFalse(self.target.exists())
         self.assertTrue(self.staging.is_dir())
 
+    def test_directory_swap_in_the_directory_sync_pass_is_tree_mutation(self) -> None:
+        self.prepare_tree({"nested/alpha.txt": b"alpha\n"})
+        decoy = self.workspace / "decoy"
+        decoy.mkdir()
+        real_open = os.open
+        armed = {"on": False}
+
+        def swapped_open(path: object, flags: int, **kwargs: object) -> int:
+            if armed["on"] and flags & os.O_DIRECTORY and path == "nested":
+                return real_open(decoy, os.O_RDONLY | os.O_DIRECTORY)
+            return real_open(path, flags, **kwargs)  # type: ignore[arg-type]
+
+        def arm(relative: str) -> None:
+            armed["on"] = True
+
+        with mock.patch.object(evidence_io.os, "open", swapped_open):
+            with self.assertRaisesRegex(
+                evidence_io.TreeMutationError, "changed identity while being synced"
+            ):
+                self.publish(hooks={"during_file_sync": arm})
+        self.assertFalse(self.target.exists())
+        self.assertTrue(self.staging.is_dir())
+
     def test_at_rename_hook_double_rename_after_success_is_uncertain(self) -> None:
         self.prepare_tree()
         calls = {"count": 0}
@@ -774,7 +797,6 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
 
     def test_at_rename_hook_fabricating_target_exists_is_uncertain(self) -> None:
         self.prepare_tree()
-        operation = evidence_io._no_replace_primitive()[2]
 
         def rename_out_of_band(rename: Callable[[], str]) -> str:
             os.rename(self.staging, self.target)
@@ -784,7 +806,6 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
             self.publish(hooks={"at_rename": rename_out_of_band})
         self.assertEqual(caught.exception.kind, "at_rename_outcome_unverified")
         self.assertTrue(self.target.is_dir())
-        del operation
 
     def test_hook_raising_oserror_is_typed_as_publication_failed(self) -> None:
         self.prepare_tree()

@@ -121,6 +121,12 @@ Hooks = dict[str, Callable[..., object]]
 
 
 def _run_hook(hooks: Hooks | None, name: str, *arguments: Any) -> None:
+    """Invoke a fault-injection hook, typing a hook-raised OSError.
+
+    Inventory-phase hook failures reuse ``PublicationFailedError`` even though
+    no publication is in progress; the message names the hook either way.
+    """
+
     hook = (hooks or {}).get(name)
     if hook is not None:
         try:
@@ -711,10 +717,25 @@ def _fsync_directories_bottom_up(
                         raise PublicationFailedError(
                             f"staging directory could not be opened: {relative}"
                         ) from error
-                    try:
-                        _fsync_directories_bottom_up(child_fd, f"{relative}/", hooks)
-                    finally:
-                        os.close(child_fd)
+                    else:
+                        try:
+                            try:
+                                opened = os.fstat(child_fd)
+                            except OSError as error:
+                                raise TreeMutationError(
+                                    f"staging directory could not be inspected: {relative}"
+                                ) from error
+                            if not stat.S_ISDIR(opened.st_mode) or (
+                                opened.st_dev,
+                                opened.st_ino,
+                            ) != (metadata.st_dev, metadata.st_ino):
+                                raise TreeMutationError(
+                                    f"staging directory changed identity while being "
+                                    f"synced: {relative}"
+                                )
+                            _fsync_directories_bottom_up(child_fd, f"{relative}/", hooks)
+                        finally:
+                            os.close(child_fd)
                 elif not stat.S_ISREG(metadata.st_mode):
                     raise UnsafeTreeError(
                         f"staging contains a special or non-regular file: {relative}"
@@ -1099,7 +1120,7 @@ def publish_tree(
                     "staging root was replaced before the atomic transition"
                 )
 
-            performed = {"renamed": False}
+            performed = {"renamed": False, "eexist": False}
 
             def rename_callable() -> str:
                 try:
@@ -1110,6 +1131,7 @@ def publish_tree(
                         target.name,
                     )
                 except TargetExistsError as error:
+                    performed["eexist"] = True
                     raise _RenameTargetExists(str(error)) from error
                 performed["renamed"] = True
                 return operation
@@ -1120,7 +1142,7 @@ def publish_tree(
                 try:
                     operation = rename_hook(rename_callable)
                 except _RenameTargetExists as error:
-                    if performed["renamed"]:
+                    if performed["renamed"] or not performed["eexist"]:
                         raise DurablePublicationUncertainError(
                             "the at_rename hook failed after possibly renaming; the "
                             "target state requires operator inspection",
