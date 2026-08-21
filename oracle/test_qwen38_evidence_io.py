@@ -465,12 +465,13 @@ class PublicationHostileTests(EvidenceIOTestBase):
     def test_cross_filesystem_publication_is_refused(self) -> None:
         self.prepare_tree()
         original = evidence_io._descriptor_device
-        evidence_io._descriptor_device = lambda descriptor: original(descriptor) + 1
-        try:
-            with self.assertRaisesRegex(evidence_io.CrossDeviceError, "different filesystems"):
+        with mock.patch.object(
+            evidence_io, "_descriptor_device", lambda descriptor: original(descriptor) + 1
+        ):
+            with self.assertRaisesRegex(
+                evidence_io.CrossDeviceError, "different filesystems"
+            ):
                 self.publish()
-        finally:
-            evidence_io._descriptor_device = original
         self.assertFalse(self.target.exists())
         self.assertTrue(self.staging.is_dir())
 
@@ -522,7 +523,6 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
             "during_file_sync": fail("during_file_sync"),
             "during_directory_sync": fail("during_directory_sync"),
             "before_rename": fail("before_rename"),
-            "at_rename": raise_at_rename,
         }
 
     def test_pre_rename_failures_leave_the_target_absent(self) -> None:
@@ -540,6 +540,12 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
                     )
                 self.assertFalse(target.exists())
                 self.assertEqual(sibling.read_bytes(), b"untouched")
+
+    def test_at_rename_hook_failure_is_conservatively_uncertain(self) -> None:
+        self.prepare_tree()
+        with self.assertRaises(evidence_io.DurablePublicationUncertainError):
+            self.publish(hooks={"at_rename": raise_at_rename})
+        self.assertFalse(self.target.exists())
 
     def test_post_rename_parent_sync_failure_is_not_durable_success(self) -> None:
         self.prepare_tree()
@@ -606,8 +612,8 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
         self.prepare_tree()
         seen: set[None] = set()
 
-        def swap(prefix: str) -> None:
-            if prefix == "" and not seen:
+        def swap() -> None:
+            if not seen:
                 seen.add(None)
                 os.rename(self.staging, self.workspace / "staging-superseded")
                 self.staging.mkdir()
@@ -616,7 +622,7 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
         with self.assertRaisesRegex(
             evidence_io.TreeMutationError, "replaced before the atomic transition"
         ):
-            self.publish(hooks={"during_directory_sync": swap})
+            self.publish(hooks={"before_rename": swap})
         self.assertFalse(self.target.exists())
         self.assertTrue((self.staging / "imposter.txt").exists())
 
@@ -630,7 +636,7 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
                 (self.staging / "smuggled.txt").write_bytes(b"smuggled")
 
         with self.assertRaisesRegex(
-            evidence_io.TreeMutationError, "no longer matches the accepted inventory"
+            evidence_io.TreeMutationError, "differs from the accepted inventory"
         ):
             self.publish(hooks={"after_final_inventory": smuggle})
         self.assertFalse(self.target.exists())
@@ -648,6 +654,36 @@ class PublicationFaultInjectionTests(EvidenceIOTestBase):
             evidence_io.TreeMutationError, "no longer matches the accepted inventory"
         ):
             self.publish(hooks={"after_final_inventory": remove_pending})
+        self.assertFalse(self.target.exists())
+
+    def test_same_size_rewrite_after_the_final_inventory_is_refused(self) -> None:
+        self.prepare_tree({"alpha.json": b'{"first":1}\n'})
+        seen: set[None] = set()
+
+        def rewrite() -> None:
+            if not seen:
+                seen.add(None)
+                (self.staging / "alpha.json").write_bytes(b'{"first":2}\n')
+
+        with self.assertRaisesRegex(
+            evidence_io.TreeMutationError, "differs from the accepted inventory"
+        ):
+            self.publish(hooks={"after_final_inventory": rewrite})
+        self.assertFalse(self.target.exists())
+
+    def test_file_added_during_the_directory_sync_is_refused(self) -> None:
+        self.prepare_tree()
+        seen: set[None] = set()
+
+        def smuggle(prefix: str) -> None:
+            if prefix == "" and not seen:
+                seen.add(None)
+                (self.staging / "smuggled.txt").write_bytes(b"smuggled")
+
+        with self.assertRaisesRegex(
+            evidence_io.TreeMutationError, "no longer matches the accepted inventory"
+        ):
+            self.publish(hooks={"during_directory_sync": smuggle})
         self.assertFalse(self.target.exists())
 
 
